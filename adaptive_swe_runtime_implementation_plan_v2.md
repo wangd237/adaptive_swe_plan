@@ -1020,7 +1020,7 @@ DAG Node 是：
 |---|---:|
 | 可以真正并行 | 是 |
 | 需要不同 specialist provider | 是 |
-| READ → WRITE side-effect boundary | 是 |
+| READ → WRITE side-effect boundary | 候选边界，不强制 |
 | WRITE → verification boundary | 是 |
 | mandatory Review gate | 是 |
 | 有独立 acceptance condition | 是 |
@@ -1046,11 +1046,83 @@ Diagnose DB connection leak
 
 而不是创建三个 Agent Node。
 
-### 4.12 PlanValidator / PlanNormalizer
+READ → WRITE 也不是绝对拆分边界。若：
+
+- 语义强依赖；
+- 同一 Provider 能覆盖 diagnosis + modification；
+- 拆分会导致重复 Repository discovery；
+- 没有明显 parallel / specialist benefit；
+
+则可以编译成一个：
+
+```text
+Diagnose and Implement
+workspace_access = WRITE
+```
+
+代价是该 Node 在整个执行期间独占 Workspace。
+
+因此 NodeBoundaryPolicy 的目标不是“尽量多拆”，而是：
+
+> **在 specialization / parallelism / verification benefit 与 handoff / duplicate discovery / coordination cost 之间选择最小合理 work package。**
+
+### 4.12 Two-Stage Plan Compiler
+
+Plan validation 分为两道关：
+
+```text
+WorkPlanProposal
+      ↓
+SemanticPlanValidator
+      ↓
+ValidatedWorkPlan
+      ↓
+Capability / Provider Resolution
+      ↓
+ExecutionPlanValidator
+      ↓
+DAG Materializer
+      ↓
+Executable TaskDAG
+```
+
+#### SemanticPlanValidator
+
+Provider 选择前即可判断：
+
+- Schema correctness；
+- ID uniqueness；
+- dependency existence；
+- self dependency；
+- DAG acyclic；
+- capability vocabulary；
+- user / task obligation coverage；
+- node count / plan budget；
+- NodeBoundaryPolicy；
+- missing verification / review gates。
+
+#### ExecutionPlanValidator
+
+Provider Assignment 后判断：
+
+- Provider 是否覆盖 required capabilities；
+- required tools 是否在 Provider static contract 中；
+- required skills 是否可用；
+- Sandbox mode 是否支持所需 execution；
+- Node tool allowlist 是否满足 least privilege；
+- workspace access 是否与 Capability side effect 一致；
+- acceptance criteria 是否可编译；
+- Runtime budget 是否可满足。
+
+因此：
+
+> **semantic plan valid ≠ executable under the current deployment**
+
+### 4.13 PlanValidator / PlanNormalizer
 
 LLM Proposal 必须经过 deterministic validation。
 
-规则分三类：
+规则分三类。
 
 #### Hard Reject
 
@@ -1061,9 +1133,9 @@ cycle
 self dependency
 dependency references nonexistent item
 unknown / impossible capability
-plan has no path to requested deliverable
 semantic contradiction
 node count exceeds hard limit
+unsatisfied hard user constraint
 ```
 
 结果：
@@ -1090,9 +1162,12 @@ AND no verification work item
 risk == high
 AND no review work item
 → append review gate
+
+unordered workspace-conflicting nodes
+→ add deterministic ordering edge
 ```
 
-规则只能增强安全性 / 完整性，不能静默删除用户需求。
+规则只能增强 safety / completeness，不能静默删除用户需求，也不能重写核心任务目标。
 
 #### Warning / Optimization
 
@@ -1102,11 +1177,12 @@ AND no review work item
 多个强依赖 READ items 可以合并
 重复 Repository discovery
 过度细粒度 decomposition
+same-provider handoff overhead
 ```
 
-一期可以先记录 Trace Warning，再逐步自动 normalize。
+一期先记录 Trace Warning；只有语义单调、安全的 normalization 才自动应用。
 
-### 4.13 Acceptance Compilation
+### 4.14 Acceptance Compilation
 
 Planner 的 `acceptance_intent` 是语义意图，不直接成为 DeerFlow canonical acceptance criteria。
 
@@ -1132,9 +1208,9 @@ tests_passed:<resolved-test-command>
 → UNVERIFIED / reviewer-level condition
 ```
 
-不把“looks correct”之类自由文本伪装成 deterministic acceptance。
+不把 “looks correct” 之类自由文本伪装成 deterministic acceptance。
 
-### 4.14 Capability 从 Task-Level 下沉到 WorkItem-Level
+### 4.15 Capability 从 Task-Level 下沉到 WorkItem-Level
 
 authoritative capability flow：
 
@@ -1148,76 +1224,82 @@ Capability Resolver
 
 TaskSpec 中只有 `capability_hints`。
 
-Task-level capability set 可以定义为：
+Task-level capability set：
 
 ```text
 Union(all validated work-item capabilities)
 ```
 
-### 4.15 Handoff Contract
+### 4.16 Handoff Contract
 
-DAG dependency 不只表示控制顺序，还表示上下文 / 数据交接。
+DAG dependency 不只表示 control order，还表示 data handoff。
+
+一期不强求把 Agent 自由文本完全解析成复杂语义对象；优先使用：
 
 ```python
 class NodeHandoff(BaseModel):
     source_node_id: str
 
-    summary: str
+    report: str
 
-    findings: list[str]
     evidence_paths: list[str]
     changed_paths: list[str]
 
-    unresolved_questions: list[str]
+    acceptance_summary: dict | None
+    receipt_ids: list[str]
 ```
 
-下游 Node 输入：
+其中：
+
+- `report` 必须 bounded；
+- `changed_paths` 优先来自 deterministic workspace/git evidence；
+- `receipt_ids` 来自 DeerFlow Tool Receipt；
+- Handoff 仍然是 model report，不是事实权威。
+
+后续若确有价值，再扩展结构化 findings / unresolved_questions。
+
+### 4.17 Planning Replan Boundary
+
+一期区分 planning-time replan 与 execution-time replan。
+
+#### Planning-time
+
+尚未执行任何业务 Node，没有 Workspace mutation：
 
 ```text
-Original Task
-+
-Current Node Objective
-+
-Dependency Handoffs
-+
-Runtime Constraints
-+
-Acceptance Criteria
+invalid proposal
+→ validator diagnostics
+→ bounded planner retry
 ```
 
-Handoff 仍然是 Agent self-report，不是事实权威；关键结论需要通过文件、receipt、test、path 等 evidence 复核。
+#### Execution-time
 
-### 4.16 Planning Replan Boundary
-
-一期优先实现：
+只允许：
 
 ```text
-Planning-time adaptation
-✅
-
-Arbitrary execution-time DAG mutation
-❌
+READ Node returns PLAN_INVALIDATED
+AND no WRITE has executed
+AND replan budget remains
+→ bounded replan
 ```
 
-Node 可以返回：
+一旦 Workspace 已经发生业务 WRITE：
 
 ```text
-PLAN_INVALIDATED
+arbitrary DAG replan = disabled in MVP
 ```
 
-第一版允许：
+因为这时需要定义 rollback、result reuse、dirty-state semantics。
+
+一期推荐：
 
 ```text
-max_replans = 0
+planning_attempts <= 2
+execution_replans <= 1
+execution replan only before first WRITE
 ```
 
-后续最多先演进到 bounded one-shot replan：
-
-```text
-max_replans = 1
-```
-
-不在 MVP 实现无界动态 DAG spawning。
+不实现无界动态 DAG spawning。
 
 ---
 
@@ -1697,6 +1779,8 @@ class TaskNode(BaseModel):
     acceptance_criteria: list[str] = []
 
     retry_policy: RetryPolicy
+    repair_policy: RepairPolicy | None = None
+
     status: NodeStatus
 ```
 
@@ -1714,9 +1798,9 @@ READ + WRITE
 
 LLM `effect_hint` 不具有 authority。
 
-### 9.4 Dependency Normalization
+### 9.4 Dependency / Workspace Conflict Normalization
 
-Planner 提出的 dependency 先做：
+Planner dependency 先做：
 
 ```text
 existence validation
@@ -1725,9 +1809,11 @@ transitive sanity check
 side-effect normalization
 ```
 
-对于没有显式依赖但共享同一 Workspace 的多个 WRITE Node，一期不只依赖 Runtime Mutex。
+Workspace Mutex 只能保证“不会同时执行”，不能保证“谁先执行”。
 
-DAG Materializer 应使用 deterministic ordering 增加 serialization edge：
+因此所有 unordered conflict pair 必须在 Materialization 阶段获得 deterministic order。
+
+#### unordered WRITE / WRITE
 
 ```text
 WRITE A
@@ -1735,17 +1821,44 @@ WRITE A
 WRITE B
 ```
 
-排序依据可以是：
+按 validated planner ordinal 等稳定顺序串行。
+
+#### unordered READ / WRITE
+
+若只靠 lock：
 
 ```text
-validated planner ordinal
+READ first  → 看到 mutation 前状态
+WRITE first → 看到 mutation 后状态
 ```
 
-这样执行顺序可复现。
+会形成语义不确定性。
+
+一期默认：
+
+```text
+READ
+ ↓
+WRITE
+```
+
+即独立 read-only exploration 优先基于当前稳定状态完成。
+
+如果 READ 本来就应该观察 mutation 后状态，Planner 必须显式生成：
+
+```text
+WRITE → READ
+```
+
+依赖。
+
+原则：
+
+> **Workspace lock 负责运行时互斥；DAG normalization 负责确定性语义顺序。**
 
 ### 9.5 READ Parallelism
 
-独立的 READ Node 可以保留真实并行：
+只有 unordered READ / READ 允许真实并行：
 
 ```text
 Inspect API ─┐
@@ -1753,42 +1866,43 @@ Inspect API ─┐
 Inspect Test ─┘
 ```
 
-前提：
+并行仍受：
 
-- 无 dependency；
-- 无 shared mutable state；
-- 无 external side effect；
-- NodeBoundaryPolicy 判断确实值得拆分。
+- NodeBoundaryPolicy；
+- backend execution capacity；
+- global Runtime budget；
+
+限制。
 
 ### 9.6 Handoff Data Dependency
 
-DAG Edge 不只表示：
+DAG Edge 同时表示：
 
 ```text
-B waits for A
+Control Dependency
++
+Data Dependency
 ```
 
-还表示：
-
-```text
-B receives A's bounded handoff context
-```
-
-下游执行请求应包含：
+下游请求：
 
 ```text
 Original Task
++
 Current Node Objective
-Dependency Handoffs
++
+Bounded Dependency Handoffs
++
 Runtime Constraints
++
 Acceptance Criteria
 ```
 
-`NodeHandoff` 是 model report，需要 evidence 支撑，不能获得 system authority。
+Handoff 进入 untrusted data channel。
 
 ### 9.7 Scheduler 的职责
 
-Scheduler 不再负责 Task decomposition。
+Scheduler 不负责 Task decomposition。
 
 一期职责：
 
@@ -1798,7 +1912,8 @@ Scheduler 不再负责 Task decomposition。
 - Workspace Access arbitration；
 - WRITE exclusivity；
 - Node status tracking；
-- retry；
+- retry classification；
+- bounded repair；
 - cancellation；
 - failure propagation；
 - acceptance gate；
@@ -1806,20 +1921,243 @@ Scheduler 不再负责 Task decomposition。
 - handoff routing；
 - result aggregation。
 
-### 9.8 Workspace 并发规则
+### 9.8 Failure Taxonomy
 
-| Node A | Node B | 是否允许并行 |
-|---|---|---:|
-| READ | READ | 是 |
-| READ | WRITE | 否 |
-| WRITE | READ | 否 |
-| WRITE | WRITE | 否 |
+不能把所有失败统一成 “retry once”。
 
-即：
+至少区分：
 
-> **MVP 只允许 READ / READ 并行。**
+```text
+AdmissionFailure
+ExecutionTransientFailure
+AcceptanceFailure
+VerificationFailure
+PlanInvalidated
+PolicyViolation
+RepositoryInvariantFailure
+Cancelled
+```
 
-### 9.9 Node 执行流程
+处理原则：
+
+| Failure | 行为 |
+|---|---|
+| admission failure before execution | wait / bounded retry |
+| READ transient failure | RetryPolicy |
+| WRITE failure 且无 workspace change | bounded retry |
+| WRITE failure 且已有 workspace change | fail closed |
+| acceptance does-not-hold | repair unmet condition / fail |
+| verification test failure | bounded upstream repair，再 verify |
+| UNVERIFIED | additional deterministic check 或保留 uncertainty |
+| PLAN_INVALIDATED before any WRITE | bounded replan |
+| PLAN_INVALIDATED after WRITE | MVP fail / restart-from-baseline |
+| policy / repository invariant violation | fail closed |
+| cancelled | propagate cancellation |
+
+### 9.9 WRITE Retry Safety
+
+DeerFlow `workspace_changes` snapshot 适合作为 evidence / diff，不是通用 transaction rollback：
+
+- binary / large / sensitive content 可能不可恢复；
+- snapshot 有 scan / file / diff limit；
+- 它不是 Git transaction log；
+- `.git` 本身被 scanner 排除。
+
+因此 WRITE Node 前可以 capture pre-attempt snapshot。
+
+失败后：
+
+```text
+no workspace change
+→ retry may be allowed
+
+workspace changed
+→ DIRTY_WRITE_FAILURE
+→ no automatic retry in MVP
+```
+
+后续若实现真正的 Git/worktree checkpoint，再开放 dirty-write rollback + retry。
+
+### 9.10 Retry vs Repair
+
+```text
+Retry
+→ 同一个 Node 因 transient execution fault 再执行
+
+Repair
+→ 下游 acceptance / verification 提供了新 evidence，
+  让 upstream WRITE Node 修正已有 patch
+```
+
+典型闭环：
+
+```text
+Implement
+   ↓
+Verify
+   │
+   └─ tests fail
+        ↓
+Repair Implement with failure handoff
+        ↓
+Verify again
+```
+
+MVP 推荐：
+
+```text
+max_repairs_per_write = 1
+```
+
+Repair 不创建任意新 DAG topology，而是静态 DAG 上的 bounded attempt state machine。
+
+优先只支持：
+
+> **single-writer → deterministic verification failure → repair → reverify**
+
+多 Writer repair、任意 rollback、Reviewer-only feedback 自动修复暂不做。
+
+### 9.11 Execution-Time Replan Boundary
+
+只有：
+
+```text
+PLAN_INVALIDATED
+AND invalidating Node is READ
+AND no WRITE has executed
+AND replan budget remains
+```
+
+才能 replan。
+
+一旦发生 WRITE，任意 replan 一期关闭。
+
+### 9.12 Runtime Assembly Attestation
+
+Compile-time Provider feasibility 基于 A-SWE Provider Contract。
+
+但 DeerFlow 真正组装 Subagent 时还会执行：
+
+- `SubagentConfig.tools` allowlist；
+- `disallowed_tools` denylist；
+- runtime authorization filter；
+- Skill authorization；
+- MCP / deferred tool assembly；
+- Sandbox policy。
+
+因此实际 bound tools 可能被进一步收窄。
+
+DeerFlow `SubagentExecutor.assembly_descriptor` 在 assembly 后记录：
+
+- effective model；
+- authorization-filtered tools；
+- enabled skills；
+- effective policies；
+- assembly fingerprint。
+
+A-SWE Adapter 在 Node 结果中记录 descriptor / fingerprint，并检查：
+
+```text
+required_tools ⊆ actual_bound_tools
+required_skills ⊆ actual_enabled_skills  # when hard-required
+```
+
+若不满足：
+
+```text
+PROVIDER_ASSEMBLY_MISMATCH
+```
+
+Node 不得因为模型自报成功而被接受。
+
+DeerFlow 的 `AgentAssemblyObserver` 是 fail-open notification hook，异常会被吞并记录，因此不能作为 execution safety gate。
+
+### 9.13 Node-Scoped Least Privilege
+
+A-SWE 不应仅选择 Agent，然后让其继承一大包工具。
+
+ExecutionPlanValidator 生成：
+
+```python
+class NodeExecutionPolicy(BaseModel):
+    required_tools: list[str]
+    allowed_tools: list[str]
+    required_skills: list[str]
+
+    workspace_access: WorkspaceAccess
+
+    timeout_seconds: int
+    max_turns: int
+```
+
+Adapter 将 Node policy 映射成显式 `SubagentConfig.tools` allowlist。
+
+例如 Recon Probe：
+
+```text
+ls
+glob
+grep
+read_file
+```
+
+明确没有：
+
+```text
+bash
+write_file
+str_replace
+task
+```
+
+Runtime authorization 仍可进一步收窄，但不能由 A-SWE 绕过。
+
+### 9.14 Compiled Plan Descriptor / Fingerprint
+
+最终 Executable TaskDAG 需要稳定 identity。
+
+```python
+class CompiledPlanDescriptor(BaseModel):
+    repository_base_sha: str
+
+    task_contract_hash: str
+    validated_plan_hash: str
+
+    capability_registry_hash: str
+    provider_registry_hash: str
+    policy_hash: str
+
+    dag_hash: str
+
+    repairs: list[PlanRepair]
+    warnings: list[PlanWarning]
+
+    fingerprint: str
+```
+
+所有：
+
+- runtime-injected verification / review node；
+- workspace ordering edge；
+- acceptance canonicalization；
+- access upgrade；
+- normalization；
+
+都必须进入 repair / normalization log。
+
+Trace 最终关联：
+
+```text
+A-SWE Plan Fingerprint
+        │
+        ├── Node A → DeerFlow Assembly Fingerprint
+        ├── Node B → DeerFlow Assembly Fingerprint
+        └── Node C → DeerFlow Assembly Fingerprint
+```
+
+形成端到端 reproducibility evidence。
+
+### 9.15 Node 执行流程
 
 ```text
 NodeReady
@@ -1831,10 +2169,21 @@ Dependency Handoff Assemble
 WorkspaceAccessCheck
    │
    ▼
+WRITE? capture pre-attempt snapshot
+   │
+   ▼
 ExecutionBackend.execute_node()
    │
    ▼
-NodeExecutionResult
+Runtime Assembly Attestation
+   │
+   ▼
+Failure Classification
+   │
+   ├── safe retry
+   ├── dirty-write fail
+   ├── bounded repair
+   └── continue
    │
    ▼
 Acceptance Check
@@ -1849,10 +2198,34 @@ Create NodeHandoff
 Release Workspace Access
 ```
 
-### 9.10 一期不做
+### 9.16 一期 Runtime Budget
+
+所有预算必须属于 Runtime config，而不是 Prompt 建议。
+
+P1 建议初始值：
+
+```text
+max_work_items = 8
+max_parallel_read_nodes = min(3, backend_capacity)
+planning_attempts = 2
+execution_replans = 1        # pre-WRITE only
+max_repairs_per_write = 1
+```
+
+其中 DeerFlow 当前 pinned baseline 的 native subagent runtime 默认：
+
+```text
+max_running = 3
+```
+
+A-SWE 不应把自身并行预算设置得高于 backend 实际 capacity。
+
+### 9.17 一期不做
 
 - arbitrary execution-time DAG spawning；
+- dirty WRITE transactional rollback；
 - unlimited replanning；
+- multi-writer automatic repair；
 - parallel write merge；
 - distributed scheduler；
 - cross-machine workspace lock；
@@ -3373,7 +3746,17 @@ Plan Compiler Rules Audit In Progress
 - Scheduler 不再做 task decomposition；
 - DAG Edge 同时具有 control dependency 与 handoff data dependency；
 - 共享 Workspace 的无依赖 WRITE Nodes 由 Materializer 确定性串行化；
-- execution-time arbitrary DAG mutation 不属于 MVP。
+- execution-time arbitrary DAG mutation 不属于 MVP；
+- Plan validation 分为 Semantic 与 Execution 两阶段；
+- unordered READ / WRITE 同样需要 deterministic dependency normalization；
+- Retry、Repair、Replan、Fail-Closed 必须分离；
+- DeerFlow workspace snapshot 不是 transactional rollback；
+- dirty WRITE failure 一期禁止自动 retry；
+- Verification failure 使用 bounded repair，而不是重试 Tester；
+- execution-time replan 只允许发生在首次 WRITE 前；
+- DeerFlow AgentAssemblyDescriptor 用于 runtime assembly attestation；
+- AgentAssemblyObserver 是 fail-open observer，不能作为安全 gate；
+- Executable Plan 需要 canonical fingerprint 与 repair log。
 
 下一步继续审计：
 
