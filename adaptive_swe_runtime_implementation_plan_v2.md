@@ -1539,26 +1539,172 @@ LLM 的 coverage claim 本身不是完成证据，只是 Plan coverage metadata�
 
 #### 4.8.14 Contract → Execution Policy
 
+Constraint 不应只存在于 Planner Prompt 中。
+
+每个 CompiledConstraint 需要声明可执行 enforcement phase：
+
+```python
+class EnforcementPhase(str, Enum):
+    PLAN_VALIDATION = "plan_validation"
+    PRE_TOOL_GUARD = "pre_tool_guard"
+    POST_NODE_INVARIANT = "post_node_invariant"
+    FINAL_EVALUATION = "final_evaluation"
+    SEMANTIC_REVIEW = "semantic_review"
+```
+
 例如：
 
 ```text
-actions.forbidden = dependency_update
 repo.paths.allowed = src/auth/**
 ```
 
-ExecutionPlanValidator 将其编译到 Node policy / acceptance / repository invariant：
+可以编译为：
+
+```text
+PLAN_VALIDATION
+→ mutation node 的 declared scope 不得明显超出允许范围
+
+PRE_TOOL_GUARD
+→ write_file / str_replace 的 path 在执行前拦截
+
+POST_NODE_INVARIANT
+→ Git ChangeSet 检查实际 changed paths
+
+FINAL_EVALUATION
+→ 再次确认最终 Patch 未越界
+```
+
+再例如：
+
+```text
+verification.required = regression
+```
+
+对应：
+
+```text
+PLAN_VALIDATION
+→ 必须存在 verification obligation coverage
+
+POST_NODE_INVARIANT / Acceptance
+→ 检查真实 test evidence
+
+FINAL_EVALUATION
+→ contract verdict
+```
+
+semantic requirement：
+
+```text
+PLAN_VALIDATION
+→ 必须有 plan coverage
+
+SEMANTIC_REVIEW
+→ Reviewer / semantic judge
+
+FINAL_EVALUATION
+→ 无法确认则 UNVERIFIED
+```
+
+因此 ExecutionPlanValidator 应输出：
 
 ```text
 TaskContract
       ↓
 NodeExecutionPolicy
-      ↓
-DeerFlow tool allowlist / sandbox / post-write checks
+      ├─ tool allowlist
+      ├─ contract guard rules
+      ├─ workspace access
+      ├─ acceptance
+      └─ post-node invariants
 ```
 
-因此 constraint 不应只存在于 Planner Prompt 中。
+##### DeerFlow Pre-Tool Guard Reuse
 
-#### 4.8.15 Contract → Evaluation
+DeerFlow pinned baseline 的 `GuardrailMiddleware` 在工具执行前能够获取：
+
+```text
+tool_name
+tool_input
+thread_id
+run_id
+is_subagent
+tool provenance
+```
+
+并支持 fail-closed decision。
+
+因此 P1 不需要自己重写 Tool execution middleware；建议实现 DeerFlow-side：
+
+```text
+A-SWE ContractGuardrailProvider
+```
+
+由 Adapter 将当前 Node 的 contract policy 与 DeerFlow execution identity 关联。
+
+典型可 pre-enforce：
+
+- `write_file(path=...)`；
+- `str_replace(path=...)`；
+- 禁止修改 manifest / generated file；
+- 禁止特定 tool；
+- node-scoped action deny。
+
+但要注意：
+
+> `bash(command=...)` 是自由 shell，不能仅凭简单 path argument policy 证明其无写副作用。
+
+因此 bash-related constraint 仍需：
+
+- conservative WRITE scheduling；
+- command allow / exact test command policy（可验证时）；
+- post-node Git ChangeSet；
+- final contract evaluation。
+
+##### Defense in Depth
+
+Contract enforcement 采用：
+
+```text
+Plan-time prevention
+        +
+Pre-tool enforcement
+        +
+Post-node invariant
+        +
+Final evaluation
+```
+
+而不是依赖单一 Prompt 或单一 guard。
+
+DeerFlow Guardrail provider 异常时，A-SWE constrained execution 必须采用 fail-closed semantics。
+
+#### 4.8.15 Enforcement Guarantee Classification
+
+并非所有 Constraint 都能在执行前完全阻止。
+
+因此建议给 CompiledConstraint 增加：
+
+```python
+class EnforcementGuarantee(str, Enum):
+    PREVENTIVE = "preventive"
+    DETECTIVE = "detective"
+    SEMANTIC = "semantic"
+```
+
+例如：
+
+| Constraint | Guarantee |
+|---|---|
+| `write_file` path scope | PREVENTIVE + DETECTIVE |
+| final changed-path scope | DETECTIVE |
+| generic `bash` does not mutate source | DETECTIVE in P1 |
+| semantic behavior requirement | SEMANTIC |
+| required deterministic test command | PREVENTIVE where command allowlist applies + DETECTIVE via receipt |
+
+TaskContract UI / Trace 不应把“只能事后检测”的约束宣传为已 sandbox-enforced。
+
+#### 4.8.16 Contract → Evaluation
 
 TaskContract 必须贯穿到最终 Evaluation。
 
@@ -1603,7 +1749,7 @@ semantic requirement：
 
 > **undecidable ≠ passed**
 
-#### 4.8.16 Contract Fingerprint / Trace
+#### 4.8.17 Contract Fingerprint / Trace
 
 Constraint Trace 至少记录：
 
@@ -1639,7 +1785,7 @@ task_contract_hash
 
 > 当前 DAG 到底是在什么任务约束集合下被编译出来的？
 
-#### 4.8.17 Constraint Compiler Pipeline
+#### 4.8.18 Constraint Compiler Pipeline
 
 最终冻结为：
 
@@ -2172,11 +2318,23 @@ capability:
     - str_replace
 ```
 
-### 5.4 Capability Side-Effect Authority
+### 5.4 Capability / Tool Side-Effect Authority
 
-最终 `workspace_access` 不由 LLM 决定，而从 Capability metadata 编译。
+最终 `workspace_access` 不由 LLM 决定，也不能只从 Capability 的语义名称推断。
 
-例如：
+必须同时考虑：
+
+```text
+Capability Semantic Effect
++
+Actual Required Tool Effect
++
+Backend / Sandbox Contract
+        ↓
+Effective WorkspaceAccess
+```
+
+Capability metadata 只提供 semantic lower bound：
 
 ```text
 repo_exploration   → READ
@@ -2184,23 +2342,55 @@ code_search        → READ
 bug_diagnosis      → READ
 code_modification  → WRITE
 test_generation    → WRITE
-regression_testing → READ
+regression_testing → READ_HINT
 code_review        → READ
 ```
 
-若 WorkItem 同时包含多个 Capability：
+其中 `regression_testing → READ_HINT` 不能直接成为最终 READ。
 
-```text
-WorkspaceAccess = max(side_effects)
+原因：
+
+> DeerFlow 的 `bash` 是通用 shell execution；源码明确说明 local bash path validation **不实施 bash command write prevention**。测试命令可以生成 cache、coverage、snapshot、安装依赖，甚至修改源码。
+
+因此新增：
+
+```python
+class ToolEffect(str, Enum):
+    READ_ONLY = "read_only"
+    WORKSPACE_MUTATING = "workspace_mutating"
+    EXTERNAL_SIDE_EFFECT = "external_side_effect"
+    UNKNOWN = "unknown"
 ```
 
-一期定义：
+P1 保守分类：
+
+| Tool | ToolEffect |
+|---|---|
+| `ls` / `glob` / `grep` / `read_file` | READ_ONLY |
+| `write_file` / `str_replace` | WORKSPACE_MUTATING |
+| `bash` | WORKSPACE_MUTATING |
+| 未声明 effect 的 MCP / Extension Tool | UNKNOWN |
+
+最终编译：
 
 ```text
-READ < WRITE
+all required tools provably READ_ONLY
+AND capability semantic effect is read
+→ WorkspaceAccess.READ
+
+otherwise
+→ WorkspaceAccess.WRITE
 ```
 
-LLM 的 `effect_hint` 可以更保守，但不能把 Runtime 判定的 WRITE 降级为 READ。
+即：
+
+> **MVP 只有“可证明只读”才获得 READ；未知或可写一律按 WRITE 调度。**
+
+这意味着使用 `bash` 的 Tester / Verification Node 默认获得 Workspace 独占，而不是与其他 READ Node 并发。
+
+后续若引入命令级 effect verifier 或真正的 read-only sandbox，可以再缩窄该保守策略。
+
+LLM 的 `effect_hint` 仍然只是 hint，可以更保守，但不能降低 Runtime 从 Capability / Tool Contract 编译出的权限。
 
 ### 5.5 与 Plugin System 的边界
 
@@ -2566,15 +2756,44 @@ class TaskNode(BaseModel):
 
 ### 9.3 Side-Effect Compilation
 
-`workspace_access` 由 Runtime 根据 Capability metadata 编译。
+`workspace_access` 由 Runtime 根据：
 
 ```text
-READ + READ
+Capability Semantic Effect
++
+Node Required Tools
++
+ToolEffect Registry
++
+Backend Capability
+```
+
+联合编译。
+
+```text
+only provably read-only capabilities/tools
 → READ
 
-READ + WRITE
+any write-capable / unknown tool
 → WRITE
 ```
+
+因此：
+
+```text
+regression_testing + bash
+→ WRITE
+
+code_review + read_file/grep
+→ READ
+
+repo_exploration + read_file/glob/grep
+→ READ
+```
+
+这不是说“运行测试等价于修改业务代码”，而是表示：
+
+> Scheduler 无法证明 shell execution 对共享 Workspace 无副作用，因此需要独占。
 
 LLM `effect_hint` 不具有 authority。
 
@@ -2864,7 +3083,11 @@ class NodeExecutionPolicy(BaseModel):
     allowed_tools: list[str]
     required_skills: list[str]
 
+    tool_effects: dict[str, ToolEffect]
     workspace_access: WorkspaceAccess
+
+    contract_guard_rules: list[str]
+    post_node_invariants: list[str]
 
     timeout_seconds: int
     max_turns: int
@@ -2891,6 +3114,16 @@ task
 ```
 
 Runtime authorization 仍可进一步收窄，但不能由 A-SWE 绕过。
+
+对于使用 `bash` 的 Node：
+
+```text
+workspace_access = WRITE
+```
+
+除非未来 Backend 明确提供“可证明只读”的 shell contract。
+
+Tester 可以拥有 `bash`，但在调度层不再被视为 READ Node。
 
 ### 9.14 Compiled Plan Descriptor / Fingerprint
 
@@ -3893,6 +4126,7 @@ a-swe-runtime/
 │   ├── registry.py
 │   ├── resolver.py
 │   ├── provider.py
+│   ├── tool_effects.py
 │   └── schema.py
 │
 ├── team/
@@ -3935,6 +4169,7 @@ a-swe-runtime/
 │       ├── config_mapper.py
 │       ├── result_mapper.py
 │       ├── acceptance_adapter.py
+│       ├── contract_guardrail.py
 │       └── trace_adapter.py
 │
 ├── api/
@@ -4458,6 +4693,12 @@ PoC 矩阵：
 | POC-10 | tool receipts | 可关联 node → execution evidence |
 | POC-11 | sequential WRITE nodes | Repository 状态正确累计 |
 | POC-12 | Local AIO release / reclaim | Workspace 文件仍连续可见 |
+| POC-21 | Contract Guard：write_file 越界 path | tool 执行前 fail-closed deny |
+| POC-22 | Contract Guard：str_replace forbidden manifest | tool 执行前 deny |
+| POC-23 | Tester + bash | Node 被编译为 WRITE / exclusive |
+| POC-24 | Verification bash 产生 source mutation | post-node Git invariant 能检测并 fail |
+| POC-25 | Guard provider error under A-SWE constrained run | fail closed |
+| POC-26 | ordinary DeerFlow non-A-SWE run | A-SWE Node policy 不误作用于无关 run |
 
 Go / No-Go Tests：
 
@@ -4620,6 +4861,14 @@ Implementation PoC Pending
 - unknown explicit requirement → semantic.requirement，不静默丢弃；
 - Contract → Planner coverage → Execution Policy → Final Evaluation 闭环；
 - undecidable contract leaf → UNVERIFIED，不自动视为满足。
+- Contract constraint 必须声明 enforcement phase 与 guarantee；
+- DeerFlow GuardrailMiddleware 可复用为 PRE_TOOL_GUARD；
+- structured file tool path constraint 可执行前拦截；
+- generic bash 不具备 read-only guarantee；
+- WorkspaceAccess 必须综合 Capability + ToolEffect；
+- P1 仅将“可证明只读”的 Node 编译为 READ；
+- 使用 bash 的 Tester 默认 WRITE / exclusive；
+- sensitive constraint 采用 plan + pre-tool + post-node + final evaluation defense-in-depth。
 
 ---
 
@@ -4705,7 +4954,9 @@ ValidatedWorkPlan
 - NodeHandoff schema；
 - DAG Materializer；
 - TaskNode；
-- deterministic WRITE serialization。
+- ToolEffect Registry；
+- Capability + Tool Effect workspace access compiler；
+- deterministic workspace-conflict serialization。
 
 目标：
 
@@ -4723,8 +4974,11 @@ Executable TaskDAG
 - Ready Node calculation；
 - Dependency Handoff Routing；
 - READ / WRITE Workspace Access；
-- READ-only Basic Parallel Execution；
-- WRITE Exclusive Execution；
+- provably READ-only Basic Parallel Execution；
+- WRITE / UNKNOWN-MUTATING Exclusive Execution；
+- ContractGuardrailProvider integration；
+- Pre-tool constraint guard；
+- Post-node Git-aware contract invariant；
 - Retry；
 - Cancellation；
 - Failure Propagation；
