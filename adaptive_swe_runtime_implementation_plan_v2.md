@@ -763,7 +763,17 @@ Basic RepositoryProfile
 Targeted Profile Evidence
 ```
 
-输出 `TaskSpec`。
+其模型调用不直接依赖 DeerFlow 私有模型工厂，而通过 A-SWE 的 `ReasoningBackend` 完成结构化推理。
+
+输出：
+
+```text
+TaskSpec
++
+TaskContractDraft
+```
+
+其中 `TaskSpec` 表示任务理解结果；`TaskContractDraft` 保存带来源与权威级别的候选约束。
 
 示例：
 
@@ -792,6 +802,93 @@ class TaskSpec(BaseModel):
 > `capability_hints` 只是 Task-Level semantic hints，不是最终 authoritative `required_capabilities`。
 
 最终 Required Capability 由 Validated Work Items 在 Node-Level 产生。
+
+### 4.4.1 ReasoningBackend
+
+A-SWE Core 不直接调用：
+
+```python
+deerflow.models.create_chat_model
+```
+
+也不自行维护第二套 provider credential / model configuration。
+
+建议定义：
+
+```python
+class ReasoningBackend(Protocol):
+    async def generate_structured(
+        self,
+        *,
+        purpose: str,
+        system_prompt: str,
+        data_context: str,
+        response_schema: dict,
+        model_role: str | None = None,
+    ) -> StructuredReasoningResult:
+        ...
+```
+
+DeerFlow integration 实现优先复用公开的：
+
+```text
+deerflow_extension_api.ModelInvoker
+```
+
+其已经提供：
+
+- operator-granted logical model roles；
+- timeout / concurrency / input-output bounds；
+- JSON Schema validation；
+- normalized provider errors；
+- usage metadata；
+- host-owned provider credentials。
+
+建议 logical roles：
+
+```text
+task_analyzer → analyzer
+semantic_planner → planner
+```
+
+A-SWE Core 只认识 logical role，不绑定具体模型厂商。
+
+### 4.4.2 TaskContract Draft
+
+Task Analyzer 不再把所有信息平铺进 `TaskSpec` 并视为同等权威。
+
+新增：
+
+```python
+class ConstraintSource(str, Enum):
+    RUNTIME_POLICY = "runtime_policy"
+    USER_EXPLICIT = "user_explicit"
+    REPOSITORY_GUIDANCE = "repository_guidance"
+    ANALYZER_INFERRED = "analyzer_inferred"
+    RECON_INFERRED = "recon_inferred"
+
+class ConstraintDraft(BaseModel):
+    kind: str
+    value: object
+
+    source: ConstraintSource
+    hard: bool
+
+    evidence: str | None = None
+    evidence_ref: str | None = None
+
+class TaskContractDraft(BaseModel):
+    deliverables: list[ConstraintDraft]
+    constraints: list[ConstraintDraft]
+    forbidden_actions: list[ConstraintDraft]
+    verification_requirements: list[ConstraintDraft]
+```
+
+注意：
+
+> Draft 只是 Analyzer Proposal，不是最终 authoritative TaskContract。
+
+它必须经过后续 `ConstraintCompiler` 做 provenance validation、conflict resolution 与 policy merge。
 
 ### 4.5 Task Analyzer Rule Validation
 
@@ -915,7 +1012,41 @@ class ReconReport(BaseModel):
 
 其中 path / line range 由 Runtime 做基础可验证性检查。
 
-### 4.8 Repository Evidence Trust Boundary
+### 4.8 TaskContract / Constraint Compiler Boundary
+
+TaskSpec 解决：
+
+> **系统如何理解任务。**
+
+TaskContract 解决：
+
+> **系统最终必须满足什么、禁止什么、哪些条件具有何种 authority。**
+
+编译链：
+
+```text
+TaskRequest
++
+Runtime Policy
++
+Repository Guidance
++
+TaskContractDraft
+      ↓
+ConstraintCompiler
+      ↓
+Compiled TaskContract
+      ↓
+SemanticPlanner / PlanValidator
+```
+
+核心原则：
+
+> **Inference can inform planning, but only compiled authority can constrain execution.**
+
+ConstraintCompiler 的具体规则在 P0-4 审计中继续冻结。
+
+### 4.9 Repository Evidence Trust Boundary
 
 Repository 内容、Recon 输出和 predecessor Agent 报告都是：
 
@@ -958,16 +1089,23 @@ user/model-influenced text → sanitized HumanMessage data channel
 
 A-SWE 必须沿用这一边界。
 
-### 4.9 SemanticPlanner
+### 4.10 SemanticPlanner
 
 SemanticPlanner 输入：
 
 ```text
 TaskSpec
+Compiled TaskContract
 RepositoryProfile
 ReconReport（如果存在）
 Capability Catalog（只提供语义能力，不提供 Agent roster）
 ```
+
+其中：
+
+- `TaskSpec` 提供 task classification / risk / scope inference；
+- `TaskContract` 提供 authoritative deliverables / constraints / forbidden actions / verification obligations；
+- Repository / Recon 信息属于 untrusted evidence，不可提升为 Runtime Policy。
 
 Planner 不应该看到：
 
@@ -984,7 +1122,7 @@ Planner 只回答：
 
 > 为完成任务，需要哪些 bounded work packages？
 
-### 4.10 WorkPlanProposal
+### 4.11 WorkPlanProposal
 
 LLM 只输出 proposal，不直接输出可执行 `TaskDAG`。
 
@@ -1006,7 +1144,7 @@ class WorkPlanProposal(BaseModel):
     rationale: str
 ```
 
-### 4.11 Node Boundary Policy
+### 4.12 Node Boundary Policy
 
 DAG Node 是：
 
@@ -1066,7 +1204,7 @@ workspace_access = WRITE
 
 > **在 specialization / parallelism / verification benefit 与 handoff / duplicate discovery / coordination cost 之间选择最小合理 work package。**
 
-### 4.12 Two-Stage Plan Compiler
+### 4.13 Two-Stage Plan Compiler
 
 Plan validation 分为两道关：
 
@@ -1118,7 +1256,7 @@ Provider Assignment 后判断：
 
 > **semantic plan valid ≠ executable under the current deployment**
 
-### 4.13 PlanValidator / PlanNormalizer
+### 4.14 PlanValidator / PlanNormalizer
 
 LLM Proposal 必须经过 deterministic validation。
 
@@ -1182,7 +1320,7 @@ same-provider handoff overhead
 
 一期先记录 Trace Warning；只有语义单调、安全的 normalization 才自动应用。
 
-### 4.14 Acceptance Compilation
+### 4.15 Acceptance Compilation
 
 Planner 的 `acceptance_intent` 是语义意图，不直接成为 DeerFlow canonical acceptance criteria。
 
@@ -1210,7 +1348,7 @@ tests_passed:<resolved-test-command>
 
 不把 “looks correct” 之类自由文本伪装成 deterministic acceptance。
 
-### 4.15 Capability 从 Task-Level 下沉到 WorkItem-Level
+### 4.16 Capability 从 Task-Level 下沉到 WorkItem-Level
 
 authoritative capability flow：
 
@@ -1230,7 +1368,7 @@ Task-level capability set：
 Union(all validated work-item capabilities)
 ```
 
-### 4.16 Handoff Contract
+### 4.17 Handoff Contract
 
 DAG dependency 不只表示 control order，还表示 data handoff。
 
@@ -1258,7 +1396,7 @@ class NodeHandoff(BaseModel):
 
 后续若确有价值，再扩展结构化 findings / unresolved_questions。
 
-### 4.17 Planning Replan Boundary
+### 4.18 Planning Replan Boundary
 
 一期区分 planning-time replan 与 execution-time replan。
 
@@ -2954,6 +3092,9 @@ A-SWE Runtime 一期完整链路：
 TaskRequest
      │
      ▼
+Runtime Policy Snapshot
+     │
+     ▼
 Workspace Bootstrap
      │
      ▼
@@ -2962,10 +3103,17 @@ Basic RepositoryProfile
      ▼
 Task Analyzer
      │
-     ▼
-TaskSpec
+     ├──────────────→ TaskSpec
      │
-     ▼
+     └──────────────→ TaskContractDraft
+                         │
+                         ▼
+                  Constraint Compiler
+                         │
+                         ▼
+                  Compiled TaskContract
+                         │
+                         ▼
 Targeted Repository Profiling
      │
      ▼
@@ -3065,7 +3213,14 @@ a-swe-runtime/
 ├── task/
 │   ├── analyzer.py
 │   ├── schema.py
+│   ├── contract.py
+│   ├── constraints.py
 │   └── validator.py
+│
+├── reasoning/
+│   ├── backend.py
+│   ├── schema.py
+│   └── errors.py
 │
 ├── workspace/
 │   ├── session.py
@@ -3130,6 +3285,7 @@ a-swe-runtime/
 ├── integrations/
 │   └── deerflow/
 │       ├── backend.py
+│       ├── reasoning.py
 │       ├── config_mapper.py
 │       ├── result_mapper.py
 │       ├── acceptance_adapter.py
@@ -3178,6 +3334,8 @@ Evaluation
 - `workspace/` 不依赖 Team Builder；
 - Repository lifecycle 属于 `workspace/` Runtime infrastructure；
 - `task/` 不依赖具体 Agent；
+- `reasoning/` 只定义 provider-neutral structured reasoning contract；
+- Task Analyzer / SemanticPlanner 只能通过 `ReasoningBackend` 调用模型；
 - `planning/` 不依赖 DeerFlow；
 - SemanticPlanner 不直接读取 Agent roster；
 - `capability/` 不依赖 DeerFlow；
@@ -3206,6 +3364,18 @@ NodeExecutionResult / NodeAcceptanceResult
 ```
 
 A-SWE 核心 Planning / Scheduler 代码禁止散落 `deerflow.*` import。
+
+DeerFlow integration 分为两条 Anti-Corruption seam：
+
+```text
+ReasoningBackend
+→ DeerFlow ModelInvoker
+
+ExecutionBackend
+→ DeerFlow SubagentExecutor
+```
+
+P1 暂不使用 `AgentRuns` 作为细粒度 DAG Worker，因为 AgentRuns 的 Custom Agent 与 thread 绑定，而 A-SWE 需要多个不同 Provider 共享同一 WorkspaceSession / thread filesystem。
 
 ---
 
@@ -3757,6 +3927,10 @@ Plan Compiler Rules Audit In Progress
 - DeerFlow AgentAssemblyDescriptor 用于 runtime assembly attestation；
 - AgentAssemblyObserver 是 fail-open observer，不能作为安全 gate；
 - Executable Plan 需要 canonical fingerprint 与 repair log。
+- Task Analyzer / SemanticPlanner 的模型调用通过 provider-neutral ReasoningBackend；
+- DeerFlow integration 优先复用公开 ModelInvoker 做 bounded structured reasoning；
+- TaskSpec 与 authoritative TaskContract 分离；
+- TaskContract / Constraint Compiler 进入下一轮 P0-4 审计。
 
 下一步继续审计：
 
@@ -3769,6 +3943,27 @@ DAG Materializer
 ```
 
 的 deterministic rule set、repair boundary 与 bounded replan policy。
+
+---
+
+#### P0-4：TaskContract / Constraint Compiler Audit
+
+状态：
+
+```text
+Audit In Progress
+```
+
+目标：
+
+- 冻结 ConstraintSource / authority model；
+- 区分 runtime-policy / user-explicit / repository-guidance / inference；
+- 定义 provenance validation；
+- 定义 hard / soft constraint；
+- 定义 conflict resolution；
+- 定义 monotonic constraint repair；
+- 定义 TaskContract 与 SemanticPlanner / PlanValidator 的接口；
+- 定义 constraint trace / fingerprint。
 
 ---
 
@@ -3813,7 +4008,12 @@ DeerFlow Subagent Execution
 
 - RepositoryProfile；
 - Basic / Targeted Profiling；
+- ReasoningBackend；
+- DeerFlowReasoningBackend / ModelInvoker adapter；
 - TaskSpec；
+- TaskContractDraft；
+- ConstraintCompiler；
+- Compiled TaskContract；
 - Task Analyzer；
 - Planning Context Gate；
 - Read-only Recon Probe；
