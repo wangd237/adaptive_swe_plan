@@ -855,40 +855,42 @@ A-SWE Core 只认识 logical role，不绑定具体模型厂商。
 
 ### 4.4.2 TaskContract Draft
 
-Task Analyzer 不再把所有信息平铺进 `TaskSpec` 并视为同等权威。
+Task Analyzer 不再直接产出带 authority 的 `ConstraintSource / hard` 字段。
 
-新增：
+原因：
+
+> **模型可以提出 constraint candidate，但不能自己证明来源，也不能自己决定执行权威。**
+
+Analyzer 只输出候选：
 
 ```python
-class ConstraintSource(str, Enum):
-    RUNTIME_POLICY = "runtime_policy"
-    USER_EXPLICIT = "user_explicit"
-    REPOSITORY_GUIDANCE = "repository_guidance"
-    ANALYZER_INFERRED = "analyzer_inferred"
-    RECON_INFERRED = "recon_inferred"
-
-class ConstraintDraft(BaseModel):
-    kind: str
+class ConstraintCandidate(BaseModel):
+    key: str
+    operator: str
     value: object
 
-    source: ConstraintSource
-    hard: bool
+    # model hint only
+    origin_hint: str | None = None
+    modality_hint: str | None = None
 
-    evidence: str | None = None
-    evidence_ref: str | None = None
+    evidence_quote: str | None = None
+    evidence_locator: str | None = None
 
 class TaskContractDraft(BaseModel):
-    deliverables: list[ConstraintDraft]
-    constraints: list[ConstraintDraft]
-    forbidden_actions: list[ConstraintDraft]
-    verification_requirements: list[ConstraintDraft]
+    candidates: list[ConstraintCandidate]
 ```
 
-注意：
+其中：
 
-> Draft 只是 Analyzer Proposal，不是最终 authoritative TaskContract。
+- `origin_hint` 不是 provenance；
+- `modality_hint` 不是 enforcement；
+- `evidence_quote / locator` 是 Compiler 做 provenance validation 的输入；
+- Runtime Policy constraint 不由 Analyzer 抽取，而由 Runtime deterministic 注入；
+- Analyzer / Recon inference 默认只进入 TaskSpec / PlanningContext，不自动成为 Hard Contract。
 
-它必须经过后续 `ConstraintCompiler` 做 provenance validation、conflict resolution 与 policy merge。
+核心原则：
+
+> **No model-supplied field is allowed to self-elevate into execution authority.**
 
 ### 4.5 Task Analyzer Rule Validation
 
@@ -1012,7 +1014,7 @@ class ReconReport(BaseModel):
 
 其中 path / line range 由 Runtime 做基础可验证性检查。
 
-### 4.8 TaskContract / Constraint Compiler Boundary
+### 4.8 TaskContract / Constraint Compiler
 
 TaskSpec 解决：
 
@@ -1020,31 +1022,668 @@ TaskSpec 解决：
 
 TaskContract 解决：
 
-> **系统最终必须满足什么、禁止什么、哪些条件具有何种 authority。**
+> **系统最终必须满足什么、禁止什么，以及这些条件由谁授权、如何合并、如何验证。**
 
-编译链：
+#### 4.8.1 Provenance Authenticity ≠ Instruction Authority
+
+Constraint Compiler 必须把下面三个概念分开：
 
 ```text
-TaskRequest
+Origin
+→ 这条约束来自哪里？
+
+Provenance
+→ Runtime 能否证明它确实来自那里？
+
+Enforcement
+→ 最终执行时它有多强？
+```
+
+DeerFlow 的 Project Context 已证明这种区分是必要的：
+
+- server-owned provenance 能证明该块确实由 middleware 注入；
+- 其中 project instructions 仍然是 untrusted user text；
+- provenance authenticity 不会自动提升 instruction authority。
+
+因此 A-SWE 不使用单一 `source + hard` 模型。
+
+#### 4.8.2 Immutable TaskRequest Envelope
+
+P1 创建 immutable task source：
+
+```python
+class TaskRequestEnvelope(BaseModel):
+    request_id: str
+    raw_text: str
+    content_hash: str
+```
+
+Task Analyzer / Constraint Extractor 读取同一个 `raw_text`。
+
+类似 DeerFlow 保留 `original_user_content`：
+
+> Runtime 后续判断 user-explicit constraint 时，必须回到原始用户文本，而不能从经过 prompt wrapping / middleware enrichment / Planner paraphrase 后的文本反推用户意图。
+
+一期不允许外部调用者直接提供 Compiler-owned provenance metadata。
+
+#### 4.8.3 Constraint Origin
+
+最终 CompiledConstraint 只使用 Runtime 签发的 Origin：
+
+```python
+class ConstraintOrigin(str, Enum):
+    RUNTIME_POLICY = "runtime_policy"
+    USER_EXPLICIT = "user_explicit"
+    REPOSITORY_GUIDANCE = "repository_guidance"
+    RUNTIME_DERIVED = "runtime_derived"
+```
+
+注意：
+
+```text
+ANALYZER_INFERRED
+RECON_INFERRED
+```
+
+不作为最终 authoritative origin。
+
+它们可以：
+
+- 影响 TaskSpec；
+- 触发 deterministic Runtime Policy Rule；
+- 影响 Planner context；
+
+但不能直接变成 Hard Constraint。
+
+例如：
+
+```text
+Analyzer:
+risk = high
+
+Runtime rule:
+RISK-REVIEW-001
+high risk → require review
+
+Compiled origin:
+RUNTIME_DERIVED
+```
+
+而不是：
+
+```text
+origin = ANALYZER_INFERRED
+hard = true
+```
+
+#### 4.8.4 Constraint Provenance
+
+建议：
+
+```python
+class ConstraintEvidenceRef(BaseModel):
+    source_kind: Literal[
+        "task_request",
+        "runtime_policy",
+        "repository_file",
+        "task_spec",
+    ]
+
+    source_id: str
+    source_hash: str
+
+    locator: str
+    quote: str | None = None
+
+class ConstraintProvenance(BaseModel):
+    origin: ConstraintOrigin
+    evidence: list[ConstraintEvidenceRef]
+
+    provenance_verified: bool
+
+    extraction_method: Literal[
+        "deterministic",
+        "llm",
+    ]
+```
+
+重要区别：
+
+```text
+provenance_verified = true
+```
+
+只表示：
+
+> Compiler 可以证明“这段 source text / policy rule / repository range”确实存在。
+
+它不表示：
+
+> LLM 对该文本语义的解析一定正确。
+
+这种区别必须在 Trace 中保留。
+
+#### 4.8.5 Compiler-Owned Provenance Stamp
+
+Analyzer 若输出：
+
+```yaml
+origin_hint: user_explicit
+evidence_quote: "不要修改数据库 schema"
+```
+
+ConstraintCompiler 必须：
+
+1. 在 immutable `TaskRequestEnvelope.raw_text` 中验证 evidence；
+2. 校验 locator / quote 一致；
+3. canonicalize constraint；
+4. 最后由 Runtime 创建 `ConstraintProvenance(origin=USER_EXPLICIT)`。
+
+如果 evidence 无法验证：
+
+```text
+origin_hint = user_explicit
+→ 不得保留 USER_EXPLICIT authority
+```
+
+结果可以：
+
+```text
+drop candidate
+or
+demote to analyzer inference
+or
+emit compiler diagnostic
+```
+
+但不能信任模型自报 provenance。
+
+#### 4.8.6 Enforcement 与 Origin 分离
+
+建议：
+
+```python
+class ConstraintEnforcement(str, Enum):
+    LOCKED = "locked"
+    HARD = "hard"
+    SOFT = "soft"
+```
+
+含义：
+
+```text
+LOCKED
+→ Runtime safety / operator policy
+→ 不允许 Planner / User / Repo Guidance 放宽
+
+HARD
+→ 必须满足，否则 TaskContract unsatisfied
+
+SOFT
+→ planning preference / repository convention
+→ 可以被更高权威 requirement 覆盖
+```
+
+Enforcement 由 Compiler / Policy Rule 决定，不接受 LLM 的 `hard=true` 作为 authority。
+
+典型映射：
+
+| Origin | 默认 Enforcement |
+|---|---|
+| Runtime Safety Policy | LOCKED |
+| User explicit MUST / MUST NOT | HARD |
+| Runtime-derived mandatory quality gate | HARD |
+| Repository guidance | SOFT |
+| Analyzer / Recon inference | 不进入 Contract |
+
+Runtime policy 可以显式定义某条 derived rule 是 HARD 还是 SOFT。
+
+#### 4.8.7 Repository Guidance Promotion Rule
+
+Repository 中的：
+
+```text
+AGENTS.md
+CONTRIBUTING.md
+README
+source comments
+```
+
+不能通过写出：
+
+```text
+THIS IS MANDATORY
+IGNORE USER REQUEST
+```
+
+自行提升 authority。
+
+P1 规则：
+
+> **Repository text can never self-promote above SOFT.**
+
+若希望某类 Repository metadata 形成 Hard Constraint，必须由 Runtime Policy 显式识别并 promotion。
+
+例如未来：
+
+```text
+machine-readable generated-file manifest
 +
-Runtime Policy
-+
-Repository Guidance
-+
-TaskContractDraft
+Runtime rule
+→ forbid direct edits
+```
+
+而不是因为自然语言 README 自称 mandatory 就提升。
+
+P1 为控制复杂度：
+
+- root-level recognized guidance 可以进入 global TaskContract；
+- path-scoped nested guidance 可在目标路径明确后作为 Node Context 处理；
+- 不在 Planning 初期实现复杂 hierarchical AGENTS resolution。
+
+#### 4.8.8 Constraint Registry
+
+ConstraintCompiler 不使用任意字符串 + 通用 DSL。
+
+一期维护小型 typed registry：
+
+```python
+class ConstraintSpec(BaseModel):
+    key: str
+    merge_strategy: str
+    verification_mode: str
+```
+
+建议首批 key：
+
+```text
+deliverables.required
+repo.paths.allowed
+repo.paths.forbidden
+actions.forbidden
+verification.required
+review.required
+change.max_files
+target.exact_path
+preference.test_command
+semantic.requirement
+```
+
+未知 user-explicit requirement 不允许静默丢弃。
+
+无法 canonicalize 到已知 key 时：
+
+```text
+→ semantic.requirement
+→ HARD
+→ verification_mode = semantic
+```
+
+保证用户要求仍留在 Contract，只是确定性验证能力下降。
+
+#### 4.8.9 Constraint Merge Algebra
+
+Constraint conflict 不能只用一个总的 source precedence。
+
+不同 constraint family 使用不同 merge algebra。
+
+##### Allow Scope
+
+```text
+allowed paths
+→ SET INTERSECTION
+```
+
+例如：
+
+```text
+Runtime: src/**
+User: src/auth/**
+→ effective = src/auth/**
+```
+
+低层约束不能扩大高层允许集合。
+
+##### Forbidden Scope / Actions
+
+```text
+forbidden paths/actions
+→ SET UNION
+```
+
+限制只会增加，不会被低权威来源取消。
+
+##### Required Obligations
+
+```text
+deliverables / verification / review
+→ SET UNION
+```
+
+兼容义务共同保留。
+
+##### Maximum Budget
+
+```text
+max_changed_files
+max_runtime_cost
+→ MIN
+```
+
+低层请求不能突破 Runtime ceiling。
+
+##### Exact Choice
+
+```text
+target.exact_path
+single required mode
+→ EXACT / conflict detection
+```
+
+两个 incompatible HARD 值：
+
+```text
+→ CONTRACT_UNSATISFIABLE
+```
+
+##### Soft Preference
+
+```text
+preferred test command / style preference
+→ PRIORITY SELECT
+```
+
+一期 soft precedence：
+
+```text
+USER_EXPLICIT
+>
+REPOSITORY_GUIDANCE
+>
+Runtime default preference
+```
+
+但 LOCKED/HARD 不通过 soft precedence 解决，而通过 constraint algebra / conflict detection 处理。
+
+#### 4.8.10 Conflict Resolution
+
+典型矩阵：
+
+| Conflict | P1 行为 |
+|---|---|
+| User 请求 Runtime LOCKED 禁止动作 | `CONTRACT_POLICY_CONFLICT`，不静默降级执行 |
+| 两个 user-explicit HARD 约束互斥 | `CONTRACT_UNSATISFIABLE` |
+| User HARD vs Repository SOFT | User wins，记录 overridden-guidance warning |
+| Repository SOFT vs Repository SOFT | deterministic priority / warning，不升级 Hard |
+| Runtime-derived HARD + User HARD 兼容 | union |
+| Runtime-derived HARD + User HARD 不兼容 | unsatisfiable / policy conflict，不能偷偷删除一方 |
+| Unknown source / unverifiable provenance | 不得提升到 authoritative constraint |
+
+如果系统运行在 interactive mode：
+
+```text
+CONTRACT_UNSATISFIABLE
+→ 可以进入 clarification
+```
+
+Headless / Demo MVP：
+
+```text
+→ fail with explicit diagnostics
+```
+
+#### 4.8.11 Monotonic Constraint Repair
+
+ConstraintCompiler 允许的自动 repair 必须满足：
+
+> **只收窄权限、增加验证或规范化表达，不改变用户核心目标。**
+
+允许：
+
+```text
+normalize path spelling
+deduplicate equivalent constraint
+runtime ceiling clamp
+merge forbidden sets
+add mandatory review derived from policy
+promote deterministic verification obligation
+```
+
+禁止：
+
+```text
+删除 user HARD requirement
+替换用户目标文件
+把禁止动作改成允许
+为了让计划可执行而弱化 acceptance
+```
+
+后者必须进入：
+
+```text
+contract conflict
+or
+replan / clarification
+```
+
+#### 4.8.12 CompiledTaskContract
+
+建议：
+
+```python
+class CompiledConstraint(BaseModel):
+    id: str
+
+    key: str
+    operator: str
+    value: object
+
+    enforcement: ConstraintEnforcement
+    provenance: ConstraintProvenance
+
+    verification_mode: Literal[
+        "deterministic",
+        "semantic",
+        "none",
+    ]
+
+    contributors: list[str]
+
+class CompiledTaskContract(BaseModel):
+    task_request_hash: str
+    runtime_policy_hash: str
+    repository_base_sha: str
+
+    constraints: list[CompiledConstraint]
+
+    compiler_repairs: list[dict]
+    warnings: list[dict]
+
+    fingerprint: str
+```
+
+CompiledTaskContract 是 immutable runtime artifact。
+
+#### 4.8.13 Contract → Planner Coverage
+
+SemanticPlanner 不只生成 WorkItem，还需要声明 positive obligation coverage。
+
+建议扩展：
+
+```python
+class WorkItemProposal(BaseModel):
+    id: str
+    objective: str
+
+    capability_hints: list[str]
+    depends_on: list[str]
+
+    satisfies: list[str] = []
+
+    effect_hint: Literal["read", "write"] | None = None
+    acceptance_intent: list[str] = []
+```
+
+其中 `satisfies` 引用 `CompiledConstraint.id`。
+
+SemanticPlanValidator 检查：
+
+```text
+所有 LOCKED / HARD positive obligation
+→ 必须存在 coverage 或 Runtime-owned enforcement
+```
+
+负向 constraint 不要求 Planner 每个节点重复声明，而由 ExecutionPlanValidator / NodeExecutionPolicy 全局应用。
+
+LLM 的 coverage claim 本身不是完成证据，只是 Plan coverage metadata。
+
+#### 4.8.14 Contract → Execution Policy
+
+例如：
+
+```text
+actions.forbidden = dependency_update
+repo.paths.allowed = src/auth/**
+```
+
+ExecutionPlanValidator 将其编译到 Node policy / acceptance / repository invariant：
+
+```text
+TaskContract
       ↓
-ConstraintCompiler
+NodeExecutionPolicy
       ↓
-Compiled TaskContract
+DeerFlow tool allowlist / sandbox / post-write checks
+```
+
+因此 constraint 不应只存在于 Planner Prompt 中。
+
+#### 4.8.15 Contract → Evaluation
+
+TaskContract 必须贯穿到最终 Evaluation。
+
+```text
+CompiledTaskContract
       ↓
-SemanticPlanner / PlanValidator
+Execution
+      ↓
+Git ChangeSet / Receipts / Tests / Reviewer Evidence
+      ↓
+TaskContractEvaluator
+      ↓
+ContractVerdict
+```
+
+约束结果至少：
+
+```text
+SATISFIED
+VIOLATED
+UNVERIFIED
+NOT_APPLICABLE
+```
+
+确定性约束：
+
+- changed paths；
+- max changed files；
+- forbidden file modification；
+- required test evidence；
+
+优先代码检查。
+
+semantic requirement：
+
+```text
+→ reviewer / semantic evaluator
+→ 无法确认时保持 UNVERIFIED
+```
+
+沿用 DeerFlow acceptance checker 的原则：
+
+> **undecidable ≠ passed**
+
+#### 4.8.16 Contract Fingerprint / Trace
+
+Constraint Trace 至少记录：
+
+```text
+CandidateExtracted
+ProvenanceValidated
+ConstraintCanonicalized
+ConstraintMerged
+ConstraintOverridden
+ConstraintConflict
+TaskContractCompiled
+TaskContractEvaluated
+```
+
+TaskContract fingerprint 必须绑定：
+
+```text
+TaskRequest hash
+Runtime policy snapshot hash
+Repository base SHA
+Relevant repository guidance hashes
+Compiled constraint set
+Compiler version / rule-set version
+```
+
+最终 Plan fingerprint 再包含：
+
+```text
+task_contract_hash
+```
+
+从而回答：
+
+> 当前 DAG 到底是在什么任务约束集合下被编译出来的？
+
+#### 4.8.17 Constraint Compiler Pipeline
+
+最终冻结为：
+
+```text
+Immutable TaskRequest
+        │
+        ├─────────────→ Runtime Policy Projection
+        │
+        ├─────────────→ User Constraint Extraction
+        │
+        └─────────────→ Repository Guidance Extraction
+                              │
+                              ▼
+                    Constraint Candidates
+                              │
+                              ▼
+                    Provenance Validation
+                              │
+                              ▼
+                  Canonicalization / Registry
+                              │
+                              ▼
+                    Enforcement Assignment
+                              │
+                              ▼
+                      Typed Merge Algebra
+                              │
+                              ▼
+                     Conflict Detection
+                              │
+                              ▼
+                   Monotonic Normalization
+                              │
+                              ▼
+                    CompiledTaskContract
+                              │
+                 ┌────────────┴─────────────┐
+                 ▼                          ▼
+          Semantic Planner             Final Evaluator
 ```
 
 核心原则：
 
-> **Inference can inform planning, but only compiled authority can constrain execution.**
-
-ConstraintCompiler 的具体规则在 P0-4 审计中继续冻结。
+> **The model extracts candidate constraints; the runtime authenticates, merges, enforces, and evaluates them.**
 
 ### 4.9 Repository Evidence Trust Boundary
 
@@ -1133,6 +1772,9 @@ class WorkItemProposal(BaseModel):
 
     capability_hints: list[str]
     depends_on: list[str]
+
+    # references CompiledConstraint.id for positive obligations
+    satisfies: list[str] = []
 
     # hint only; runtime owns final side effect
     effect_hint: Literal["read", "write"] | None = None
@@ -3215,6 +3857,9 @@ a-swe-runtime/
 │   ├── schema.py
 │   ├── contract.py
 │   ├── constraints.py
+│   ├── provenance.py
+│   ├── constraint_registry.py
+│   ├── constraint_compiler.py
 │   └── validator.py
 │
 ├── reasoning/
@@ -3272,6 +3917,7 @@ a-swe-runtime/
 │
 ├── evaluation/
 │   ├── evaluator.py
+│   ├── contract_evaluator.py
 │   ├── acceptance.py
 │   ├── checks.py
 │   └── reviewer.py
@@ -3951,7 +4597,8 @@ DAG Materializer
 状态：
 
 ```text
-Audit In Progress
+Architecture Audited
+Implementation PoC Pending
 ```
 
 目标：
@@ -3964,6 +4611,15 @@ Audit In Progress
 - 定义 monotonic constraint repair；
 - 定义 TaskContract 与 SemanticPlanner / PlanValidator 的接口；
 - 定义 constraint trace / fingerprint。
+- provenance authenticity 与 instruction authority 分离；
+- compiler-owned provenance stamping；
+- `LOCKED / HARD / SOFT` enforcement；
+- repository guidance 默认 SOFT 且禁止 self-promotion；
+- typed merge algebra；
+- user/runtime/repository conflict matrix；
+- unknown explicit requirement → semantic.requirement，不静默丢弃；
+- Contract → Planner coverage → Execution Policy → Final Evaluation 闭环；
+- undecidable contract leaf → UNVERIFIED，不自动视为满足。
 
 ---
 
@@ -4012,8 +4668,11 @@ DeerFlow Subagent Execution
 - DeerFlowReasoningBackend / ModelInvoker adapter；
 - TaskSpec；
 - TaskContractDraft；
+- Constraint Provenance Validation；
+- Constraint Registry / Merge Algebra；
 - ConstraintCompiler；
-- Compiled TaskContract；
+- CompiledTaskContract / fingerprint；
+- Contract coverage validation；
 - Task Analyzer；
 - Planning Context Gate；
 - Read-only Recon Probe；
@@ -4099,6 +4758,7 @@ Executable TaskDAG
 - Reviewer；
 - Git-aware Repository ChangeSet；
 - DeerFlow Workspace ChangeSet；
+- TaskContractEvaluator / ContractVerdict；
 - Evaluation Report。
 
 #### P1-7：Demo Packaging
