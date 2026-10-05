@@ -627,114 +627,597 @@ deerflow/subagents/acceptance_checks.py
 
 ---
 
-## 4. Task Understanding：任务理解模块
+## 4. Task Understanding 与 Planning Pipeline
 
 ### 4.1 模块目标
 
-Task Analyzer 将自然语言形式的软件工程需求转换为结构化 `TaskSpec`。
+A-SWE 不让 Task Analyzer 直接产生最终 Capability / Team / DAG。
 
-系统接收到任务后，不应直接进入 Coding，而需要先判断：
-
-- 任务类型；
-- 技术栈；
-- Repository 影响范围；
-- 是否需要代码修改；
-- 是否需要测试；
-- 是否存在较高 Regression Risk；
-- 是否需要 Repository Exploration；
-- 是否需要 Reviewer；
-- 任务复杂度；
-- 所需 Capability。
-
-### 4.2 TaskSpec 数据结构
-
-示例任务：
-
-> Flask 项目在并发请求下偶发出现数据库连接泄漏，请定位问题，修复并添加 regression test。
-
-结构化输出：
-
-```yaml
-task:
-  type: bug_fix
-  description: database connection leak under concurrent requests
-
-scope:
-  repository_level: true
-  expected_files: unknown
-
-domains:
-  - python
-  - flask
-  - database
-  - concurrency
-
-requirements:
-  investigation: high
-  coding: medium
-  testing: high
-  review: true
-
-risk:
-  level: high
-  regression: high
-
-capabilities:
-  required:
-    - repo_exploration
-    - python_debugging
-    - database_analysis
-    - code_modification
-    - regression_testing
-
-estimated_complexity: medium
-```
-
-### 4.3 实现方式
-
-一期采用：
+一期将任务规划拆成：
 
 ```text
-LLM Structured Output
-        +
-Rule Validation
-        +
-Lightweight Heuristics
+Task Request
+      ↓
+Repository Profile
+      ↓
+Task Understanding
+      ↓
+Planning Context Acquisition
+      ↓
+Semantic Planning
+      ↓
+Plan Validation / Normalization
+      ↓
+Capability Resolution
+      ↓
+Provider / Team Selection
+      ↓
+DAG Materialization
 ```
 
-建议使用严格 Schema：
+核心原则：
+
+> **The planner proposes work packages; the runtime compiles and governs execution.**
+
+其中：
+
+```text
+LLM
+→ 理解语义、提出工作拆解
+
+Runtime
+→ 验证、修正、补全、绑定 Capability / Provider / Workspace Policy，并生成最终可执行 DAG
+```
+
+因此：
+
+> **LLM proposes semantics. Runtime owns execution semantics.**
+
+### 4.2 RepositoryProfile
+
+Planner 不应只根据用户一句自然语言需求凭空生成 Repository-Level Plan。
+
+Repository Bootstrap 完成后，Runtime 先产生廉价、确定性的 `RepositoryProfile`。
+
+建议：
+
+```python
+class RepositoryProfile(BaseModel):
+    base_sha: str
+
+    tracked_file_count: int
+    top_level_tree: list[str]
+
+    languages: dict[str, int]
+
+    manifests: list[str]
+    test_configs: list[str]
+    build_configs: list[str]
+    ci_configs: list[str]
+
+    guidance_files: list[str]
+
+    test_framework_hints: list[str]
+    build_system_hints: list[str]
+
+    task_anchor_matches: list[AnchorMatch]
+
+    truncated: bool
+```
+
+Basic Profile 每个 Repository-Level Task 都可以确定性采集：
+
+```text
+git metadata
+tracked file inventory
+shallow tree
+language distribution
+manifest files
+test/build configuration
+CI configuration
+guidance file inventory
+```
+
+一期不做：
+
+```text
+full repository embedding
+all-source-code LLM ingestion
+repository-wide semantic index requirement
+```
+
+### 4.3 Targeted Repository Profiling
+
+根据用户任务中的显式 anchor，再做廉价定向探测。
+
+例如任务包含：
+
+```text
+UserService.login
+/database/session
+specific error string
+config key
+API endpoint
+```
+
+Runtime 可以使用 deterministic search 获取：
+
+```text
+exact path match
+symbol/string match
+manifest match
+test-path match
+```
+
+目标是尽量减少 LLM Recon Probe 的必要性。
+
+### 4.4 TaskSpec
+
+Task Analyzer 输入：
+
+```text
+TaskRequest
++
+Basic RepositoryProfile
++
+Targeted Profile Evidence
+```
+
+输出 `TaskSpec`。
+
+示例：
 
 ```python
 class TaskSpec(BaseModel):
     task_type: TaskType
+    description: str
+
     domains: list[str]
     repository_level: bool
+
     complexity: Complexity
     risk: RiskLevel
-    required_capabilities: list[str]
+
     testing_required: bool
     review_required: bool
+
+    scope_hints: list[str]
+    capability_hints: list[str]
+
+    planning_uncertainties: list[str]
 ```
 
-### 4.4 Rule Validation
+其中：
 
-LLM 输出不能直接作为最终调度依据，需要执行规则修正。
+> `capability_hints` 只是 Task-Level semantic hints，不是最终 authoritative `required_capabilities`。
+
+最终 Required Capability 由 Validated Work Items 在 Node-Level 产生。
+
+### 4.5 Task Analyzer Rule Validation
+
+LLM 输出不能直接作为最终调度依据。
 
 例如：
 
 ```text
 如果 task_type == bug_fix
-→ 至少需要 code_modification
-
-如果 repository_level == true
-→ 默认加入 repo_exploration
-
-如果 risk == high
-→ 强制 review_required = true
+→ capability_hints 至少包含 code_modification
 
 如果用户明确要求 regression test
-→ 强制加入 regression_testing
+→ testing_required = true
+
+如果 risk == high
+→ review_required = true
+
+如果目标文件 / symbol 在 Profile 中没有解析到
+→ 增加 planning_uncertainty
+
+如果用户明确限定文件 / 模块
+→ 写入 scope_hints
 ```
+
+Task Analyzer 的 Rule Validation 只修正 TaskSpec，不创建 Agent 和 DAG。
+
+### 4.6 Planning Context Gate
+
+Runtime 根据 TaskSpec 与 RepositoryProfile 判断 Planner 是否已有足够 Repository Context。
+
+```text
+Basic Profile
+      +
+TaskSpec
+      +
+Targeted Evidence
+      ↓
+Planning Context Gate
+      /          \
+ enough        insufficient
+   │               │
+   │               ▼
+   │        Read-only Recon Probe
+   │               │
+   └───────┬───────┘
+           ▼
+     PlanningContext
+```
+
+一期可以使用确定性 trigger，而不是完全依赖模型自报 confidence。
+
+例如：
+
+```text
+repository_level == true
+AND
+task_type in {bug_fix, refactor, architecture_change}
+AND
+relevant target / root cause area unresolved
+→ Recon Probe
+
+task explicitly names exact file
+AND
+operation is local and low-risk
+→ skip Recon Probe
+```
+
+### 4.7 Read-only Reconnaissance Probe
+
+Recon Probe 属于：
+
+> **Planning Infrastructure**
+
+而不是最终 Execution Team 的业务节点。
+
+它使用同一个 WorkspaceSession，但必须严格只读。
+
+一期建议只暴露 DeerFlow read-only tools：
+
+```text
+ls
+glob
+grep
+read_file
+```
+
+禁止：
+
+```text
+bash
+write_file
+str_replace
+task
+MCP write tools
+```
+
+DeerFlow 当前工具分组已经明确区分：
+
+```text
+ls / read_file / glob / grep → file:read
+write_file / str_replace    → file:write
+bash                         → bash
+```
+
+Recon Probe 建议输出：
+
+```python
+class ReconFinding(BaseModel):
+    claim: str
+    path: str | None
+    line_start: int | None
+    line_end: int | None
+
+    confidence: Literal["observed", "inferred"]
+
+class ReconReport(BaseModel):
+    findings: list[ReconFinding]
+    likely_areas: list[str]
+    unresolved_questions: list[str]
+```
+
+其中 path / line range 由 Runtime 做基础可验证性检查。
+
+### 4.8 Repository Evidence Trust Boundary
+
+Repository 内容、Recon 输出和 predecessor Agent 报告都是：
+
+> **Untrusted Runtime Data**
+
+不能获得 Framework / System authority。
+
+信任层级建议：
+
+```text
+Runtime Safety / Policy
+        ↓
+Explicit User Requirement
+        ↓
+Repository Guidance
+        ↓
+Repository Evidence
+        ↓
+Agent Self-Report
+```
+
+Repository 中的：
+
+```text
+README.md
+AGENTS.md
+CONTRIBUTING.md
+source comments
+test data
+```
+
+可以提供工程上下文，但不能覆盖 Runtime Policy。
+
+DeerFlow 自身已经采用同类 Prompt Trust 原则：
+
+```text
+framework authority → system channel
+user/model-influenced text → sanitized HumanMessage data channel
+```
+
+A-SWE 必须沿用这一边界。
+
+### 4.9 SemanticPlanner
+
+SemanticPlanner 输入：
+
+```text
+TaskSpec
+RepositoryProfile
+ReconReport（如果存在）
+Capability Catalog（只提供语义能力，不提供 Agent roster）
+```
+
+Planner 不应该看到：
+
+```text
+Explorer
+Coder
+Tester
+Reviewer
+```
+
+避免 Planner 为了已有 Agent 反向制造 workflow。
+
+Planner 只回答：
+
+> 为完成任务，需要哪些 bounded work packages？
+
+### 4.10 WorkPlanProposal
+
+LLM 只输出 proposal，不直接输出可执行 `TaskDAG`。
+
+```python
+class WorkItemProposal(BaseModel):
+    id: str
+    objective: str
+
+    capability_hints: list[str]
+    depends_on: list[str]
+
+    # hint only; runtime owns final side effect
+    effect_hint: Literal["read", "write"] | None = None
+
+    acceptance_intent: list[str] = []
+
+class WorkPlanProposal(BaseModel):
+    items: list[WorkItemProposal]
+    rationale: str
+```
+
+### 4.11 Node Boundary Policy
+
+DAG Node 是：
+
+> **bounded work package**
+
+而不是 Todo item / reasoning step。
+
+一期拆分原则：
+
+| 情况 | 是否拆成独立 Node |
+|---|---:|
+| 可以真正并行 | 是 |
+| 需要不同 specialist provider | 是 |
+| READ → WRITE side-effect boundary | 是 |
+| WRITE → verification boundary | 是 |
+| mandatory Review gate | 是 |
+| 有独立 acceptance condition | 是 |
+| 强依赖且需要同一上下文连续推理 | 否 |
+| 同一 Provider 连续完成更便宜 | 否 |
+| 拆分会重复 Repository discovery | 否 |
+
+例如：
+
+```text
+Locate DB code
++
+Understand lifecycle
++
+Identify root cause
+```
+
+一期更倾向合并为：
+
+```text
+Diagnose DB connection leak
+```
+
+而不是创建三个 Agent Node。
+
+### 4.12 PlanValidator / PlanNormalizer
+
+LLM Proposal 必须经过 deterministic validation。
+
+规则分三类：
+
+#### Hard Reject
+
+不能安全自动修复：
+
+```text
+cycle
+self dependency
+dependency references nonexistent item
+unknown / impossible capability
+plan has no path to requested deliverable
+semantic contradiction
+node count exceeds hard limit
+```
+
+结果：
+
+```text
+PLAN_INVALID
+```
+
+进入 bounded replan 或直接失败。
+
+#### Monotonic Safety Repair
+
+可以安全加强：
+
+```text
+code_modification present
+AND effect_hint == READ
+→ upgrade WRITE
+
+testing_required == true
+AND no verification work item
+→ append verification gate
+
+risk == high
+AND no review work item
+→ append review gate
+```
+
+规则只能增强安全性 / 完整性，不能静默删除用户需求。
+
+#### Warning / Optimization
+
+例如：
+
+```text
+多个强依赖 READ items 可以合并
+重复 Repository discovery
+过度细粒度 decomposition
+```
+
+一期可以先记录 Trace Warning，再逐步自动 normalize。
+
+### 4.13 Acceptance Compilation
+
+Planner 的 `acceptance_intent` 是语义意图，不直接成为 DeerFlow canonical acceptance criteria。
+
+```text
+Acceptance Intent
+      ↓
+Acceptance Compiler
+      ↓
+Canonical Acceptance Criteria
+```
+
+例如：
+
+```text
+"regression tests should pass"
+      ↓
+tests_passed:<resolved-test-command>
+```
+
+无法确定性编译的 criterion：
+
+```text
+→ UNVERIFIED / reviewer-level condition
+```
+
+不把“looks correct”之类自由文本伪装成 deterministic acceptance。
+
+### 4.14 Capability 从 Task-Level 下沉到 WorkItem-Level
+
+authoritative capability flow：
+
+```text
+ValidatedWorkPlan
+      ↓
+WorkItem Required Capabilities
+      ↓
+Capability Resolver
+```
+
+TaskSpec 中只有 `capability_hints`。
+
+Task-level capability set 可以定义为：
+
+```text
+Union(all validated work-item capabilities)
+```
+
+### 4.15 Handoff Contract
+
+DAG dependency 不只表示控制顺序，还表示上下文 / 数据交接。
+
+```python
+class NodeHandoff(BaseModel):
+    source_node_id: str
+
+    summary: str
+
+    findings: list[str]
+    evidence_paths: list[str]
+    changed_paths: list[str]
+
+    unresolved_questions: list[str]
+```
+
+下游 Node 输入：
+
+```text
+Original Task
++
+Current Node Objective
++
+Dependency Handoffs
++
+Runtime Constraints
++
+Acceptance Criteria
+```
+
+Handoff 仍然是 Agent self-report，不是事实权威；关键结论需要通过文件、receipt、test、path 等 evidence 复核。
+
+### 4.16 Planning Replan Boundary
+
+一期优先实现：
+
+```text
+Planning-time adaptation
+✅
+
+Arbitrary execution-time DAG mutation
+❌
+```
+
+Node 可以返回：
+
+```text
+PLAN_INVALIDATED
+```
+
+第一版允许：
+
+```text
+max_replans = 0
+```
+
+后续最多先演进到 bounded one-shot replan：
+
+```text
+max_replans = 1
+```
+
+不在 MVP 实现无界动态 DAG spawning。
 
 ---
 
@@ -742,21 +1225,18 @@ LLM 输出不能直接作为最终调度依据，需要执行规则修正。
 
 ### 5.1 核心设计原则
 
-A-SWE Runtime 不将 Agent 作为最基本调度单位，而将：
-
-> **Capability**
-
-作为 Runtime 的语义调度单位。
+A-SWE Runtime 将 Capability 作为 Runtime 的语义调度单位。
 
 Capability 表示：
 
-> **完成任务所需要的“能力”。**
+> **一个 bounded work package 为完成目标所需要的能力。**
 
 例如：
 
 ```text
 repo_exploration
 code_search
+bug_diagnosis
 python_debugging
 database_analysis
 code_modification
@@ -768,8 +1248,6 @@ code_review
 Agent、Skill 和 Tool 是 Capability Provider。
 
 ### 5.2 Capability 与 Capability Provider
-
-推荐数据模型：
 
 ```text
                      Capability
@@ -788,68 +1266,97 @@ Agent、Skill 和 Tool 是 Capability Provider。
 
 该模型中：
 
-- Capability：任务需要做什么；
+- Capability：WorkItem 需要做什么；
 - Agent：谁来执行；
-- Skill：执行时应加载哪些领域知识 / SOP；
+- Skill：执行时加载哪些 SOP / domain knowledge；
 - Tool：真正执行外部动作；
 - MCP：Tool 的一种外部接入来源，而不是 Capability 本身。
 
-### 5.3 Capability 定义示例
+### 5.3 Capability Metadata
+
+Capability 不只保存 provider mapping，还应保存 Plan Compiler 所需要的执行约束。
+
+建议：
+
+```python
+class CapabilitySpec(BaseModel):
+    id: str
+    description: str
+
+    side_effect: Literal["read", "write"]
+
+    eligible_agents: list[str]
+    preferred_skills: list[str]
+    required_tools: list[str]
+
+    default_acceptance_kind: str | None = None
+```
+
+例如：
 
 ```yaml
 capability:
-  id: repo_exploration
-  description: understand repository structure and locate relevant code
+  id: code_modification
+  description: modify repository source code
 
-providers:
-  agents:
-    - repo_explorer
+  side_effect: write
 
-  skills:
-    - repository_navigation
+  eligible_agents:
+    - coder
 
-  tools:
+  required_tools:
     - read_file
-    - search_code
-    - list_tree
-
-  mcp_tools:
-    - github.search_code
+    - write_file
+    - str_replace
 ```
 
-### 5.4 与 Plugin System 的边界
+### 5.4 Capability Side-Effect Authority
+
+最终 `workspace_access` 不由 LLM 决定，而从 Capability metadata 编译。
+
+例如：
+
+```text
+repo_exploration   → READ
+code_search        → READ
+bug_diagnosis      → READ
+code_modification  → WRITE
+test_generation    → WRITE
+regression_testing → READ
+code_review        → READ
+```
+
+若 WorkItem 同时包含多个 Capability：
+
+```text
+WorkspaceAccess = max(side_effects)
+```
+
+一期定义：
+
+```text
+READ < WRITE
+```
+
+LLM 的 `effect_hint` 可以更保守，但不能把 Runtime 判定的 WRITE 降级为 READ。
+
+### 5.5 与 Plugin System 的边界
 
 Capability-Centric Runtime 与“Everything is a Plugin”不是同一层概念。
 
 ```text
-Plugin System
-解决：系统组件如何注册、加载、替换、组合
+Plugin / Extension System
+→ 系统组件如何注册、加载、替换
 
 Capability System
-解决：当前任务需要什么能力，以及应该选哪些 Provider
+→ 当前 WorkItem 需要什么能力，应选择哪些 Provider
 ```
 
-可以理解为：
+A-SWE 不重新实现底层 Plugin Framework。
 
-```text
-Infrastructure Layer
-Plugin / Registry / Extension
-          │
-          ▼
-Runtime Semantic Layer
-Capability
-          │
-          ▼
-Provider Selection
-```
+### 5.6 一期 Capability 范围
 
-因此 A-SWE 不应重新实现一套底层 Plugin Framework。
-
-若底层 Harness 已经支持 Plugin / Tool / Skill 注册机制，A-SWE 仅维护 Capability 到 Provider 的语义映射。
-
-### 5.5 一期 Capability 范围
-
-一期建议只支持：
+一期建议：
 
 ```text
 repo_exploration
@@ -859,15 +1366,17 @@ code_modification
 test_generation
 regression_testing
 code_review
-git_operation
 ```
 
-必要时再增加：
+必要时增加：
 
 ```text
+python_debugging
 database_analysis
 architecture_analysis
 ```
+
+Repository clone / checkout / base SHA / final patch 不属于普通 Agent Capability，而属于 Workspace Runtime。
 
 ---
 
@@ -875,73 +1384,44 @@ architecture_analysis
 
 ### 6.1 模块职责
 
-Capability Resolver 输入：
+Capability Resolver 的 authoritative input 不再是 `TaskSpec.required_capabilities`，而是：
 
 ```text
-TaskSpec
+ValidatedWorkPlan
 +
 Capability Registry
 +
 Available Providers
 ```
 
-输出：
+对每一个 WorkItem 输出：
 
 ```text
-ResolvedCapabilities
+ResolvedWorkItemCapabilities
 ```
 
-主要解决：
+### 6.2 Node-Level Resolution
 
-> 每一个 Required Capability 应由哪些 Agent、Skill 和 Tool 提供。
-
-### 6.2 解析示例
-
-任务要求：
+例如：
 
 ```text
-repo_exploration
-python_debugging
-code_modification
-regression_testing
+WorkItem: diagnose
+→ repo_exploration
+→ code_search
+→ bug_diagnosis
+
+WorkItem: implement
+→ code_modification
+
+WorkItem: verify
+→ regression_testing
 ```
 
-Resolver 输出：
-
-```yaml
-resolved_capabilities:
-
-  repo_exploration:
-    agents:
-      - repo_explorer
-    skills:
-      - repository_navigation
-    tools:
-      - search_code
-      - read_file
-
-  python_debugging:
-    agents:
-      - coder
-    skills:
-      - python_debugging
-
-  code_modification:
-    agents:
-      - coder
-
-  regression_testing:
-    agents:
-      - tester
-    skills:
-      - pytest
-    tools:
-      - shell
-```
+Resolver 输出候选 Agent / Skill / Tool 组合。
 
 ### 6.3 Provider Selection
 
-一期使用简单、可解释的 Provider Selection：
+一期：
 
 ```text
 Required Capability
@@ -953,23 +1433,26 @@ Candidate Providers
 Availability Filter
         │
         ▼
-Compatibility Filter
+Compatibility / Permission Filter
         │
         ▼
-Priority / Cost Rule
+Workspace / Tool Requirement Filter
         │
         ▼
-Resolved Provider
+Priority / Estimated Cost Rule
+        │
+        ▼
+Provider Assignment
 ```
 
-不需要一期就实现复杂学习模型。
+不需要一期实现学习型成功率预测。
 
 ### 6.4 核心价值
 
 Capability Resolver 将：
 
 ```text
-Task Requirement
+Work Package Semantics
 ```
 
 与：
@@ -980,7 +1463,7 @@ Task Requirement
 
 解耦。
 
-这使 Dynamic Team Builder 不需要直接理解所有底层工具细节。
+因此 SemanticPlanner 不需要知道 Agent roster，Team Builder 也不需要重新理解任务语义。
 
 ---
 
@@ -988,309 +1471,342 @@ Task Requirement
 
 ### 7.1 建设目标
 
-Dynamic Team Builder 根据：
+Dynamic Team Builder 输入：
 
-- TaskSpec；
-- ResolvedCapabilities；
-- Complexity；
-- Risk；
-- Repository Scope；
-- Testing Requirement；
-- Review Requirement；
+```text
+ValidatedWorkPlan
++
+Provider Assignments
++
+Task Risk / Constraints
+```
 
-动态生成 `TeamSpec`。
+输出：
+
+```text
+TeamSpec
+```
+
+Team Builder 只回答：
+
+> **哪些执行 Provider 参与本任务？**
+
+不负责：
+
+```text
+Task decomposition
+dependency topology
+execution order
+parallelism
+```
+
+这些属于 Planning / DAG Materializer。
 
 ### 7.2 核心原则
 
 Multi-Agent 不是默认选择。
 
-> **能够由一个 Agent 完成的任务，不应为了“Multi-Agent”而强行创建多个 Agent。**
+> **能够由一个 Provider 覆盖全部 WorkItem 的任务，不应为了“Multi-Agent”强行创建多个 Agent。**
 
-### 7.3 示例拓扑
+### 7.3 TeamSpec 只保存 Roster
 
-#### 简单任务
+建议：
 
-任务：
+```python
+class TeamMember(BaseModel):
+    provider_id: str
+    capabilities: list[str]
 
-> 修改 README 中的一处描述错误。
+    selected_for_nodes: list[str]
+    selection_reason: str
 
-```text
-Coder
-```
-
-#### 普通 Bug
-
-```text
-Explorer
-   ↓
-Coder
-   ↓
-Tester
-```
-
-#### 高风险 Bug
-
-```text
-Explorer
-   ↓
-Coder
-   ↓
-Tester
-   ↓
-Reviewer
-```
-
-#### Repository-Level 重构
-
-```text
-          Explorer
-         /       \
- Explorer         Explorer
-         \       /
-           Coder
-             ↓
-           Tester
-             ↓
-          Reviewer
-```
-
-### 7.4 TeamSpec
-
-```yaml
-team:
-  strategy: explore_code_test_review
-
-  agents:
-    - id: explorer_1
-      role: explorer
-
-    - id: coder_1
-      role: coder
-
-    - id: tester_1
-      role: tester
-
-    - id: reviewer_1
-      role: reviewer
-
-  constraints:
-    testing_required: true
-    review_required: true
-```
-
-### 7.5 动态团队的核心解释能力
-
-Team Builder 除了输出“选了谁”，还必须输出：
-
-```text
-为什么选
-为什么不选
+class TeamSpec(BaseModel):
+    members: list[TeamMember]
 ```
 
 例如：
 
 ```yaml
-selection_reason:
-  explorer:
-    selected: true
-    reason: repository_level_task
+team:
+  members:
+    - provider_id: repo_explorer
+      selected_for_nodes:
+        - diagnose
+      selection_reason: diagnosis_requires_repository_exploration
 
-  tester:
-    selected: true
-    reason: regression_test_required
+    - provider_id: coder
+      selected_for_nodes:
+        - implement
+      selection_reason: code_modification
 
-  reviewer:
-    selected: true
-    reason: high_risk_change
-
-  architect:
-    selected: false
-    reason: architecture_change_not_detected
+    - provider_id: tester
+      selected_for_nodes:
+        - verify
+      selection_reason: regression_testing
 ```
 
-该信息后续直接进入 Execution Trace。
+TeamSpec 不包含：
+
+```text
+Explorer → Coder → Tester
+strategy: explore_code_test_review
+```
+
+Topology 只存在于最终 TaskDAG。
+
+### 7.4 Planning Recon 不计入 Execution Team
+
+Planning Phase 中的只读 Recon Probe 属于 Runtime planning infrastructure。
+
+例如：
+
+```text
+Planning:
+  Repo Profile
+  Recon Probe
+
+Execution Team:
+  Coder
+  Tester
+  Reviewer
+```
+
+Recon Probe 不因为运行过一次就自动成为 TeamSpec 成员。
+
+### 7.5 Explainability
+
+Team Builder 仍需记录：
+
+```text
+为什么选
+为什么不选
+哪些 WorkItem 被谁覆盖
+```
+
+这些进入 Decision Trace。
 
 ---
 
 ## 8. MVP Team Selection Policy：最小可行团队策略
 
-### 8.1 为什么一期不使用复杂 Cost Utility
+### 8.1 一期选择目标
 
-理论上可以将团队选择定义为：
-
-```text
-success probability
--
-token cost
--
-latency
--
-coordination cost
-```
-
-但一期没有足够历史数据可靠估计：
+在：
 
 ```text
-P(success | task, team)
+Capability Coverage
+Risk Constraint
+Provider Compatibility
+Tool / Permission Availability
 ```
 
-因此一期不构造形式上复杂但缺乏数据支撑的成功率模型。
+全部满足的前提下：
 
-### 8.2 一期选择目标
-
-一期 Team Builder 使用：
-
-> **满足 Capability Coverage 与风险约束前提下，选择最小可行 Team。**
+> **选择最小可行 Provider Set。**
 
 形式化表达：
 
 ```text
 Minimize:
-    Team Complexity / Estimated Execution Cost
+    Provider Count
+    + Estimated Coordination Cost
 
 Subject to:
-    CapabilityCoverage == 100%
+    WorkItemCapabilityCoverage == 100%
     RiskConstraints == satisfied
-    TaskConstraints == satisfied
+    ProviderCompatibility == satisfied
 ```
+
+### 8.2 一期不构造虚假 Success Probability
+
+一期没有足够历史数据可靠估计：
+
+```text
+P(success | task, team)
+```
+
+因此不使用形式复杂但无数据基础的模型。
 
 ### 8.3 规则示例
 
 ```text
-规则 1：
-单文件低风险修改
-→ Coder
+低风险单文件修改
+且 Coder 覆盖全部所需 Capability
+→ Team = {Coder}
 
-规则 2：
-Repository-Level Task
-→ Explorer 必选
+Diagnosis WorkItem 需要 repo_exploration + bug_diagnosis
+且 Coder profile 不满足
+→ 加入 Explorer
 
-规则 3：
-需要测试
-→ Tester 必选
+testing_required == true
+且没有现有 Provider 覆盖 regression_testing
+→ 加入 Tester
 
-规则 4：
-High Risk
-→ Reviewer 必选
-
-规则 5：
-明显跨模块重构
-→ 允许多个 Explorer 并行
-
-规则 6：
-如果 Coder 已覆盖简单代码检索能力
-且任务规模很小
-→ 不额外创建 Explorer
+risk == high
+→ Review WorkItem 必须有 Reviewer-compatible Provider
 ```
 
-### 8.4 后续演进
+注意：
 
-当系统积累历史执行数据后，可升级为：
-
-```text
-Task Features
-     +
-Historical Execution Metrics
-     ↓
-Team Ranking
-     ↓
-Selected Team
-```
-
-但不属于一期必做范围。
+> Team Selection Rule 不负责决定这些 Provider 的先后关系。
 
 ---
 
-## 9. Task Scheduler：任务调度模块
+## 9. DAG Materialization 与 Task Scheduler
 
-### 9.1 模块职责
+### 9.1 DAG Materializer 的职责
 
-Team Builder 决定：
-
-> 谁参与任务。
-
-Task Scheduler 决定：
-
-> 这些 Agent 以什么顺序、依赖关系和并行关系执行，以及它们能否安全地同时访问同一个 Workspace。
-
-Scheduler 将任务转换为 Task DAG，同时维护 Workspace side-effect constraint。
-
-### 9.2 示例 DAG
-
-数据库连接泄漏任务：
+DAG Materializer 输入：
 
 ```text
-                 Inspect Repository
-                        │
-          ┌─────────────┴─────────────┐
-          ▼                           ▼
- Locate DB Layer                Inspect Tests
-      READ                          READ
-          │                           │
-          ▼                           │
-Analyze Connection Lifecycle         │
-      READ                            │
-          │                           │
-          └─────────────┬─────────────┘
-                        ▼
-                    Root Cause
-                       READ
-                        │
-                        ▼
-                     Implement
-                       WRITE
-                        │
-                        ▼
-                  Regression Test
-                       READ
-                        │
-                        ▼
-                      Review
-                       READ
+ValidatedWorkPlan
++
+Provider Assignment
++
+Capability Metadata
++
+Workspace Policy
++
+Acceptance Policy
 ```
 
-其中两个探索节点均为只读，可以并行执行；代码修改节点具有 WRITE 副作用，需要独占共享 Workspace。
+输出：
 
-### 9.3 TaskNode
+```text
+Executable TaskDAG
+```
 
-建议统一定义：
+LLM 不直接生成最终 TaskNode。
+
+### 9.2 TaskNode
 
 ```python
 class TaskNode(BaseModel):
     id: str
-    type: str
-    description: str
+    objective: str
 
-    assigned_agent: str | None
     required_capabilities: list[str]
+    provider_id: str
+
     dependencies: list[str]
 
     workspace_access: WorkspaceAccess
 
-    # Phase 1 optional; default unknown.
     affected_paths: list[str] | None = None
 
     acceptance_criteria: list[str] = []
 
-    status: NodeStatus
     retry_policy: RetryPolicy
+    status: NodeStatus
 ```
 
-一期：
+### 9.3 Side-Effect Compilation
 
-```python
-class WorkspaceAccess(str, Enum):
-    READ = "read"
-    WRITE = "write"
+`workspace_access` 由 Runtime 根据 Capability metadata 编译。
+
+```text
+READ + READ
+→ READ
+
+READ + WRITE
+→ WRITE
 ```
 
-### 9.4 Workspace 并发安全规则
+LLM `effect_hint` 不具有 authority。
 
-DeerFlow 可以解决共享 Sandbox 的生命周期、lease 与 shell scope，但不会替 A-SWE 判断两个业务节点能否安全并行修改同一份 Repository。
+### 9.4 Dependency Normalization
 
-因此 A-SWE Scheduler 必须显式承担共享 Workspace 冲突控制。
+Planner 提出的 dependency 先做：
 
-一期采用保守策略：
+```text
+existence validation
+cycle detection
+transitive sanity check
+side-effect normalization
+```
+
+对于没有显式依赖但共享同一 Workspace 的多个 WRITE Node，一期不只依赖 Runtime Mutex。
+
+DAG Materializer 应使用 deterministic ordering 增加 serialization edge：
+
+```text
+WRITE A
+  ↓
+WRITE B
+```
+
+排序依据可以是：
+
+```text
+validated planner ordinal
+```
+
+这样执行顺序可复现。
+
+### 9.5 READ Parallelism
+
+独立的 READ Node 可以保留真实并行：
+
+```text
+Inspect API ─┐
+             ├→ downstream
+Inspect Test ─┘
+```
+
+前提：
+
+- 无 dependency；
+- 无 shared mutable state；
+- 无 external side effect；
+- NodeBoundaryPolicy 判断确实值得拆分。
+
+### 9.6 Handoff Data Dependency
+
+DAG Edge 不只表示：
+
+```text
+B waits for A
+```
+
+还表示：
+
+```text
+B receives A's bounded handoff context
+```
+
+下游执行请求应包含：
+
+```text
+Original Task
+Current Node Objective
+Dependency Handoffs
+Runtime Constraints
+Acceptance Criteria
+```
+
+`NodeHandoff` 是 model report，需要 evidence 支撑，不能获得 system authority。
+
+### 9.7 Scheduler 的职责
+
+Scheduler 不再负责 Task decomposition。
+
+一期职责：
+
+- Ready Node calculation；
+- dependency enforcement；
+- READ-only parallel dispatch；
+- Workspace Access arbitration；
+- WRITE exclusivity；
+- Node status tracking；
+- retry；
+- cancellation；
+- failure propagation；
+- acceptance gate；
+- Repository invariant gate；
+- handoff routing；
+- result aggregation。
+
+### 9.8 Workspace 并发规则
 
 | Node A | Node B | 是否允许并行 |
 |---|---|---:|
@@ -1301,52 +1817,15 @@ DeerFlow 可以解决共享 Sandbox 的生命周期、lease 与 shell scope，�
 
 即：
 
-> **MVP 只允许 READ / READ 并行，任何 WRITE 节点都获得 Workspace 独占执行权。**
+> **MVP 只允许 READ / READ 并行。**
 
-这种策略会牺牲部分并行度，但能优先保证 Repository 状态一致性。
-
-### 9.5 后续细粒度并行
-
-二期以后可增加：
-
-```python
-affected_paths = [
-    "src/auth/**"
-]
-```
-
-若两个 WRITE Node 的作用域可证明不相交，可允许并行：
-
-```text
-Coder A → src/auth/**
-Coder B → docs/**
-```
-
-但一期不实现复杂路径冲突预测、Git worktree fan-out 或自动 merge。
-
-### 9.6 Scheduler 执行职责
-
-一期 Scheduler 必须支持：
-
-- Task decomposition；
-- Dependency DAG；
-- Sequential execution；
-- READ-only basic parallel execution；
-- Agent assignment；
-- Node status tracking；
-- Workspace access arbitration；
-- Retry；
-- Failure propagation；
-- Cancellation；
-- Result aggregation；
-- Acceptance gate。
-
-### 9.7 Node 执行流程
-
-单节点标准流程：
+### 9.9 Node 执行流程
 
 ```text
 NodeReady
+   │
+   ▼
+Dependency Handoff Assemble
    │
    ▼
 WorkspaceAccessCheck
@@ -1360,26 +1839,24 @@ NodeExecutionResult
    ▼
 Acceptance Check
    │
-   ├── holds → NodeCompleted
+   ▼
+Repository Invariant Check（WRITE）
    │
-   ├── unverified → policy decision
-   │
-   └── failed → retry / fail
+   ▼
+Create NodeHandoff
    │
    ▼
 Release Workspace Access
 ```
 
-### 9.8 一期不追求
+### 9.10 一期不做
 
-暂不做：
-
-- complex distributed scheduler；
-- dynamic worker autoscaling；
-- RL scheduling；
-- large-scale Agent swarm；
+- arbitrary execution-time DAG spawning；
+- unlimited replanning；
 - parallel write merge；
-- cross-machine distributed workspace locking。
+- distributed scheduler；
+- cross-machine workspace lock；
+- RL scheduling。
 
 ---
 
@@ -2098,75 +2575,105 @@ recorded execution evidence
 
 ## 15. 核心运行流程
 
-A-SWE Runtime 一期完整执行链路：
+A-SWE Runtime 一期完整链路：
 
 ```text
-User SWE Task
-      │
-      ▼
+TaskRequest
+     │
+     ▼
+Workspace Bootstrap
+     │
+     ▼
+Basic RepositoryProfile
+     │
+     ▼
 Task Analyzer
-      │
-      ▼
+     │
+     ▼
 TaskSpec
-      │
-      ├─────────────────────┐
-      ▼                     ▼
-Workspace Runtime      Capability Resolver
-      │                     │
-      ▼                     ▼
-WorkspaceSession     ResolvedCapabilities
-      │                     │
-      │                     ▼
-      │              Dynamic Team Builder
-      │                     │
-      │                     ▼
-      │                  TeamSpec
-      │                     │
-      └──────────┬──────────┘
-                 ▼
-            Task Scheduler
-                 │
-                 ▼
-              Task DAG
-                 │
-                 ▼
-        Workspace Access Gate
-                 │
-                 ▼
-      DeerFlowExecutionBackend
-                 │
-                 ▼
-         SubagentExecutor
-                 │
-                 ▼
-         SubagentResult
-                 │
-        ┌────────┴─────────┐
-        ▼                  ▼
-Node Acceptance       Execution Evidence
-        │                  │
-        └────────┬─────────┘
-                 ▼
-          Runtime Trace
-                 │
-                 ▼
-             Evaluation
-                 │
-                 ▼
-               Result
+     │
+     ▼
+Targeted Repository Profiling
+     │
+     ▼
+Planning Context Gate
+   /       \
+enough     gap
+  │         │
+  │         ▼
+  │     Recon Probe
+  │      READ ONLY
+  │         │
+  └────┬────┘
+       ▼
+PlanningContext
+       │
+       ▼
+SemanticPlanner
+       │
+       ▼
+WorkPlanProposal
+       │
+       ▼
+PlanValidator / Normalizer
+       │
+       ▼
+ValidatedWorkPlan
+       │
+       ▼
+Node Capability Resolver
+       │
+       ▼
+Provider Assignment
+       │
+       ▼
+Minimal Team Builder
+       │
+       ▼
+TeamSpec（roster only）
+       │
+       ▼
+DAG Materializer
+       │
+       ▼
+Executable TaskDAG
+       │
+       ▼
+Workspace-Aware Scheduler
+       │
+       ▼
+DeerFlowExecutionBackend
+       │
+       ▼
+SubagentExecutor
+       │
+       ▼
+Node Acceptance / Invariant / Handoff
+       │
+       ▼
+Evaluation
+       │
+       ▼
+Result
 ```
 
-其中：
+职责边界：
 
 ```text
-A-SWE
-→ Task / Capability / Team / DAG / Scheduling / Evaluation
+SemanticPlanner
+→ proposes bounded work packages
+
+A-SWE Plan Compiler
+→ validates and compiles execution semantics
+
+A-SWE Scheduler
+→ executes the already compiled DAG
 
 DeerFlow
-→ Subagent / Skill / Tool / MCP / Sandbox / low-level execution
+→ executes concrete bounded Agent nodes
 ```
 
-每一个主要 Runtime Decision 均产生 A-SWE Runtime Event；底层 LLM / Tool span 通过 backend trace correlation 下钻查看。
+Planning Phase 与 Execution Phase 在 Trace 中分开显示。
 
 ---
 
@@ -2193,8 +2700,21 @@ a-swe-runtime/
 │   ├── access.py
 │   ├── bootstrap.py
 │   ├── repository.py
+│   ├── profile.py
 │   ├── invariants.py
 │   └── changes.py
+│
+├── planning/
+│   ├── schema.py
+│   ├── context_gate.py
+│   ├── recon.py
+│   ├── planner.py
+│   ├── validator.py
+│   ├── normalizer.py
+│   ├── node_boundary.py
+│   ├── handoff.py
+│   ├── acceptance_compiler.py
+│   └── materializer.py
 │
 ├── capability/
 │   ├── registry.py
@@ -2204,8 +2724,7 @@ a-swe-runtime/
 │
 ├── team/
 │   ├── builder.py
-│   ├── policy.py
-│   └── topology.py
+│   └── policy.py
 │
 ├── scheduler/
 │   ├── dag.py
@@ -2215,11 +2734,7 @@ a-swe-runtime/
 │   └── retry.py
 │
 ├── agents/
-│   ├── registry.py
-│   ├── explorer.py
-│   ├── coder.py
-│   ├── tester.py
-│   └── reviewer.py
+│   └── registry.py
 │
 ├── skills/
 │   ├── repository-navigation/
@@ -2264,86 +2779,60 @@ a-swe-runtime/
 ### 16.2 核心依赖方向
 
 ```text
-Task
-  ├─────────────→ Workspace
-  │
-  ▼
+TaskRequest
+   ↓
+Workspace / Repository Profile
+   ↓
+Task Understanding
+   ↓
+Planning
+   ↓
 Capability
-  ↓
-Team
-  ↓
+   ↓
+Team / Provider Set
+   ↓
+DAG Materialization
+   ↓
 Scheduler
-  ├─────────────→ Workspace Access Policy
-  │
-  ▼
+   ↓
 Execution Backend
-  ↓
+   ↓
 Evaluation
-```
-
-Observability 作为横切能力：
-
-```text
-Task ──────────────┐
-Workspace ─────────┤
-Capability ────────┤
-Team ──────────────┤
-Scheduler ─────────┼──→ RuntimeEvent → Trace Store
-Execution ─────────┤
-Evaluation ────────┘
 ```
 
 ### 16.3 依赖约束
 
-建议：
-
-- `task/` 不依赖具体 Agent；
 - `workspace/` 不依赖 Team Builder；
-- Repository clone / checkout / baseline freeze 属于 `workspace/` Runtime infrastructure，不交给 Agent 自主完成；
-- Repository lifecycle operation 与 Agent 的普通 Git exploration 必须分离；
+- Repository lifecycle 属于 `workspace/` Runtime infrastructure；
+- `task/` 不依赖具体 Agent；
+- `planning/` 不依赖 DeerFlow；
+- SemanticPlanner 不直接读取 Agent roster；
 - `capability/` 不依赖 DeerFlow；
-- `team/` 不直接调用 Tool；
-- `scheduler/` 只通过 `ExecutionBackend` 执行节点；
-- `scheduler/` 负责共享 Workspace 的并发正确性；
+- `team/` 只形成 roster，不拥有 topology；
+- topology 只由 `planning/materializer.py` 形成；
+- `scheduler/` 禁止重新 decomposition；
+- `scheduler/` 只执行已编译 TaskDAG；
 - `observability/` 不参与业务决策；
-- `evaluation/` 不直接创建 Agent；
 - 所有 DeerFlow-specific 逻辑集中在 `integrations/deerflow/`。
 
 ### 16.4 Anti-Corruption Layer
 
-`integrations/deerflow/` 是 A-SWE 与 DeerFlow 之间的 Anti-Corruption Layer。
-
-它负责把：
+`integrations/deerflow/` 负责：
 
 ```text
-A-SWE TaskNode
-A-SWE AgentProvider
-A-SWE WorkspaceSession
-```
-
-转换成：
-
-```text
-DeerFlow SubagentConfig
-DeerFlow SubagentExecutor inputs
-```
-
-并把：
-
-```text
+TaskNode
+AgentProvider
+WorkspaceSession
+Node Handoff Context
+      ↓
+DeerFlow SubagentConfig / SubagentExecutor
+      ↓
 SubagentResult
-AcceptanceVerdict
-backend trace id
+      ↓
+NodeExecutionResult / NodeAcceptanceResult
 ```
 
-转换回：
-
-```text
-NodeExecutionResult
-NodeAcceptanceResult
-```
-
-A-SWE 核心代码禁止直接散落 `deerflow.*` import。
+A-SWE 核心 Planning / Scheduler 代码禁止散落 `deerflow.*` import。
 
 ---
 
@@ -2857,6 +3346,47 @@ Evaluation / Patch Result
 
 P0-2 的目标不是让 Agent 学会 Git，而是让 Runtime 掌握 Repository execution identity 与可复现 baseline。
 
+#### P0-3：Planning / DAG Architecture Audit
+
+状态：
+
+```text
+Architecture Audited
+Plan Compiler Rules Audit In Progress
+```
+
+当前冻结结论：
+
+- DeerFlow Plan Mode / Todo 不等于 SWE Task DAG；
+- A-SWE 不使用 DeerFlow Lead Agent 自主 delegation 作为核心 topology authority；
+- LLM 不直接生成最终可执行 TaskDAG；
+- TaskSpec 中只保留 `capability_hints`；
+- Repository Profile 在 Task Analyzer / Planner 前提供结构证据；
+- 信息不足时允许 bounded read-only Recon Probe；
+- Recon Probe 属于 Planning Infrastructure，不计入最终 TeamSpec；
+- SemanticPlanner 不读取 Agent roster；
+- Planner 输出 `WorkPlanProposal`；
+- Runtime 通过 PlanValidator / Normalizer 生成 `ValidatedWorkPlan`；
+- Capability Resolution 下沉到 WorkItem / Node Level；
+- Team Builder 只生成 roster，不生成 topology；
+- DAG Materializer 拥有最终执行 topology authority；
+- Scheduler 不再做 task decomposition；
+- DAG Edge 同时具有 control dependency 与 handoff data dependency；
+- 共享 Workspace 的无依赖 WRITE Nodes 由 Materializer 确定性串行化；
+- execution-time arbitrary DAG mutation 不属于 MVP。
+
+下一步继续审计：
+
+```text
+PlanValidator
++
+PlanNormalizer
++
+DAG Materializer
+```
+
+的 deterministic rule set、repair boundary 与 bounded replan policy。
+
 ---
 
 ### Phase 1：Adaptive SWE Runtime MVP
@@ -2894,49 +3424,62 @@ WorkspaceSession
 DeerFlow Subagent Execution
 ```
 
-#### P1-2：Task → Capability
+#### P1-2：Task Understanding + Planning Pipeline
 
 完成：
 
+- RepositoryProfile；
+- Basic / Targeted Profiling；
 - TaskSpec；
 - Task Analyzer；
-- Rule Validation；
-- Capability Registry；
-- Capability Resolver。
+- Planning Context Gate；
+- Read-only Recon Probe；
+- PlanningContext；
+- SemanticPlanner；
+- WorkPlanProposal；
+- NodeBoundaryPolicy；
+- PlanValidator；
+- PlanNormalizer；
+- Acceptance Compiler。
 
 目标：
 
 ```text
-Natural Language Task
+Task + Repository Evidence
 →
-Structured Capability Requirement
+ValidatedWorkPlan
 ```
 
-#### P1-3：Capability → Team
+#### P1-3：WorkPlan → Capability → Team → DAG
 
 完成：
 
+- Capability Metadata；
+- Node-Level Capability Resolver；
 - Agent Registry；
 - AgentProvider；
-- TeamSpec；
 - Minimal Feasible Team Policy；
-- Dynamic Team Builder。
+- TeamSpec（roster only）；
+- NodeHandoff schema；
+- DAG Materializer；
+- TaskNode；
+- deterministic WRITE serialization。
 
 目标：
 
 ```text
-Different Tasks
+ValidatedWorkPlan
 →
-Different Teams
+Executable TaskDAG
 ```
 
-#### P1-4：Team → DAG → Workspace-Aware Execution
+#### P1-4：Workspace-Aware Execution
 
 完成：
 
-- TaskNode；
-- DAG；
 - Scheduler；
+- Ready Node calculation；
+- Dependency Handoff Routing；
 - READ / WRITE Workspace Access；
 - READ-only Basic Parallel Execution；
 - WRITE Exclusive Execution；
@@ -2946,6 +3489,7 @@ Different Teams
 - Result Aggregation；
 - Node Acceptance Gate；
 - WRITE Node 后 Repository Invariant Check；
+- NodeHandoff generation；
 - 可选 WRITE Node before / after workspace snapshot。
 
 #### P1-5：Execution Trace
@@ -2989,10 +3533,12 @@ Repository-Level Exploration
 
 ```text
 Task
-→ Workspace
-→ Capability
+→ Workspace / Repo Profile
+→ Semantic Work Plan
+→ Plan Validation
+→ Capability / Provider Resolution
 → Selected Team
-→ DAG
+→ Compiled DAG
 → Workspace-Aware Scheduling
 → Trace
 → Evaluation
