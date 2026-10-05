@@ -227,12 +227,12 @@ class WorkspaceSession(BaseModel):
     thread_id: str
     user_id: str
 
-    # repository identity
-    repo_url: str | None = None
-    base_ref: str | None = None
-
     # runtime workspace
     workspace_root: str
+
+    # optional Git repository bound to this workspace
+    repository: RepositoryBinding | None = None
+
     status: str
 ```
 
@@ -267,7 +267,179 @@ Reviewer reviews the same working tree
 
 成为 Runtime 的显式契约，而不是依赖 Agent 输出在 Prompt 中传递代码状态。
 
-Repository clone / checkout / base ref 固定等 Workspace Bootstrap 细节在正式实现前继续进行 P0 审计；当前架构先固定 `WorkspaceSession` 作为上层接口。
+Repository / Workspace Bootstrap 的职责边界经 P0-2 审计后固定为：
+
+> **Repository Bootstrap 属于 A-SWE Control Plane，不属于 Agent Task。**
+
+A-SWE 不让 Coder / Explorer 自行决定 Repository 的 clone、checkout 和 baseline。Runtime 必须在第一个 Agent Node 执行前确定性完成 Repository Bootstrap，并冻结 Repository 基线。
+
+建议增加：
+
+```python
+class RepositoryBinding(BaseModel):
+    source_type: str
+
+    remote_url: str | None = None
+    requested_ref: str | None = None
+
+    # immutable runtime authority
+    resolved_base_sha: str
+
+    repository_root: str
+    default_branch: str | None = None
+
+    clean_at_bootstrap: bool
+```
+
+其中 `requested_ref` 可以是：
+
+```text
+main
+develop
+feature/foo
+v1.2.0
+<commit sha>
+```
+
+但 Runtime 真正使用的基线必须是：
+
+```text
+resolved_base_sha
+```
+
+而不是可漂移的 branch / tag 名称。
+
+一期推荐一个 Task 对应一个独立 Thread Workspace，并直接将 Repository Root 放在：
+
+```text
+/mnt/user-data/workspace
+```
+
+而不是：
+
+```text
+/mnt/user-data/workspace/<repo-name>
+```
+
+因为 DeerFlow 的 bash 工具本身会将默认工作目录定位到 thread workspace，这样 Explorer、Coder、Tester、Reviewer 均天然在 Repository Root 执行。
+
+Repository Bootstrap 标准流程：
+
+```text
+WorkspaceSession Allocate
+        │
+        ▼
+Prepare Empty Workspace
+        │
+        ▼
+Clone / Materialize Repository
+        │
+        ▼
+Resolve requested_ref
+        │
+        ▼
+Checkout exact resolved_base_sha
+        │
+        ▼
+Verify Repository Clean
+        │
+        ▼
+Capture Baseline Workspace Snapshot
+        │
+        ▼
+WORKSPACE READY
+```
+
+一期推荐以 detached HEAD / immutable baseline 方式运行，使 Agent 只修改 Working Tree，不负责 commit / branch / merge / rebase 等 Repository lifecycle operation。
+
+### 3.2.1 Repository Invariant
+
+A-SWE 必须在关键 WRITE Node 后检查 Repository invariant：
+
+```python
+class RepositoryInvariant(BaseModel):
+    git_repo_exists: bool
+    head_sha: str
+    head_matches_baseline: bool
+```
+
+最重要的不变量：
+
+```text
+.git exists
+HEAD == resolved_base_sha
+```
+
+如果 Agent 擅自 commit、checkout、rebase 等导致 HEAD 偏离 baseline，一期直接将该 Node 判为失败，不做静默自动恢复。
+
+### 3.2.2 Repository Change Evidence
+
+DeerFlow 已提供 filesystem-level `workspace_changes`：
+
+```text
+before snapshot
+      ↓
+execution
+      ↓
+after snapshot
+      ↓
+filesystem change result
+```
+
+A-SWE 直接复用：
+
+```text
+capture_workspace_snapshot
+compare_snapshots
+```
+
+但 DeerFlow 的 workspace scanner 明确忽略 `.git`，因此它不是 Git-aware Patch。
+
+一期采用双证据模型：
+
+```text
+Repository Result
+      │
+      ├── Git ChangeSet
+      │     └── authoritative repository patch
+      │
+      └── Workspace ChangeSet
+            └── filesystem execution evidence
+```
+
+建议：
+
+```python
+class RepositoryChangeSet(BaseModel):
+    base_sha: str
+
+    head_sha: str
+    head_matches_baseline: bool
+
+    tracked_diff: str
+    changed_files: list[str]
+    untracked_files: list[str]
+
+    dirty: bool
+```
+
+注意：`git diff HEAD` 不包含 untracked files，因此最终 Patch 提取不能仅依赖该命令。
+
+正式输出完整 Patch 时，可使用 temporary Git index 生成不污染真实 index 的 patch：
+
+```text
+temporary GIT_INDEX_FILE
+        ↓
+git read-tree <base_sha>
+        ↓
+git add -A
+        ↓
+git diff --cached --binary <base_sha>
+```
+
+Baseline Workspace Snapshot 必须在 clone / checkout 完成之后采集，否则整个 Repository 会被误判为 task-created files。
+
+Task-level snapshot 用于最终 ChangeSet；WRITE Node 可选用 before / after snapshot 做 Node → file change attribution；纯 READ Node 一期不强制全量 snapshot。
 
 ### 3.3 DeerFlow Execution Adapter
 
@@ -2019,7 +2191,10 @@ a-swe-runtime/
 │   ├── session.py
 │   ├── manager.py
 │   ├── access.py
-│   └── bootstrap.py
+│   ├── bootstrap.py
+│   ├── repository.py
+│   ├── invariants.py
+│   └── changes.py
 │
 ├── capability/
 │   ├── registry.py
@@ -2124,6 +2299,8 @@ Evaluation ────────┘
 
 - `task/` 不依赖具体 Agent；
 - `workspace/` 不依赖 Team Builder；
+- Repository clone / checkout / baseline freeze 属于 `workspace/` Runtime infrastructure，不交给 Agent 自主完成；
+- Repository lifecycle operation 与 Agent 的普通 Git exploration 必须分离；
 - `capability/` 不依赖 DeerFlow；
 - `team/` 不直接调用 Tool；
 - `scheduler/` 只通过 `ExecutionBackend` 执行节点；
@@ -2342,9 +2519,21 @@ git
 ```text
 filesystem
 shell
-git
 code search
+git read-only exploration
 ```
+
+其中必须区分：
+
+```text
+Runtime-owned Git operations
+→ clone / checkout / base SHA freeze / invariant / final patch
+
+Agent-available Git operations
+→ status / log / show / diff 等任务探索
+```
+
+一期不将 Repository lifecycle operation 作为普通 `git_operation` Capability 下放给 Agent。
 
 可选：
 
@@ -2370,13 +2559,21 @@ Execution Trace 为后续 Experience Memory 提供数据基础。
 
 ### 18.6 Sandbox / Deployment Boundary
 
-一期明确支持：
+一期区分两类执行模式：
 
 ```text
-LocalSandboxProvider
-or
-AioSandboxProvider + LocalContainerBackend
+Development / Trusted Fixture:
+LocalSandboxProvider + allow_host_bash=true
+
+Default SWE Execution:
+AioSandboxProvider + Local Container Backend
 ```
+
+DeerFlow 的 LocalSandbox 会直接在 Gateway / Host 文件系统上执行命令，没有容器隔离。因此：
+
+> **LocalSandbox 只用于受信任的 Demo Fixture、本地开发和调试，不作为任意外部 Repository 的默认执行环境。**
+
+真实 Repository-Level SWE Task 需要执行 `pytest`、`npm test`、`make`、安装依赖等潜在不可信代码，一期默认推荐使用本地 AIO Container Sandbox。
 
 核心要求：
 
@@ -2393,6 +2590,8 @@ multi-worker remote filesystem persistence
 ```
 
 远程 Sandbox 可能依赖显式文件同步或共享存储，必须独立验证后再进入支持范围。
+
+Private Repository Auth 一期作为 optional integration。DeerFlow GitHub Webhook Channel 可以注入 GitHub App installation token，但 A-SWE Direct Runtime 不应默认假设自动获得该 token。MVP 必须稳定支持 public HTTPS repo 与 local fixture repo；private clone / push 需要单独设计 RepositoryCredential / GitHub integration boundary。
 
 ### 18.7 Demo Case
 
@@ -2595,23 +2794,68 @@ POC-09
 
 #### P0-2：Repository / Workspace Bootstrap Audit
 
-在开始实际 Repository-Level Demo 前继续确认：
+状态：
+
+```text
+Architecture Audited
+Implementation PoC Pending
+```
+
+审计后冻结链路：
 
 ```text
 Repository Source
       ↓
-WorkspaceSession creation
+WorkspaceSession Allocate
       ↓
-clone / checkout / base ref freeze
+Repository Bootstrap
       ↓
-/mnt/user-data/workspace
+clone / materialize
+      ↓
+resolve requested_ref
+      ↓
+checkout exact resolved_base_sha
+      ↓
+verify clean repository
+      ↓
+capture baseline workspace snapshot
       ↓
 Task DAG execution
       ↓
-git diff / patch result
+Repository Invariant Check
+      ↓
+Git ChangeSet + Workspace ChangeSet
+      ↓
+Evaluation / Patch Result
 ```
 
-该阶段的目标是冻结 Repo ingress / base revision / final diff 的工程边界，而不是扩展 Agent 功能。
+架构结论：
+
+- DeerFlow thread workspace：直接复用；
+- DeerFlow bash cwd：直接复用，Repository Root 放在 `/mnt/user-data/workspace`；
+- Repository clone / checkout / base SHA freeze：A-SWE 实现；
+- Repository invariant：A-SWE 实现；
+- filesystem snapshot / diff：复用 DeerFlow `workspace_changes`；
+- Git-aware Patch：A-SWE 实现；
+- LocalSandbox：仅可信开发 / Demo；
+- Local AIO Container：Repository-Level SWE 默认执行环境；
+- public HTTPS repo / local fixture：MVP 必须支持；
+- private repo credential：optional integration。
+
+新增 P0-2 PoC：
+
+| PoC | 测试内容 | 必须验证 |
+|---|---|---|
+| POC-13 | public repo → bootstrap | clone 到 workspace root |
+| POC-14 | branch / tag → SHA | `resolved_base_sha` 稳定 |
+| POC-15 | bootstrap clean check | 初始 working tree clean |
+| POC-16 | Agent 修改后 invariant | HEAD 仍等于 base SHA |
+| POC-17 | Agent 擅自 commit / checkout | invariant fail |
+| POC-18 | final Git ChangeSet | tracked + untracked 完整 |
+| POC-19 | baseline snapshot timing | clone 文件不进入 task diff |
+| POC-20 | Local AIO repo execution | clone / edit / pytest / diff 全链路成立 |
+
+P0-2 的目标不是让 Agent 学会 Git，而是让 Runtime 掌握 Repository execution identity 与可复现 baseline。
 
 ---
 
@@ -2629,6 +2873,13 @@ git diff / patch result
 - `SubagentExecutor` Adapter；
 - Runtime State / Context；
 - `WorkspaceSession`；
+- `RepositoryBinding`；
+- Repository Bootstrap；
+- `resolved_base_sha` freeze；
+- Repository clean baseline check；
+- baseline workspace snapshot；
+- Repository invariant；
+- Repository ChangeSet；
 - Workspace identity：`task_id → user_id + thread_id`；
 - shared execution capacity；
 - DeerFlow compatibility integration tests。
@@ -2693,7 +2944,9 @@ Different Teams
 - Cancellation；
 - Failure Propagation；
 - Result Aggregation；
-- Node Acceptance Gate。
+- Node Acceptance Gate；
+- WRITE Node 后 Repository Invariant Check；
+- 可选 WRITE Node before / after workspace snapshot。
 
 #### P1-5：Execution Trace
 
@@ -2717,6 +2970,8 @@ Different Teams
 - Test Execution；
 - Regression Test；
 - Reviewer；
+- Git-aware Repository ChangeSet；
+- DeerFlow Workspace ChangeSet；
 - Evaluation Report。
 
 #### P1-7：Demo Packaging
