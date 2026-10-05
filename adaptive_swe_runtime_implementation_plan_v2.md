@@ -1,6 +1,6 @@
 # Adaptive Agent Runtime for Software Engineering 实施方案书
 
-> 版本：MVP 面试项目收敛版  
+> 版本：MVP 面试项目收敛版（DeerFlow 源码审计后更新）  
 > 项目简称：**A-SWE Runtime**  
 > 核心目标：在较短实施周期内，完成一个可运行、可演示、可解释的自适应软件工程 Agent Runtime。
 
@@ -82,7 +82,7 @@ Software Engineering Task
           Result
 ```
 
-项目当前默认通过 Adapter 对接 DeerFlow Harness，复用其 LangGraph Runtime、基础 Subagent、Skills、MCP、Sandbox、Context Management 等基础能力；A-SWE Runtime 自身保持独立，核心新增能力集中在任务理解、Capability Resolution、动态团队构建、任务调度、Execution Trace 和 Evaluation。
+项目当前默认通过 Adapter 对接 DeerFlow Harness，复用其 Subagent Execution、Skills、MCP、Sandbox、Context Management、Tool Receipt 等基础能力；A-SWE Runtime 自身保持独立，核心新增能力集中在任务理解、Capability Resolution、Workspace Runtime、动态团队构建、任务调度、Execution Trace 和 Evaluation。
 
 ### 1.3 核心项目命题
 
@@ -104,27 +104,31 @@ Software Engineering Task
 
 1. 理解用户提交的软件工程任务；
 2. 将自然语言任务转换为结构化 `TaskSpec`；
-3. 识别任务所需 Capability；
-4. 从 Agent、Skill、Tool、MCP Tool 中解析 Capability Provider；
-5. 根据任务复杂度、风险和能力覆盖情况构建最小可行 Agent Team；
-6. 生成 Task DAG；
-7. 调度 Agent、Skill 与 Tool 执行；
-8. 记录完整 Execution Trace；
-9. 对 Patch、测试结果和执行结果进行自动 Evaluation；
-10. 输出结构化任务结果与运行指标。
+3. 创建并维护任务级 `WorkspaceSession`，保证同一任务内各执行节点共享稳定的软件工程工作区；
+4. 识别任务所需 Capability；
+5. 从 Agent、Skill、Tool、MCP Tool 中解析 Capability Provider；
+6. 根据任务复杂度、风险和能力覆盖情况构建最小可行 Agent Team；
+7. 生成 Task DAG，并显式标注节点对共享 Workspace 的 READ / WRITE 行为；
+8. 调度 Agent、Skill 与 Tool 执行；
+9. 记录 Runtime Decision、节点执行证据与底层 Harness Trace；
+10. 对 Patch、测试结果和执行结果进行自动 Evaluation；
+11. 输出结构化任务结果与运行指标。
 
 ### 2.2 一期建设重点
 
-一期只聚焦六个核心能力：
+一期聚焦七个核心能力：
 
 ```text
 1. Task Analyzer
-2. Capability Registry / Resolver
-3. Dynamic Team Builder
-4. Task Scheduler
-5. Execution Trace / Observability
-6. Evaluation
+2. Workspace Runtime
+3. Capability Registry / Resolver
+4. Dynamic Team Builder
+5. Task Scheduler
+6. Execution Trace / Observability
+7. Evaluation
 ```
+
+其中 `Workspace Runtime` 不是额外的 Agent，而是负责维护 Repository-Level Task 的共享执行身份与工作区生命周期。
 
 ### 2.3 一期明确不做
 
@@ -139,47 +143,57 @@ Software Engineering Task
 - 大量 MCP Server；
 - 多模型 Agent Ranking；
 - 自动 Skill 生成；
-- 大规模 Web UI 平台化建设。
+- 大规模 Web UI 平台化建设；
+- 分布式 Workspace / 多租户远程 Sandbox 平台；
+- 复杂文件级冲突预测与自动 Merge。
 
 一期重点是：
 
-> **Runtime 核心链路能够真实运行，并能够通过 3～5 个 Demo Case 清晰展示不同任务产生不同执行拓扑。**
+> **Runtime 核心链路能够真实运行，并能够通过 3～5 个 Demo Case 清晰展示不同任务产生不同执行拓扑，同时保证多个 DAG 节点在同一任务工作区内安全协作。**
 
 ---
 
 ## 3. 总体系统架构
 
-A-SWE Runtime 采用“核心运行时 + 基础设施适配层”的设计。
+A-SWE Runtime 采用“控制面 + Workspace Runtime + 执行适配层 + DeerFlow Execution Plane”的设计。
 
 ```text
-┌─────────────────────────────────────────────────────────┐
-│                    A-SWE Runtime                         │
-│                                                         │
-│  Task Analyzer                                          │
-│  Capability Registry / Resolver                         │
-│  Dynamic Team Builder                                   │
-│  Task Scheduler                                         │
-│  Execution Trace / Observability                        │
-│  Evaluation                                             │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│                  Runtime Adapter                         │
-│                                                         │
-│              DeerFlow Adapter                           │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│                 DeerFlow Harness                        │
-│                                                         │
-│  LangGraph Runtime                                      │
-│  Subagents                                              │
-│  Skills                                                 │
-│  MCP                                                    │
-│  Tools                                                  │
-│  Sandbox                                                │
-│  Context Management                                     │
-│  Basic Memory                                           │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                       A-SWE Runtime                           │
+│                                                              │
+│  Task Analyzer                                               │
+│  Capability Registry / Resolver                              │
+│  Dynamic Team Builder                                        │
+│  Task DAG / Scheduler                                        │
+│  Execution Trace / Observability                             │
+│  Evaluation                                                  │
+│                                                              │
+├───────────────────────────┬──────────────────────────────────┤
+│      Workspace Runtime    │       Runtime Decision Plane     │
+│                           │                                  │
+│  WorkspaceSession         │  what / who / when               │
+│  thread_id / user_id      │                                  │
+│  repo / base_ref          │                                  │
+│  shared workspace         │                                  │
+├───────────────────────────┴──────────────────────────────────┤
+│                DeerFlow Execution Adapter                    │
+│                                                              │
+│     TaskNode + AgentProvider + WorkspaceSession               │
+│                         │                                    │
+│                         ▼                                    │
+│               DeerFlowExecutionBackend                       │
+├──────────────────────────────────────────────────────────────┤
+│                   DeerFlow Execution Plane                   │
+│                                                              │
+│  SubagentConfig → SubagentExecutor → SubagentResult          │
+│  Skills / Tools / MCP / Middleware / Sandbox / Receipts      │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 ```
+
+核心职责边界：
+
+> **A-SWE 决定 what / who / when；DeerFlow 负责 how to execute safely。**
 
 ### 3.1 A-SWE Runtime 层
 
@@ -191,57 +205,253 @@ A-SWE Runtime 是项目主体，负责：
 - Dynamic Team Formation；
 - DAG Planning；
 - Agent Assignment；
-- Execution Scheduling；
-- Runtime Trace；
+- Workspace-aware Scheduling；
+- Retry / Failure Propagation；
+- Runtime Decision Trace；
 - Evaluation；
 - 运行指标采集。
 
-### 3.2 Runtime Adapter 层
+A-SWE 不让 DeerFlow Lead Agent 自主决定任务拓扑。Team 与 DAG 由 A-SWE 控制面显式生成，底层 Harness 只负责执行已确定的节点。
 
-Adapter 负责隔离 A-SWE Runtime 与具体 Harness 实现。
+### 3.2 Workspace Runtime
 
-一期默认：
+Repository-Level SWE Task 不是若干互相独立的 Agent 调用，而是在同一份代码状态上持续推进的执行过程，因此一期显式引入 `WorkspaceSession`。
 
-```text
-A-SWE Runtime
-      │
-      ▼
-DeerFlowAdapter
-      │
-      ▼
-DeerFlow Harness
-```
-
-Adapter 建议提供统一接口，例如：
+建议数据结构：
 
 ```python
-class RuntimeBackend:
-    async def create_agent(...): ...
-    async def run_agent(...): ...
-    async def execute_tool(...): ...
-    async def load_skill(...): ...
-    async def run_in_sandbox(...): ...
+class WorkspaceSession(BaseModel):
+    task_id: str
+
+    # DeerFlow execution identity
+    thread_id: str
+    user_id: str
+
+    # repository identity
+    repo_url: str | None = None
+    base_ref: str | None = None
+
+    # runtime workspace
+    workspace_root: str
+    status: str
 ```
 
-A-SWE 核心模块不直接依赖 DeerFlow 内部对象。
+关键约束：
 
-### 3.3 DeerFlow Harness 层
+```text
+one A-SWE task
+      │
+      ▼
+one WorkspaceSession
+      │
+      ├── stable user_id
+      └── stable thread_id
+              │
+              ▼
+shared DeerFlow thread workspace / sandbox identity
+```
+
+Explorer、Coder、Tester、Reviewer 只要在同一 `WorkspaceSession` 中执行，就必须使用相同的 `user_id + thread_id`。
+
+这使：
+
+```text
+Explorer discovers code
+        ↓
+Coder modifies code
+        ↓
+Tester observes the modification
+        ↓
+Reviewer reviews the same working tree
+```
+
+成为 Runtime 的显式契约，而不是依赖 Agent 输出在 Prompt 中传递代码状态。
+
+Repository clone / checkout / base ref 固定等 Workspace Bootstrap 细节在正式实现前继续进行 P0 审计；当前架构先固定 `WorkspaceSession` 作为上层接口。
+
+### 3.3 DeerFlow Execution Adapter
+
+Adapter 不再暴露：
+
+```python
+create_agent()
+run_agent()
+load_skill()
+execute_tool()
+run_in_sandbox()
+```
+
+这类过度贴近 Harness 内部组件的接口。
+
+一期收敛为节点级执行接口：
+
+```python
+class ExecutionBackend(Protocol):
+    async def execute_node(
+        self,
+        node: TaskNode,
+        provider: AgentProvider,
+        workspace: WorkspaceSession,
+    ) -> NodeExecutionResult:
+        ...
+
+    async def cancel_node(
+        self,
+        execution_id: str,
+    ) -> None:
+        ...
+
+    async def check_acceptance(
+        self,
+        result: NodeExecutionResult,
+        acceptance_criteria: list[str],
+        workspace: WorkspaceSession,
+    ) -> NodeAcceptanceResult:
+        ...
+```
+
+因此 A-SWE 核心模块只理解：
+
+```text
+TaskNode
+AgentProvider
+WorkspaceSession
+NodeExecutionResult
+NodeAcceptanceResult
+```
+
+而不知道 DeerFlow 内部如何加载 Skill、Tool、MCP、Middleware 或 Sandbox。
+
+### 3.4 DeerFlowExecutionBackend
+
+一期推荐将 DeerFlow 的 `SubagentExecutor` 作为 DAG Worker Primitive。
+
+执行链路：
+
+```text
+A-SWE Scheduler
+      │
+      ▼
+TaskNode
+      │
+      ▼
+Capability / Agent Provider
+      │
+      ▼
+DeerFlowExecutionBackend
+      │
+      ├── resolve SubagentConfig
+      ├── resolve tools / skills / MCP
+      ├── bind WorkspaceSession.thread_id
+      ├── bind WorkspaceSession.user_id
+      └── use shared execution capacity
+      │
+      ▼
+SubagentExecutor
+      │
+      ▼
+SubagentResult
+      │
+      ▼
+NodeExecutionResult
+```
+
+`SubagentExecutor` 已能接收：
+
+- `SubagentConfig`；
+- tools；
+- app config；
+- thread data；
+- sandbox state；
+- `thread_id`；
+- `user_id`；
+- trace id；
+- shared execution capacity；
+- acceptance criteria。
+
+Adapter 可以持有一个进程级 `SubagentRuntime` / shared execution capacity，并将同一容量控制器传入不同节点执行，避免 A-SWE 自己重新实现底层并发 admission control。
+
+### 3.5 NodeExecutionResult
+
+A-SWE 不直接暴露 DeerFlow `SubagentResult`，而映射成自身稳定 Schema。
+
+建议至少保留：
+
+```python
+class NodeExecutionResult(BaseModel):
+    execution_id: str
+    node_id: str
+    status: str
+    result: str | None
+    error: str | None
+
+    stop_reason: str | None
+
+    started_at: datetime | None
+    completed_at: datetime | None
+
+    token_usage: list[dict]
+    tool_receipts: list[dict] | None
+    bash_executions: list[dict] | None
+
+    backend_trace_id: str | None
+```
+
+其中 `stop_reason` 必须与 `status` 分离，例如：
+
+```text
+status = completed
+stop_reason = turn_capped
+```
+
+表示任务产生了可用结果，但执行过程触发了 Runtime Guardrail，不应被误认为 clean completion。
+
+### 3.6 DeerFlow 集成基线与升级策略
+
+本轮源码审计冻结基线：
+
+```text
+bytedance/deer-flow
+commit: c0895d295bba34f6e95188fca380f555dabed891
+```
+
+重点验证路径：
+
+```text
+deerflow/subagents/config.py
+deerflow/subagents/executor.py
+deerflow/subagents/runtime.py
+deerflow/subagents/capacity.py
+deerflow/sandbox/middleware.py
+deerflow/sandbox/lease.py
+deerflow/subagents/acceptance_checks.py
+```
+
+由于 `SubagentExecutor` 属于较低层 Harness API，A-SWE 必须：
+
+1. 将所有 DeerFlow-specific import 限制在 `integrations/deerflow/`；
+2. 固定并记录兼容的 DeerFlow commit / version；
+3. 为 Adapter 建立独立 integration tests；
+4. 升级 DeerFlow 时优先重新执行 P0.5 PoC，而不是直接假设接口兼容。
+
+### 3.7 DeerFlow Harness 复用范围
 
 底层 Harness 主要复用：
 
-- LLM Agent Runtime；
-- LangGraph；
 - Subagent 执行；
 - Tool Calling；
-- Skill Loading；
-- MCP Client；
+- Skill Discovery / Activation；
+- MCP Tool Routing；
 - Sandbox；
-- Context Management；
-- 文件与 Artifact 能力。
+- Sandbox Lease；
+- Context / Thread Data；
+- Tool Receipt；
+- Token / Turn / Loop Guard；
+- Langfuse / LangSmith 等底层 Trace 能力。
 
 实施原则：
 
-> 能通过 Adapter 使用的基础设施能力，不在 A-SWE 中重复实现。
+> 能通过 Execution Adapter 使用的基础设施能力，不在 A-SWE 中重复实现。
 
 ---
 
@@ -829,9 +1039,9 @@ Team Builder 决定：
 
 Task Scheduler 决定：
 
-> 这些 Agent 以什么顺序、依赖关系和并行关系执行。
+> 这些 Agent 以什么顺序、依赖关系和并行关系执行，以及它们能否安全地同时访问同一个 Workspace。
 
-Scheduler 将任务转换为 Task DAG。
+Scheduler 将任务转换为 Task DAG，同时维护 Workspace side-effect constraint。
 
 ### 9.2 示例 DAG
 
@@ -843,76 +1053,161 @@ Scheduler 将任务转换为 Task DAG。
           ┌─────────────┴─────────────┐
           ▼                           ▼
  Locate DB Layer                Inspect Tests
+      READ                          READ
           │                           │
           ▼                           │
 Analyze Connection Lifecycle         │
+      READ                            │
           │                           │
           └─────────────┬─────────────┘
                         ▼
                     Root Cause
+                       READ
                         │
                         ▼
                      Implement
+                       WRITE
                         │
                         ▼
                   Regression Test
+                       READ
                         │
                         ▼
                       Review
+                       READ
 ```
 
-其中：
-
-```text
-Locate DB Layer
-```
-
-和：
-
-```text
-Inspect Tests
-```
-
-可并行执行。
+其中两个探索节点均为只读，可以并行执行；代码修改节点具有 WRITE 副作用，需要独占共享 Workspace。
 
 ### 9.3 TaskNode
 
-建议定义统一 Task Node：
+建议统一定义：
 
 ```python
 class TaskNode(BaseModel):
     id: str
     type: str
     description: str
+
     assigned_agent: str | None
     required_capabilities: list[str]
     dependencies: list[str]
+
+    workspace_access: WorkspaceAccess
+
+    # Phase 1 optional; default unknown.
+    affected_paths: list[str] | None = None
+
+    acceptance_criteria: list[str] = []
+
     status: NodeStatus
     retry_policy: RetryPolicy
 ```
 
-### 9.4 一期 Scheduler 能力
+一期：
 
-必须支持：
+```python
+class WorkspaceAccess(str, Enum):
+    READ = "read"
+    WRITE = "write"
+```
+
+### 9.4 Workspace 并发安全规则
+
+DeerFlow 可以解决共享 Sandbox 的生命周期、lease 与 shell scope，但不会替 A-SWE 判断两个业务节点能否安全并行修改同一份 Repository。
+
+因此 A-SWE Scheduler 必须显式承担共享 Workspace 冲突控制。
+
+一期采用保守策略：
+
+| Node A | Node B | 是否允许并行 |
+|---|---|---:|
+| READ | READ | 是 |
+| READ | WRITE | 否 |
+| WRITE | READ | 否 |
+| WRITE | WRITE | 否 |
+
+即：
+
+> **MVP 只允许 READ / READ 并行，任何 WRITE 节点都获得 Workspace 独占执行权。**
+
+这种策略会牺牲部分并行度，但能优先保证 Repository 状态一致性。
+
+### 9.5 后续细粒度并行
+
+二期以后可增加：
+
+```python
+affected_paths = [
+    "src/auth/**"
+]
+```
+
+若两个 WRITE Node 的作用域可证明不相交，可允许并行：
+
+```text
+Coder A → src/auth/**
+Coder B → docs/**
+```
+
+但一期不实现复杂路径冲突预测、Git worktree fan-out 或自动 merge。
+
+### 9.6 Scheduler 执行职责
+
+一期 Scheduler 必须支持：
 
 - Task decomposition；
 - Dependency DAG；
 - Sequential execution；
-- Basic parallel execution；
+- READ-only basic parallel execution；
 - Agent assignment；
 - Node status tracking；
+- Workspace access arbitration；
 - Retry；
 - Failure propagation；
-- Result aggregation。
+- Cancellation；
+- Result aggregation；
+- Acceptance gate。
 
-### 9.5 一期不追求
+### 9.7 Node 执行流程
+
+单节点标准流程：
+
+```text
+NodeReady
+   │
+   ▼
+WorkspaceAccessCheck
+   │
+   ▼
+ExecutionBackend.execute_node()
+   │
+   ▼
+NodeExecutionResult
+   │
+   ▼
+Acceptance Check
+   │
+   ├── holds → NodeCompleted
+   │
+   ├── unverified → policy decision
+   │
+   └── failed → retry / fail
+   │
+   ▼
+Release Workspace Access
+```
+
+### 9.8 一期不追求
 
 暂不做：
 
-- 复杂 distributed scheduler；
-- 动态 worker autoscaling；
+- complex distributed scheduler；
+- dynamic worker autoscaling；
 - RL scheduling；
-- 超大规模 Agent swarm。
+- large-scale Agent swarm；
+- parallel write merge；
+- cross-machine distributed workspace locking。
 
 ---
 
@@ -926,7 +1221,7 @@ Capability Registry 定义：
 
 Agent Registry 定义：
 
-> 哪些执行主体能够提供这些能力。
+> 哪些执行主体能够提供这些能力，以及该执行主体在 DeerFlow Execution Plane 中应被映射成怎样的 `SubagentConfig`。
 
 ### 10.2 一期 Agent
 
@@ -939,7 +1234,7 @@ Tester
 Reviewer
 ```
 
-`SWE Lead` 可以作为 Runtime Coordinator 的逻辑角色，而不一定独立实现为一个长期 Agent。
+`SWE Lead` 作为 A-SWE Runtime Coordinator 的逻辑角色存在，不实现为一个负责自主 delegation 的长期 DeerFlow Lead Agent。
 
 ### 10.3 Agent Metadata
 
@@ -961,6 +1256,7 @@ preferred_tools:
 preferred_skills:
   - repository_navigation
 
+workspace_access: read
 cost_class: low
 parallelizable: true
 ```
@@ -982,23 +1278,69 @@ preferred_tools:
 
 preferred_skills:
   - pytest
+
+workspace_access: read
 ```
 
-### 10.4 Agent 实例化
+Coder 默认具有：
 
 ```text
-Capability Requirement
-        ↓
-Candidate Agent
-        ↓
-Metadata Match
-        ↓
-Team Builder Decision
-        ↓
-Runtime Backend Instantiate
+workspace_access = write
 ```
 
-Agent Registry 不直接负责调度。
+Reviewer 默认只读。
+
+### 10.4 AgentProvider
+
+A-SWE 内部使用 `AgentProvider`，而不是直接持有 DeerFlow 对象：
+
+```python
+class AgentProvider(BaseModel):
+    id: str
+    role: str
+    capabilities: list[str]
+
+    tools: list[str]
+    skills: list[str]
+
+    workspace_access: WorkspaceAccess
+
+    backend: str = "deerflow"
+    backend_agent_type: str
+```
+
+### 10.5 DeerFlow 映射
+
+执行时：
+
+```text
+AgentProvider
+     │
+     ▼
+DeerFlowExecutionBackend
+     │
+     ▼
+SubagentConfig
+     │
+     ▼
+SubagentExecutor
+```
+
+A-SWE 的 Agent Registry 不直接实例化 LangGraph Agent，也不直接管理 Sandbox。
+
+### 10.6 Agent Registry 不负责的事情
+
+Agent Registry 不负责：
+
+- DAG Scheduling；
+- Workspace Lock；
+- Sandbox 生命周期；
+- Tool 实际执行；
+- Skill 文件加载；
+- MCP Session；
+- Evaluation。
+
+这些职责分别归 Scheduler、Workspace Runtime、Execution Backend 与 Evaluation 模块。
 
 ---
 
@@ -1086,6 +1428,22 @@ Load Reference / Script on Demand
 
 避免一次性加载所有 Skill 内容。
 
+### 11.5 DeerFlow Direct Subagent 的 Skill Boundary
+
+DeerFlow 标准设计中，Lead Agent 通常拥有 thread-level `/mnt/skills` physical projection，Subagent 的 `skills` 配置主要限制：
+
+- Skill discovery；
+- Skill activation；
+- active skill 的 allowed-tools policy。
+
+A-SWE 一期直接使用 `SubagentExecutor`，不依赖 DeerFlow Lead Agent 进行自主 delegation，因此必须明确：
+
+> **Phase 1 的 Skill allowlist 是 capability / execution policy boundary，不宣称为每个 Subagent 独立的 filesystem security boundary。**
+
+这对面试型 MVP 不构成阻塞，但属于 Known Boundary。
+
+后续若需要多租户或强安全隔离，再单独设计 per-agent filesystem projection / sandbox isolation。
+
 ---
 
 ## 12. MCP 集成设计
@@ -1159,39 +1517,52 @@ github.get_issue
 
 ### 13.1 模块定位
 
-Execution Trace 是一期核心模块，而不是附加日志系统。
+Execution Trace 是一期核心模块，但 A-SWE 不重复实现 DeerFlow 已有的低层 LLM / Tool tracing。
 
-其作用包括：
-
-- 解释 Runtime 为什么做出某个决策；
-- 记录 Agent、Skill、Tool 的实际执行过程；
-- 为调试 Scheduler 与 Dynamic Team 提供依据；
-- 为 Evaluation 提供运行数据；
-- 为未来 Experience Memory / Adaptive Selection 提供原始数据。
-
-整体关系：
+一期采用三层 Trace：
 
 ```text
-Runtime Decision
-      │
-      ▼
- Runtime Event
-      │
-      ▼
-   Event Bus
-      │
-      ▼
-  Trace Store
-      │
-      ├── Timeline
-      ├── Metrics
-      ├── Debugging
-      └── Future Experience
+┌────────────────────────────────────────────┐
+│          Layer 1: A-SWE Decision Trace     │
+│                                            │
+│ TaskAnalyzed                               │
+│ CapabilityResolved                        │
+│ TeamSelected                              │
+│ DAGCreated                                 │
+│ NodeScheduled                             │
+│ WorkspaceAccessGranted / Blocked           │
+│ NodeRetried                               │
+│ EvaluationCompleted                       │
+└────────────────────────────────────────────┘
+                      │
+                    node_id
+                      ▼
+┌────────────────────────────────────────────┐
+│       Layer 2: Node Execution Evidence     │
+│                                            │
+│ status / stop_reason                       │
+│ duration                                   │
+│ token usage                                │
+│ tool receipts                              │
+│ bash execution evidence                    │
+│ acceptance verdict                         │
+└────────────────────────────────────────────┘
+                      │
+                 backend_trace_id
+                      ▼
+┌────────────────────────────────────────────┐
+│       Layer 3: DeerFlow / LLM Trace        │
+│                                            │
+│ model spans                                │
+│ detailed tool execution                    │
+│ middleware                                 │
+│ Langfuse / LangSmith                       │
+└────────────────────────────────────────────┘
 ```
 
-### 13.2 Runtime Event
+### 13.2 A-SWE Runtime Event
 
-建议所有关键动作统一转换为 `RuntimeEvent`。
+A-SWE 自己记录 Runtime Decision 与 Scheduler 事件：
 
 ```python
 class RuntimeEvent(BaseModel):
@@ -1199,6 +1570,8 @@ class RuntimeEvent(BaseModel):
     task_id: str
     event_type: str
     timestamp: datetime
+
+    node_id: str | None = None
     source: str
     payload: dict
 ```
@@ -1211,6 +1584,9 @@ class RuntimeEvent(BaseModel):
 TaskReceived
 TaskAnalyzed
 
+WorkspaceCreated
+WorkspaceReady
+
 CapabilityRequired
 CapabilityResolved
 
@@ -1221,15 +1597,20 @@ ToolSelected
 TeamCreated
 
 DAGCreated
+NodeReady
+NodeScheduled
+
+WorkspaceAccessGranted
+WorkspaceAccessBlocked
+WorkspaceAccessReleased
+
 NodeStarted
 NodeCompleted
 NodeFailed
 NodeRetried
+NodeCancelled
 
-AgentStarted
-AgentCompleted
-ToolCalled
-ToolReturned
+AcceptanceChecked
 
 EvaluationStarted
 EvaluationCompleted
@@ -1237,6 +1618,8 @@ EvaluationCompleted
 TaskCompleted
 TaskFailed
 ```
+
+低层 `ToolCalled / ToolReturned / LLMStarted` 不强制重新转写成 A-SWE Event；需要时通过 `backend_trace_id` 下钻到底层 Trace。
 
 ### 13.4 决策可解释性
 
@@ -1258,24 +1641,62 @@ TaskFailed
 }
 ```
 
-### 13.5 Trace Metrics
+Workspace 并发决策也必须可解释：
+
+```json
+{
+  "event_type": "WorkspaceAccessBlocked",
+  "node_id": "implement_fix_2",
+  "payload": {
+    "requested": "write",
+    "reason": "another_write_node_is_running"
+  }
+}
+```
+
+### 13.5 Tool Receipt 作为 Execution Evidence
+
+DeerFlow `SubagentResult.tool_receipts` 可直接作为节点级执行证据。
+
+Receipt 至少包含：
+
+```text
+tool_call_id
+tool_name
+status
+args_sha256
+output_sha256
+output_bytes
+created_at
+```
+
+A-SWE 不必为了“看起来可观测”再给每一个 Tool 包一层重复 callback。
+
+Tool Receipt 用于回答：
+
+> 这个 Node 实际调用过哪些 Tool，以及这些调用是否成功。
+
+若需要查看完整 Tool 输入、输出和 LLM span，则通过底层 Trace 查看。
+
+### 13.6 Trace Metrics
 
 一期至少记录：
 
 ```text
 Task Duration
+Node Count
 Agent Count
-LLM Call Count
-Tool Call Count
+LLM / Token Usage（底层可获取时）
+Tool Receipt Count
 Retry Count
 Node Failure Count
-Token Usage（若底层可获取）
+Workspace Block Count
 Selected Skills
 Selected Tools
 Final Status
 ```
 
-### 13.6 Trace UI
+### 13.7 Trace UI
 
 一期 UI 不需要复杂平台化，可以实现一个简单任务详情页：
 
@@ -1288,6 +1709,11 @@ Task Analysis
 Type           bug_fix
 Complexity     medium
 Risk           high
+
+Workspace
+────────────────────────
+Thread         aswe-task-001
+Status         ready
 
 Capabilities
 ────────────────────────
@@ -1308,22 +1734,23 @@ Reviewer
 
 Execution Timeline
 ────────────────────────
-✓ inspect repository
-✓ locate DB layer
-✓ analyze lifecycle
-→ implement patch
-○ regression test
-○ review
+✓ inspect repository       READ
+✓ locate DB layer          READ
+✓ analyze lifecycle        READ
+→ implement patch          WRITE
+○ regression test          READ
+○ review                   READ
 
 Metrics
 ────────────────────────
-Agents           4
-LLM Calls        8
-Tool Calls      27
-Retries          1
+Agents             4
+Retries            1
+Workspace Blocks   0
 ```
 
-对于面试 Demo，Trace UI 是项目展示的重要组成部分。
+对于面试 Demo，Trace UI 的核心不是展示日志数量，而是展示：
+
+> **Runtime 为什么生成当前 Team / DAG，以及 Scheduler 如何在共享 Workspace 上安全执行。**
 
 ---
 
@@ -1339,7 +1766,76 @@ Evaluation 不等同于正式 Benchmark。
 
 一期不做大规模 Benchmark，但每一次任务执行必须有内部 Evaluation。
 
-### 14.2 Evaluation Pipeline
+### 14.2 两级验证
+
+一期将验证拆成：
+
+```text
+Node Acceptance
+      │
+      ▼
+Task Evaluation
+```
+
+#### Node Acceptance
+
+回答：
+
+> 当前 DAG Node 声称完成的结果，是否有确定性执行证据支持？
+
+#### Task Evaluation
+
+回答：
+
+> 整个 Patch 是否解决原始问题，并满足 Repository-Level 软件工程要求？
+
+### 14.3 DeerFlow Acceptance Checker 复用
+
+`SubagentExecutor` 会采集 acceptance 所需的 execution evidence，例如：
+
+- tool receipts；
+- bash executions；
+- thread / workspace context。
+
+但标准 DeerFlow 中最终 deterministic acceptance check 位于 `task_tool` 的父调用路径。
+
+A-SWE 绕开 Lead Agent / `task_tool`，因此 DeerFlow Adapter 必须显式回接：
+
+```text
+SubagentExecutor
+      │
+      ▼
+SubagentResult
+      │
+      ▼
+deerflow.subagents.acceptance_checks
+      │
+      ▼
+NodeAcceptanceResult
+```
+
+原则：
+
+> **复用 DeerFlow acceptance checker，不重新实现一套平行的 acceptance 语义。**
+
+一期优先支持 DeerFlow 已能确定性判断的 criterion，例如：
+
+```text
+file:<path> exists
+file:<path> non-empty
+file_written:<path>
+tests_passed:<command>
+```
+
+无法确定性判断的 criterion 标记为：
+
+```text
+UNVERIFIED
+```
+
+而不是由 LLM 强行判为成功。
+
+### 14.4 Task Evaluation Pipeline
 
 ```text
 Code Patch
@@ -1358,11 +1854,15 @@ Evaluator
 Evaluation Report
 ```
 
-### 14.3 EvaluationResult
+### 14.5 EvaluationResult
 
 ```yaml
 evaluation:
   execution_status: completed
+
+  acceptance:
+    all_required_nodes_hold: true
+    unverified: []
 
   build:
     status: pass
@@ -1383,7 +1883,7 @@ evaluation:
   final_status: accepted
 ```
 
-### 14.4 Reviewer 关注点
+### 14.6 Reviewer 关注点
 
 Reviewer 主要检查：
 
@@ -1395,12 +1895,18 @@ Reviewer 主要检查：
 - 是否存在明显安全 / 性能问题；
 - 是否可以进一步简化。
 
-### 14.5 一期 Evaluation 原则
+### 14.7 Evaluation 原则
 
-优先使用：
+优先级：
 
 ```text
-确定性检查 > LLM 自评
+Deterministic Check
+        >
+Execution Evidence
+        >
+Reviewer Judgment
+        >
+LLM Self-Claim
 ```
 
 例如：
@@ -1410,6 +1916,8 @@ pytest
 build
 import
 lint
+file existence
+recorded execution evidence
 ```
 
 能够确定的结果，不应只依赖 Reviewer Agent 判断。
@@ -1429,44 +1937,64 @@ Task Analyzer
       ▼
 TaskSpec
       │
-      ▼
-Capability Resolver
-      │
-      ▼
-ResolvedCapabilities
-      │
-      ▼
-Dynamic Team Builder
-      │
-      ▼
-TeamSpec
-      │
-      ▼
-Task Scheduler
-      │
-      ▼
-Task DAG
-      │
-      ▼
-Adaptive Execution
-      │
- ┌────┴───────────────┐
- │                    │
- ▼                    ▼
-Runtime Events     Agent / Skill / Tool
- │                    │
- ▼                    ▼
-Trace Store         Sandbox
- │                    │
- └──────────┬─────────┘
-            ▼
-        Evaluation
-            │
-            ▼
-          Result
+      ├─────────────────────┐
+      ▼                     ▼
+Workspace Runtime      Capability Resolver
+      │                     │
+      ▼                     ▼
+WorkspaceSession     ResolvedCapabilities
+      │                     │
+      │                     ▼
+      │              Dynamic Team Builder
+      │                     │
+      │                     ▼
+      │                  TeamSpec
+      │                     │
+      └──────────┬──────────┘
+                 ▼
+            Task Scheduler
+                 │
+                 ▼
+              Task DAG
+                 │
+                 ▼
+        Workspace Access Gate
+                 │
+                 ▼
+      DeerFlowExecutionBackend
+                 │
+                 ▼
+         SubagentExecutor
+                 │
+                 ▼
+         SubagentResult
+                 │
+        ┌────────┴─────────┐
+        ▼                  ▼
+Node Acceptance       Execution Evidence
+        │                  │
+        └────────┬─────────┘
+                 ▼
+          Runtime Trace
+                 │
+                 ▼
+             Evaluation
+                 │
+                 ▼
+               Result
 ```
 
-每一个主要阶段均产生 Runtime Event。
+其中：
+
+```text
+A-SWE
+→ Task / Capability / Team / DAG / Scheduling / Evaluation
+
+DeerFlow
+→ Subagent / Skill / Tool / MCP / Sandbox / low-level execution
+```
+
+每一个主要 Runtime Decision 均产生 A-SWE Runtime Event；底层 LLM / Tool span 通过 backend trace correlation 下钻查看。
 
 ---
 
@@ -1487,6 +2015,12 @@ a-swe-runtime/
 │   ├── schema.py
 │   └── validator.py
 │
+├── workspace/
+│   ├── session.py
+│   ├── manager.py
+│   ├── access.py
+│   └── bootstrap.py
+│
 ├── capability/
 │   ├── registry.py
 │   ├── resolver.py
@@ -1502,6 +2036,7 @@ a-swe-runtime/
 │   ├── dag.py
 │   ├── scheduler.py
 │   ├── executor.py
+│   ├── workspace_policy.py
 │   └── retry.py
 │
 ├── agents/
@@ -1519,6 +2054,7 @@ a-swe-runtime/
 │
 ├── evaluation/
 │   ├── evaluator.py
+│   ├── acceptance.py
 │   ├── checks.py
 │   └── reviewer.py
 │
@@ -1530,10 +2066,11 @@ a-swe-runtime/
 │
 ├── integrations/
 │   └── deerflow/
-│       ├── adapter.py
-│       ├── agent_adapter.py
-│       ├── skill_adapter.py
-│       └── tool_adapter.py
+│       ├── backend.py
+│       ├── config_mapper.py
+│       ├── result_mapper.py
+│       ├── acceptance_adapter.py
+│       └── trace_adapter.py
 │
 ├── api/
 │   └── routes.py
@@ -1549,26 +2086,31 @@ a-swe-runtime/
 └── README.md
 ```
 
-### 16.2 模块边界
-
-核心依赖方向：
+### 16.2 核心依赖方向
 
 ```text
 Task
-  ↓
+  ├─────────────→ Workspace
+  │
+  ▼
 Capability
   ↓
 Team
   ↓
 Scheduler
+  ├─────────────→ Workspace Access Policy
+  │
+  ▼
+Execution Backend
   ↓
-Runtime Backend
+Evaluation
 ```
 
 Observability 作为横切能力：
 
 ```text
 Task ──────────────┐
+Workspace ─────────┤
 Capability ────────┤
 Team ──────────────┤
 Scheduler ─────────┼──→ RuntimeEvent → Trace Store
@@ -1581,13 +2123,50 @@ Evaluation ────────┘
 建议：
 
 - `task/` 不依赖具体 Agent；
+- `workspace/` 不依赖 Team Builder；
 - `capability/` 不依赖 DeerFlow；
 - `team/` 不直接调用 Tool；
-- `scheduler/` 只通过 Runtime Backend 执行；
+- `scheduler/` 只通过 `ExecutionBackend` 执行节点；
+- `scheduler/` 负责共享 Workspace 的并发正确性；
 - `observability/` 不参与业务决策；
+- `evaluation/` 不直接创建 Agent；
 - 所有 DeerFlow-specific 逻辑集中在 `integrations/deerflow/`。
 
-这样未来理论上可替换底层 Harness。
+### 16.4 Anti-Corruption Layer
+
+`integrations/deerflow/` 是 A-SWE 与 DeerFlow 之间的 Anti-Corruption Layer。
+
+它负责把：
+
+```text
+A-SWE TaskNode
+A-SWE AgentProvider
+A-SWE WorkspaceSession
+```
+
+转换成：
+
+```text
+DeerFlow SubagentConfig
+DeerFlow SubagentExecutor inputs
+```
+
+并把：
+
+```text
+SubagentResult
+AcceptanceVerdict
+backend trace id
+```
+
+转换回：
+
+```text
+NodeExecutionResult
+NodeAcceptanceResult
+```
+
+A-SWE 核心代码禁止直接散落 `deerflow.*` import。
 
 ---
 
@@ -1640,37 +2219,56 @@ Minimal Team
 
 形成可解释、可实现的团队选择逻辑。
 
-### 17.4 Task DAG Scheduling
+### 17.4 Workspace-Aware Task DAG Scheduling
 
-将复杂软件工程任务显式转换为 DAG，支持：
-
-- dependency；
-- parallelism；
-- retry；
-- failure propagation；
-- result aggregation。
-
-### 17.5 Execution Trace / Observability
-
-不仅记录 Agent 输出，还记录 Runtime Decision：
+A-SWE 不仅调度依赖关系，还显式调度共享 Repository 状态：
 
 ```text
-Why this capability?
-Why this agent?
-Why this skill?
-Why multi-agent?
-Why reviewer?
+Task DAG
+   +
+READ / WRITE Side Effect
+   +
+WorkspaceSession
 ```
 
-使系统具备较强可解释性和可调试性。
+一期以“READ / READ 可并行，存在 WRITE 即串行”的保守规则保证 correctness。
 
-### 17.6 Evaluation First
+这使 Scheduler 的价值不仅是并发执行，而是：
 
-任务执行完成不等于任务完成。
+> **在共享代码工作区上安全组织多个执行主体。**
+
+### 17.5 Control Plane / Execution Plane Separation
+
+```text
+A-SWE Control Plane
+→ what / who / when
+
+DeerFlow Execution Plane
+→ how to execute safely
+```
+
+A-SWE 不重复实现 Agent Harness，而是将核心工程价值集中在 Runtime Decision 与 Scheduling。
+
+### 17.6 Layered Observability
+
+可观测性分为：
+
+```text
+Runtime Decision Trace
+Node Execution Evidence
+Backend LLM / Tool Trace
+```
+
+既能解释“为什么这样调度”，又不重复底层 Harness 的 tracing。
+
+### 17.7 Evaluation First
+
+任务执行结束不等于任务完成。
 
 必须经过：
 
 ```text
+Node Acceptance
 Tests
 Build / Import
 Regression Check
@@ -1689,6 +2287,7 @@ Review
 
 ```text
 Task Analyzer
+Workspace Runtime
 Capability Registry
 Capability Resolver
 Dynamic Team Builder
@@ -1707,6 +2306,17 @@ Coder
 Tester
 Reviewer
 ```
+
+其中：
+
+```text
+Explorer → READ
+Coder    → WRITE
+Tester   → READ（生成测试文件时可升级为 WRITE）
+Reviewer → READ
+```
+
+具体 Workspace Access 最终以 TaskNode 行为为准，而不是仅按角色硬编码。
 
 ### 18.3 Skills
 
@@ -1746,7 +2356,7 @@ GitHub MCP 不应阻塞 MVP 主链路。
 
 ### 18.5 Memory
 
-一期只保留必要的运行态 Task Context。
+一期只保留必要的运行态 Task Context 与 WorkspaceSession。
 
 暂不单独建设复杂：
 
@@ -1758,7 +2368,33 @@ Long-term Vector Memory
 
 Execution Trace 为后续 Experience Memory 提供数据基础。
 
-### 18.6 Demo Case
+### 18.6 Sandbox / Deployment Boundary
+
+一期明确支持：
+
+```text
+LocalSandboxProvider
+or
+AioSandboxProvider + LocalContainerBackend
+```
+
+核心要求：
+
+- 同一 `user_id + thread_id` 可以稳定映射到同一任务 Workspace；
+- Sandbox release / warm reuse 不破坏 Workspace 中的 Repository 文件状态；
+- 多个 Node 可以在同一 WorkspaceSession 上连续执行。
+
+一期不承诺：
+
+```text
+Remote AIO / K8s provisioner
+cross-region shared workspace
+multi-worker remote filesystem persistence
+```
+
+远程 Sandbox 可能依赖显式文件同步或共享存储，必须独立验证后再进入支持范围。
+
+### 18.7 Demo Case
 
 一期准备 3～5 个可稳定复现的 Demo。
 
@@ -1783,6 +2419,10 @@ Coder
 Tester
 ```
 
+同时证明：
+
+> Explorer、Coder、Tester 共享同一 WorkspaceSession，Tester 能看到 Coder 的修改。
+
 #### Demo 3：高风险 Bug
 
 ```text
@@ -1795,16 +2435,18 @@ Tester
 Reviewer
 ```
 
-#### Demo 4：跨模块任务
+#### Demo 4：跨模块探索
 
 ```text
-Explorer × N
-     ↓
-   Coder
-     ↓
-   Tester
-     ↓
-  Reviewer
+Explorer A ─┐
+            ├─ READ / READ parallel
+Explorer B ─┘
+      ↓
+    Coder        WRITE exclusive
+      ↓
+    Tester
+      ↓
+   Reviewer
 ```
 
 Demo 重点展示：
@@ -1813,6 +2455,8 @@ Demo 重点展示：
 Same Runtime
 Different Task
 Different Agent Topology
+Shared Workspace
+Explainable Scheduling
 ```
 
 ---
@@ -1909,18 +2553,95 @@ Performance-driven Runtime
 
 ## 20. 阶段性实施计划
 
+### Phase 0：Integration Validation / Architecture Freeze
+
+正式实现 Phase 1 前，先验证 A-SWE 对 DeerFlow 的关键假设。
+
+#### P0-1：DeerFlow Integration PoC
+
+冻结审计基线：
+
+```text
+deer-flow @ c0895d295bba34f6e95188fca380f555dabed891
+```
+
+PoC 矩阵：
+
+| PoC | 测试内容 | 必须验证 |
+|---|---|---|
+| POC-01 | 直接 `SubagentExecutor(repo-explorer)` | 不经过 Lead Agent 即可执行 |
+| POC-02 | Explorer 写 `marker.txt` → Coder 读取 | 同 thread workspace |
+| POC-03 | Coder 修改 Python 文件 → Tester pytest | 修改对后续 Node 可见 |
+| POC-04 | 两个 READ Node 并发 | 能共享 Workspace / Sandbox |
+| POC-05 | 两个 Subagent 并发 | 一个结束不会提前释放另一个正在使用的 Sandbox |
+| POC-06 | timeout / cancel | capacity 与 sandbox lease 无泄漏 |
+| POC-07 | tools / disallowed_tools | Provider 权限映射正确 |
+| POC-08 | skills | discovery / activation 范围正确 |
+| POC-09 | acceptance criteria | Adapter 可回接 DeerFlow checker |
+| POC-10 | tool receipts | 可关联 node → execution evidence |
+| POC-11 | sequential WRITE nodes | Repository 状态正确累计 |
+| POC-12 | Local AIO release / reclaim | Workspace 文件仍连续可见 |
+
+Go / No-Go Tests：
+
+```text
+POC-02
+POC-03
+POC-05
+POC-09
+```
+
+任何一个失败，都先修正 Adapter / Workspace 设计，不直接进入 Phase 1 主实现。
+
+#### P0-2：Repository / Workspace Bootstrap Audit
+
+在开始实际 Repository-Level Demo 前继续确认：
+
+```text
+Repository Source
+      ↓
+WorkspaceSession creation
+      ↓
+clone / checkout / base ref freeze
+      ↓
+/mnt/user-data/workspace
+      ↓
+Task DAG execution
+      ↓
+git diff / patch result
+```
+
+该阶段的目标是冻结 Repo ingress / base revision / final diff 的工程边界，而不是扩展 Agent 功能。
+
+---
+
 ### Phase 1：Adaptive SWE Runtime MVP
 
-这是当前唯一必须完成的阶段。
+这是当前唯一必须完成的产品阶段。
 
-#### P1-1：Runtime Skeleton
+#### P1-1：Runtime Skeleton + Workspace Runtime
 
 完成：
 
 - 独立 A-SWE 工程目录；
-- Runtime Backend Interface；
-- DeerFlow Adapter；
-- Runtime State / Context。
+- `ExecutionBackend` Interface；
+- `DeerFlowExecutionBackend`；
+- `SubagentExecutor` Adapter；
+- Runtime State / Context；
+- `WorkspaceSession`；
+- Workspace identity：`task_id → user_id + thread_id`；
+- shared execution capacity；
+- DeerFlow compatibility integration tests。
+
+目标：
+
+```text
+Task Node
++
+WorkspaceSession
+→
+DeerFlow Subagent Execution
+```
 
 #### P1-2：Task → Capability
 
@@ -1945,6 +2666,7 @@ Structured Capability Requirement
 完成：
 
 - Agent Registry；
+- AgentProvider；
 - TeamSpec；
 - Minimal Feasible Team Policy；
 - Dynamic Team Builder。
@@ -1957,16 +2679,21 @@ Different Tasks
 Different Teams
 ```
 
-#### P1-4：Team → DAG → Execution
+#### P1-4：Team → DAG → Workspace-Aware Execution
 
 完成：
 
 - TaskNode；
 - DAG；
 - Scheduler；
-- Basic Parallel Execution；
+- READ / WRITE Workspace Access；
+- READ-only Basic Parallel Execution；
+- WRITE Exclusive Execution；
 - Retry；
-- Result Aggregation。
+- Cancellation；
+- Failure Propagation；
+- Result Aggregation；
+- Node Acceptance Gate。
 
 #### P1-5：Execution Trace
 
@@ -1975,7 +2702,9 @@ Different Teams
 - RuntimeEvent；
 - Event Bus；
 - Trace Store；
-- Execution Timeline；
+- Decision Timeline；
+- Node Execution Evidence；
+- backend trace correlation；
 - Metrics；
 - 简单 Trace Viewer。
 
@@ -1983,6 +2712,7 @@ Different Teams
 
 完成：
 
+- DeerFlow Acceptance Adapter；
 - Build / Import Check；
 - Test Execution；
 - Regression Test；
@@ -1997,17 +2727,20 @@ Different Teams
 Simple Task
 Normal Bug
 High-Risk Bug
-Repository-Level Task
+Repository-Level Exploration
 ```
 
 并在 README 展示：
 
 ```text
 Task
+→ Workspace
 → Capability
 → Selected Team
 → DAG
+→ Workspace-Aware Scheduling
 → Trace
+→ Evaluation
 → Result
 ```
 
@@ -2020,7 +2753,8 @@ Task
 - Historical Task Retrieval；
 - Similar Task Matching；
 - Team Execution Statistics；
-- Skill Effectiveness Statistics。
+- Skill Effectiveness Statistics；
+- Workspace conflict statistics。
 
 核心目标：
 
@@ -2035,6 +2769,7 @@ Task
 - execution time；
 - retry cost；
 - coordination cost；
+- workspace contention cost；
 - Team Ranking。
 
 此时才引入真正有数据支撑的 Cost-Aware Team Selection。
@@ -2048,7 +2783,7 @@ Execution Trace
       ↓
 Experience Extraction
       ↓
-Team / Skill Statistics
+Team / Skill / Scheduling Statistics
       ↓
 Selection Policy Update
       ↓
@@ -2069,7 +2804,7 @@ Future Runtime Decision
 
 而是：
 
-> **一个能够根据 Software Engineering Task 动态构建执行能力和 Agent Topology 的 Runtime。**
+> **一个能够根据 Software Engineering Task 动态构建执行能力、Agent Topology 与 Workspace-aware Task DAG 的 Runtime。**
 
 ### 21.2 README 首页首先展示 Adaptive Topology
 
@@ -2099,9 +2834,19 @@ A-SWE Runtime
 → Explorer → Coder → Tester → Reviewer
 ```
 
+然后展示一个并行探索案例：
+
+```text
+Explorer A ─┐
+            ├─ parallel READ
+Explorer B ─┘
+      ↓
+Coder            exclusive WRITE
+```
+
 强调：
 
-> **Same runtime. Different task. Different agent topology.**
+> **Same runtime. Different task. Different agent topology. One controlled workspace.**
 
 ### 21.3 面试必须能够讲清楚的问题
 
@@ -2115,10 +2860,19 @@ A-SWE Runtime
 6. Dynamic Team 如何选择？
 7. 为什么一期使用 Minimal Feasible Team，而不是成功率预测模型？
 8. Task Scheduler 如何构建和执行 DAG？
-9. Retry 与 Failure Propagation 如何处理？
-10. Execution Trace 为什么不仅仅是日志？
-11. Evaluation 为什么优先使用确定性检查？
-12. A-SWE Runtime 与底层 Harness 的边界在哪里？
+9. 为什么 SWE Agent 需要独立的 WorkspaceSession？
+10. 多个 Agent 共享同一 Repository 时如何避免并发写冲突？
+11. 为什么 READ / READ 可以并行，而 MVP 中 WRITE 默认独占？
+12. Retry、Cancellation 与 Failure Propagation 如何处理？
+13. A-SWE 为什么直接使用 DeerFlow `SubagentExecutor` 而不是让 Lead Agent 自主 delegation？
+14. A-SWE Control Plane 与 DeerFlow Execution Plane 的边界是什么？
+15. `SubagentResult` 如何映射为 NodeExecutionResult？
+16. Tool Receipt 与完整 Trace 有什么区别？
+17. 为什么 Acceptance Checker 要从 DeerFlow 回接，而不是自己重写？
+18. Execution Trace 为什么不仅仅是日志？
+19. Evaluation 为什么优先使用确定性检查？
+20. Direct Subagent 的 Skill projection 有什么已知边界？
+21. 为什么一期限制 Local Sandbox / Local AIO，而不直接承诺 Remote Sandbox？
 
 ### 21.4 代码掌握边界
 
@@ -2126,25 +2880,49 @@ A-SWE Runtime
 
 ```text
 Task Analyzer
+WorkspaceSession / Workspace Manager
 Capability Registry / Resolver
 Dynamic Team Builder
 Selection Policy
 Task DAG
+Workspace Access Policy
 Scheduler
 Execution Trace
 Evaluation
-DeerFlow Adapter
+DeerFlowExecutionBackend
+Acceptance Adapter
+Result Mapper
 ```
 
 对于底层成熟基础设施，应能够解释：
 
 ```text
-如何调用
-为什么复用
-接口边界是什么
+SubagentExecutor 如何调用
+thread_id / user_id 如何绑定 workspace
+Sandbox Lease 为什么复用
+Tool Receipt 如何进入节点证据
+为什么不重复实现 Skill / MCP / Sandbox
 ```
 
 而不是将主要时间投入重复实现 Sandbox、MCP Client 或 LangGraph Engine。
+
+### 21.5 面试中的核心架构表述
+
+推荐表述：
+
+> **A-SWE is the control plane. DeerFlow is the execution plane.**
+
+进一步展开：
+
+```text
+A-SWE:
+Task → Capability → Team → DAG → Scheduling → Evaluation
+
+DeerFlow:
+Subagent → Skill / Tool / MCP → Sandbox → Execution Evidence
+```
+
+这比“我在 DeerFlow 上又套了一层 Multi-Agent”更准确，也更能体现 Runtime 设计价值。
 
 ---
 
@@ -2156,22 +2934,26 @@ A-SWE Runtime 最终不定义为：
 
 更准确的定义是：
 
-> **A task-adaptive runtime for resolving software engineering capabilities, composing the minimum feasible agent team, scheduling task DAGs, and tracing/evaluating the full execution process.**
+> **A task-adaptive control plane for resolving software engineering capabilities, managing a shared repository workspace, composing the minimum feasible agent team, scheduling workspace-aware task DAGs, and tracing/evaluating execution on top of a reusable agent execution plane.**
 
 其核心执行链路为：
 
 ```text
 Task
  ↓
+WorkspaceSession
+ ↓
 Capability
  ↓
 Team
  ↓
-DAG
+Task DAG
  ↓
-Execution
+Workspace-Aware Scheduling
  ↓
-Trace
+DeerFlow Execution Plane
+ ↓
+Execution Evidence
  ↓
 Evaluation
 ```
@@ -2180,14 +2962,22 @@ Evaluation
 
 > **Don't build one SWE agent. Build the runtime that assembles the right execution structure for each software engineering task.**
 
+进一步补充：
+
+> **A-SWE owns runtime decisions and shared-workspace scheduling; DeerFlow owns safe agent execution.**
+
 对应中文：
 
-> **不是构建一个固定的软件工程 Agent，而是构建一个能够针对不同软件工程任务动态组装能力、执行主体和协作拓扑的运行时。**
+> **不是构建一个固定的软件工程 Agent，而是构建一个能够针对不同软件工程任务动态组装能力、执行主体和协作拓扑，并在同一 Repository Workspace 上安全调度这些执行主体的运行时控制面。**
 
 一期项目的成功标准不是功能数量，而是：
 
 1. 核心链路真实运行；
 2. 不同任务能够产生不同 Team / DAG；
-3. Runtime Decision 能够通过 Trace 解释；
-4. 执行结果能够通过 Evaluation 验证；
-5. 3～5 个 Demo Case 能稳定展示整个流程。
+3. 同一任务内多个 Node 能共享稳定 Workspace；
+4. READ / WRITE 调度规则能够避免基础并发冲突；
+5. A-SWE 能通过 Adapter 直接驱动 DeerFlow SubagentExecutor；
+6. Runtime Decision 能够通过 Trace 解释；
+7. Node 执行具有 Tool Receipt / Acceptance 等证据；
+8. 最终结果能够通过 Evaluation 验证；
+9. 3～5 个 Demo Case 能稳定展示整个流程。
