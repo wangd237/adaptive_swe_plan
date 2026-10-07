@@ -33763,8 +33763,8 @@ Implementation PoC Pending
 状态：
 
 ```text
-Architecture Updated
-Source Audit In Progress
+Architecture Audited
+Integration PoC Pending
 ```
 
 当前冻结结论：
@@ -33829,6 +33829,12 @@ Source Audit In Progress
 - ReviewEvidenceResolver 使用 terminal AIMessage 上 runtime-stamped citing-turn ledger 解析 rN；
 - mandatory APPROVE 至少需要一个成功 inspection receipt，防止 zero-inspection approval。
 - BindingStore 横跨 Scheduler loop 与 DeerFlow isolated subagent loop，P1 使用 thread-safe 同步而非 loop-bound asyncio.Lock。
+- DeerFlow SummarizationMiddleware 只压缩 graph state；request-scoped Handoff projection 不进入 summary_text；
+- final merged SystemMessage provenance 由 system_coalescing 接管，不能把 final producer_kind 误当 A-SWE provenance；
+- ExecutionEvidenceStore 与 RunEventStore / ExtensionData 职责分离：evidence 是 artifact，trace 是 event stream；
+- LocalEvidenceStore 使用 atomic publish + full SHA-256 integrity verification；
+- runtime task/thread/run/evidence filesystem identities 使用 opaque validated safe ids；
+- DeerFlow receipt short hashes 是 freshness stamps；durable receipt address 使用 immutable receipt-ledger EvidenceRef + ledger_index。
 
 新增 PoC：
 
@@ -33889,7 +33895,7 @@ Source Audit In Progress
 | POC-H51 | repair 需要额外 Tool/Capability | 不扩权，判 plan invalidated / unsupported repair |
 | POC-H52 | post-lock handoff projection | NodeExecutionInvocation fingerprint 固定且传入 execute_prepared |
 | POC-H53 | 两个并发 A-SWE Node | exact run_id 分别读取自己的 immutable binding，无 context 串线 |
-| POC-H54 | aswe: run_id 但 binding 丢失 | managed run fail closed |
+| POC-H54 | aswe- run_id 但 binding 丢失 | managed run fail closed |
 | POC-H55 | ordinary DeerFlow run 无 binding | 两个 A-SWE middleware 都 pass-through |
 | POC-H56 | 多轮 model call | middleware 不读 Git/EvidenceStore，只复用 immutable rendered context |
 | POC-H57 | cancellation / timeout | finally 删除 execution binding，无 store leak |
@@ -33925,6 +33931,45 @@ Source Audit In Progress
 | POC-H87 | Review basis 引用 failed / unknown receipt | evidence_resolved=false，gate unsatisfied |
 | POC-H88 | Review basis 只引用 submit_review_verdict 自身 | 不算 inspection evidence |
 | POC-H89 | valid basis receipt | display rN 转 durable ReceiptRef 后入 ReviewVerdict |
+
+---
+
+#### P0-7：Retry / Repair / Failure Propagation Audit
+
+状态：
+
+```text
+Source Audit In Progress
+```
+
+审计目标：
+
+```text
+Backend terminal outcome
+        ↓
+Mutation / completeness classification
+        ↓
+Retry eligibility
+        ↓
+Repair eligibility
+        ↓
+Downstream failure propagation
+        ↓
+Final Node logical state
+```
+
+本阶段重点核验：
+
+- DeerFlow SubagentResult terminalization 与 timeout / cancellation / cap semantics；
+- clean retry 是否可被 execution evidence 可靠证明；
+- failed / cancelled execution 的 receipt / bash evidence 可见性；
+- WRITE failure 后 sandbox / process 是否可能继续产生 late side effect；
+- Retry 与 DeerFlow execution capacity / cancellation cleanup 的边界；
+- Repair feedback 是否会复用 stale verification / acceptance evidence；
+- verification failure 如何唯一归因到 target writer；
+- capped partial 的 logical-success gate 是否足够严格；
+- downstream dependency 节点在 upstream FAILED / DIRTY / UNVERIFIED 时的传播规则；
+- cancellation 是否能保证 binding / workspace lease / scheduler state 最终一致。
 
 ---
 
