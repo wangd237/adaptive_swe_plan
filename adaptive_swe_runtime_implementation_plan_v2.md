@@ -2417,6 +2417,30 @@ Provider CapabilityBinding
 Concrete Resource Requirements
 ```
 
+#### Tool Contract ID 与 Exposed Name 分离
+
+`CapabilityBinding.required_tools / optional_tools` 在 P1 仍保持轻量字符串，但其语义冻结为 **A-SWE Tool Contract ID**，不是未经验证的 DeerFlow exposed name。
+
+为降低配置噪声，标准 SWE Tool 可以让 contract id 与 exposed name 同名，例如 `read_file`、`bash`、`str_replace`；但 DeerFlow Adapter 内部必须维护受信任映射：
+
+```text
+Tool Contract ID
+      ↓
+Expected Backend Implementation
+      ↓
+Resolved Tool Identity
+      ↓
+Exposed Name
+```
+
+Pinned DeerFlow 的 `get_available_tools()` 会按 exposed name 去重，且 config-defined tool 先于 built-in / MCP / ACP / plugin。因此 `name == read_file` 并不能证明实际 implementation 是 DeerFlow 标准 `read_file_tool`。
+
+核心原则：
+
+> **Tool name is a routing key; Tool identity is the capability/effect authority.**
+
+同名 implementation 发生变化时，A-SWE 必须将其视为 inventory drift，而不是继续沿用旧 ToolEffect。
+
 ### 5.4.1 CapabilityBinding Merge
 
 一个 WorkItem 可以要求多个 Capability，而一个 AgentProvider 可以同时覆盖它们。
@@ -2614,14 +2638,16 @@ class ToolEffect(str, Enum):
     UNKNOWN = "unknown"
 ```
 
-P1 保守分类：
+P1 保守分类必须基于**已解析 implementation**：
 
-| Tool | ToolEffect |
+| Resolved implementation | ToolEffect |
 |---|---|
-| `ls` / `glob` / `grep` / `read_file` | READ_ONLY |
-| `write_file` / `str_replace` | WORKSPACE_MUTATING |
-| `bash` | WORKSPACE_MUTATING |
-| 未声明 effect 的 MCP / Extension Tool | UNKNOWN |
+| DeerFlow standard `ls/glob/grep/read_file` | READ_ONLY |
+| DeerFlow standard `write_file/str_replace` | WORKSPACE_MUTATING |
+| DeerFlow standard `bash` | WORKSPACE_MUTATING |
+| 未识别 config / MCP / ACP / extension implementation | UNKNOWN |
+
+禁止通过 `tool.name == "read_file"` 直接赋予 `READ_ONLY`。同名 Tool 若无法确认 implementation identity，则 hard dependency 直接 preflight mismatch；仅作为 optional resource 时按 `UNKNOWN` 处理。
 
 最终：
 
@@ -2783,10 +2809,19 @@ DeerFlow 的实际 Tool catalog 来自：
 
 ```python
 class BackendToolInfo(BaseModel):
+    contract_id: str
     name: str
     source: str
     delivery: Literal["eager", "deferred"]
+
+    # Adapter-owned opaque identity of the resolved implementation.
+    implementation_id: str
+    schema_hash: str | None = None
+
+    # Display/source metadata is informative; implementation_id is used for matching.
     provenance: str | None = None
+
+    effect: ToolEffect
 
 class BackendInventorySnapshot(BaseModel):
     backend_id: str
@@ -2806,6 +2841,8 @@ class BackendInventorySnapshot(BaseModel):
 注意命名：
 
 > **candidate_tools，而不是 actual_bound_tools。**
+
+`candidate_tools` 建议按 `Tool Contract ID` 索引。`name/source/provenance` 便于解释，但 hard feasibility 与 ToolEffect 不能只依赖这些 display fields，必须匹配 `implementation_id`。
 
 Inventory 中的 `delivery` 用于区分当前 deployment 下的：
 
@@ -2868,15 +2905,17 @@ Declared Capability
 每个 Candidate AgentProvider 至少检查：
 
 1. required capability 是否都有 CapabilityBinding；
-2. binding.required_tools 是否存在于 backend candidate inventory 且 delivery == eager；
-3. operator SubagentConfig 静态 allow / deny 是否允许这些 required tools；
-4. Sandbox / backend 是否支持 required execution primitive；
-5. TaskContract 是否禁止该 Tool / effect；
-6. resolved model 是否存在；
-7. authorization-enabled deployment 下，required tools 做 identity-aware authorization preflight；
-8. authorization-enabled deployment 下，resolved model 做 `model:use` preflight；
-9. selected optional tools 是否满足 least-privilege / effect policy；
-10. 由**最终 allowed tool set**编译出的 WorkspaceAccess 是否满足 Node policy。
+2. binding.required_tools 的 Tool Contract ID 是否都能唯一解析到预期 `implementation_id`；
+3. required tool 是否存在于 backend inventory 且 `delivery == eager`；
+4. resolved implementation 的 exposed name 是否仍满足 operator SubagentConfig 静态 allow / deny；
+5. Sandbox / backend 是否支持 required execution primitive；
+6. TaskContract 是否禁止该 Tool / effect；
+7. resolved model 是否存在；
+8. authorization-enabled deployment 下，required tools 做 identity-aware authorization preflight；
+9. authorization-enabled deployment 下，resolved model 做 `model:use` preflight；
+10. selected optional tools 是否满足 least-privilege / effect policy；
+11. preferred skills 是否与 Node required-tool closure 兼容；
+12. 由**最终 resolved tool identity set**编译出的 WorkspaceAccess 是否满足 Node policy。
 
 通过后才进入：
 
@@ -4544,6 +4583,29 @@ MUST_ACTIVATE skill X
 ```
 
 必须单独定义 SkillRequirement，并验证 runtime skill-usage evidence；不能用 `enabled_skills` 冒充 activation 证据。
+
+#### Preferred Skill Compatibility
+
+Pinned DeerFlow 中，Skill 只有在 slash / in-context 激活后才施加 `allowed-tools` policy；但一旦生效，它会动态收窄 model-visible tools 与实际 tool calls。
+
+因此 preferred skill 也不能只检查“存在”。例如：
+
+```text
+Node required tool = bash
+preferred skill allowed-tools = [read_file]
+```
+
+该 Skill 一旦单独激活，就可能让 Node 失去完成 Capability 所需的 `bash`。
+
+P1 采用保守规则：
+
+- `allowed_tools is None`：兼容，表示 legacy allow-all；
+- explicit `allowed_tools` 覆盖 Node 全部 required business tool exposed names：兼容；
+- explicit `allowed_tools` 缺任一 required business tool：不向该 Node 暴露该 preferred skill，并记录 warning。
+
+DeerFlow framework-always-available names（如 `read_file` / `describe_skill` / `tool_search`）仍由 DeerFlow 自身 Skill policy 处理。
+
+注意：这只是 discoverability compatibility，不证明 Skill 实际被激活。
 
 ### 10.7 Model Policy
 
