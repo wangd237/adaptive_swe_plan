@@ -439,7 +439,112 @@ git diff --cached --binary <base_sha>
 
 Baseline Workspace Snapshot 必须在 clone / checkout 完成之后采集，否则整个 Repository 会被误判为 task-created files。
 
-Task-level snapshot 用于最终 ChangeSet；WRITE Node 可选用 before / after snapshot 做 Node → file change attribution；纯 READ Node 一期不强制全量 snapshot。
+Task-level baseline / Git ChangeSet 用于最终 Repository patch。
+
+**所有 WRITE / UNKNOWN-MUTATING Node attempt 必须采集 before / after workspace snapshot。**
+
+它不是 UI 可选项，而是以下 Runtime 语义的输入：
+
+```text
+Node-level changed-path attribution
+DIRTY_WRITE_FAILURE detection
+automatic retry eligibility
+WorkspaceRevision advancement
+post-node contract/invariant evidence
+```
+
+纯 READ Node 不强制全量 snapshot，因为其可执行 Tool set 已被证明 read-only。
+
+#### NodeWorkspaceDelta
+
+Task-level Git ChangeSet 与 Node-level attribution 必须分离。
+
+原因：
+
+```text
+baseline
+  ↓ Node A modifies src/a.py
+workspace dirty
+  ↓ Node B modifies src/b.py
+```
+
+Node B 执行后的：
+
+```text
+git diff <base_sha>
+```
+
+包含 A+B，不能证明哪些路径属于 Node B。
+
+P1 对每个 mutating attempt 生成：
+
+```python
+class NodeWorkspaceDelta(BaseModel):
+    node_id: str
+    execution_id: str
+    attempt: int
+
+    before_revision_generation: int
+
+    changed_paths: tuple[str, ...]
+    changed_paths_complete: bool
+
+    has_observed_changes: bool
+    attribution_truncated: bool
+
+    summary: dict
+
+    workspace_changeset: EvidenceRef | None
+
+    fingerprint: str
+```
+
+其中：
+
+- `changed_paths` 来自当前 attempt 的 before/after deterministic snapshot comparison；
+- Task-level `RepositoryChangeSet` 仍负责 authoritative final Git patch；
+- NodeHandoff.changed_paths 来自 `NodeWorkspaceDelta`，不从 cumulative baseline Git diff 推断。
+
+#### Snapshot Truncation Fail-Safe
+
+Pinned DeerFlow `WorkspaceChangeLimits` 默认：
+
+```text
+max_files = 200
+max_scanned_files = 2000
+max_file_bytes_for_diff = 256 KiB
+max_total_diff_bytes = 1 MiB
+```
+
+且：
+
+```text
+WorkspaceSnapshot.truncated
+WorkspaceChangeSummary.truncated
+```
+
+都可能成立。
+
+因此：
+
+```text
+truncated == true
+≠ no more changes
+```
+
+P1 规则：
+
+- `changed_paths_complete = false`；
+- Handoff 只能把 observed paths 标成“observed changed paths”，不能声称完整；
+- 添加 warning `WORKSPACE_DELTA_TRUNCATED`；
+- failed WRITE attempt 禁止自动 retry，因为不能证明 workspace 未改变；
+- successful WRITE / UNKNOWN-mutating attempt 即使没有 observed path change，只要 attribution truncated，就保守推进 WorkspaceRevision；
+- Runtime 不因 diff content unavailable（binary / sensitive / large）丢弃 path-level mutation事实；
+- snapshot truncation 不等同于 task failure，但必须降低 evidence completeness。
+
+即：
+
+> **Unknown mutation state is treated as dirty for retry safety and stale-context invalidation.**
 
 ### 3.3 DeerFlow Execution Adapter
 
@@ -2461,6 +2566,8 @@ class HandoffEvidence(BaseModel):
     receipt_refs: tuple[ReceiptRef, ...] = ()
 
     changed_paths: tuple[str, ...] = ()
+    changed_paths_complete: bool = True
+
     untracked_paths: tuple[str, ...] = ()
 
     repository_changeset: EvidenceRef | None = None
@@ -2504,7 +2611,8 @@ WorkspaceRevision.generation
 规则：
 
 - bootstrap 完成后：`generation = 0`；
-- successful WRITE Node 且 Workspace state 发生变化：generation + 1；
+- successful WRITE / UNKNOWN-mutating Node 且 observed Workspace state 发生变化：generation + 1；
+- mutating attempt 的 snapshot attribution 若 truncated / unknown：保守 generation + 1，即使没有观察到具体 changed path；
 - READ Node：不递增；
 - failed dirty WRITE：Workspace 进入 dirty failure state，不发布可供正常下游消费的新 successful Handoff；
 - `repository_state_fingerprint` 来自 Runtime canonical RepositoryChangeSet / state digest，而不是 Agent self-report。
@@ -2577,7 +2685,7 @@ execute
 |---|---|
 | `self_report` | model-authored / untrusted |
 | `receipt_refs` | DeerFlow execution-scoped evidence reference |
-| `changed_paths` | Git / Workspace deterministic evidence |
+| `changed_paths` | per-attempt NodeWorkspaceDelta observed deterministic evidence |
 | `untracked_paths` | Git-aware Runtime evidence |
 | acceptance verdict | deterministic checker output |
 | verification result | Runtime verifier output |
@@ -5060,13 +5168,17 @@ DeerFlow `workspace_changes` snapshot 适合作为 evidence / diff，不是通�
 失败后：
 
 ```text
-no workspace change
+complete before/after attribution
+AND no workspace change
 → retry may be allowed
 
-workspace changed
+observed workspace change
+OR attribution truncated / unknown
 → DIRTY_WRITE_FAILURE
 → no automatic retry in MVP
 ```
+
+因此“无修改可安全重试”必须是**可证明的 clean delta**，不是“snapshot 没列出文件”。
 
 后续若实现真正的 Git/worktree checkpoint，再开放 dirty-write rollback + retry。
 
@@ -5898,7 +6010,7 @@ against frozen revision
    └── bind immutable handoff projection
    │
    ▼
-WRITE? capture pre-attempt snapshot
+WRITE / UNKNOWN-MUTATING → mandatory pre-attempt snapshot
    │
    ▼
 ExecutionBackend.execute_prepared()
@@ -8155,6 +8267,9 @@ Source Audit In Progress
 - report citation verification 必须发生在 Handoff truncation 之前；
 - Handoff staleness final classification 必须发生在 Workspace lock granted 之后；
 - 每个 Node attempt 冻结 pre-execution WorkspaceRevision；
+- WRITE / UNKNOWN-mutating attempt 的 before/after snapshot 为 mandatory；
+- Node changed_paths 来自 per-attempt NodeWorkspaceDelta，不从 cumulative baseline diff 推断；
+- snapshot attribution truncated 时按 unknown-dirty 处理 retry，并保守推进 revision；
 
 新增 PoC：
 
@@ -8189,6 +8304,11 @@ Source Audit In Progress
 | POC-H26 | action-looking report 无 receipt citation | no_citation_claims=true；不误当 acceptance failure |
 | POC-H27 | receipts disabled / harvest None | receipt verdict absent，不伪造 verdict |
 | POC-H28 | 长 report 尾部含 citation | 对完整 report 先 verify，再做 Handoff truncation |
+| POC-H29 | Node A/B 顺序修改不同文件 | B 的 NodeWorkspaceDelta 不包含 A-only change |
+| POC-H30 | Node B 再次修改 A 已改过的同一文件 | B 的 before/after delta 仍能归属该修改 |
+| POC-H31 | Workspace snapshot truncated | changed_paths_complete=false + warning；失败 WRITE 不 retry |
+| POC-H32 | truncated mutating attempt 无 observed files | WorkspaceRevision 仍保守 +1 |
+| POC-H33 | binary/sensitive/large changed file | path mutation 仍记录，diff content 可 unavailable |
 
 ---
 
@@ -8336,7 +8456,8 @@ Executable TaskDAG
 - Node Acceptance Gate；
 - WRITE Node 后 Repository Invariant Check；
 - NodeHandoff generation；
-- 可选 WRITE Node before / after workspace snapshot。
+- mandatory WRITE / UNKNOWN-mutating before/after workspace snapshot；
+- NodeWorkspaceDelta + truncation fail-safe。
 
 #### P1-5：Execution Trace
 
@@ -8363,7 +8484,8 @@ Executable TaskDAG
 - Test Execution；
 - Regression Test；
 - Reviewer；
-- Git-aware Repository ChangeSet；
+- Git-aware task-level Repository ChangeSet；
+- per-attempt NodeWorkspaceDelta；
 - DeerFlow Workspace ChangeSet；
 - TaskContractEvaluator / ContractVerdict；
 - Evaluation Report。
