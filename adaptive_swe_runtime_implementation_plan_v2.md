@@ -1270,25 +1270,69 @@ backend-specific quiescence/idempotency proof
 
 A-SWE 不直接暴露 DeerFlow `SubagentResult`，而映射成自身稳定 Schema。
 
-建议至少保留：
+Pinned DeerFlow executor terminal status 只有：
+
+```text
+completed
+failed
+cancelled
+timed_out
+```
+
+其中 `polling_timed_out` 只存在于上层 `task_tool` / wire-status contract，不是 direct `SubagentExecutor` 的 terminal status。A-SWE direct Adapter 禁止把两层 status vocabulary 混在一起。
+
+P1 定义 provider-neutral typed contract：
 
 ```python
+class BackendTerminalStatus(str, Enum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
+
+class BackendStopReason(str, Enum):
+    TOKEN_CAPPED = "token_capped"
+    TURN_CAPPED = "turn_capped"
+    LOOP_CAPPED = "loop_capped"
+
 class ExecutionCompleteness(str, Enum):
-    CLEAN = "clean"
-    CAPPED_PARTIAL = "capped_partial"
+    # Backend ended without a guard-cap signal.
+    UNCAPPED = "uncapped"
+
+    # Backend ended because a guard cap fired. This is orthogonal to terminal status:
+    # usable partial work may be COMPLETED; unusable/no partial may be FAILED.
+    CAPPED = "capped"
+
+class BackendFailureClass(str, Enum):
+    NONE = "none"
+
+    # Capacity reject / queue timeout before the execution acquired a slot.
+    ADMISSION = "admission"
+
+    # A-SWE synthetic policy/assembly failure surfaced through terminal AI fallback.
+    POLICY_OR_ASSEMBLY = "policy_or_assembly"
+
+    # Ordinary DeerFlow / provider / tool / graph execution failure.
+    EXECUTION = "execution"
+
+    TIMEOUT = "timeout"
+    CANCELLED = "cancelled"
 
 class NodeExecutionResult(BaseModel):
     execution_id: str
     node_id: str
 
-    # Backend terminal status; not A-SWE logical Node success.
-    status: str
+    # Backend terminal result, not logical Node status.
+    terminal_status: BackendTerminalStatus
 
     result: str | None
     error: str | None
 
-    stop_reason: str | None
-    completeness: ExecutionCompleteness | None
+    stop_reason: BackendStopReason | None
+    completeness: ExecutionCompleteness
+
+    failure_class: BackendFailureClass
+    admission_failure: bool
 
     started_at: datetime | None
     completed_at: datetime | None
@@ -1297,44 +1341,173 @@ class NodeExecutionResult(BaseModel):
     tool_receipts: list[dict] | None
     bash_executions: list[dict] | None
 
-    # Provider-neutral mapped advisory evidence, completed runs only.
+    # Raw assistant step metadata needed for precise A-SWE synthetic-failure mapping.
+    ai_messages: list[dict]
+
+    # Provider-neutral mapped advisory evidence; only produced when the
+    # corresponding verifier has a valid terminal input.
     report_receipt_verdict: ReportReceiptVerdict | None
 
     backend_trace_id: str | None
 ```
 
-其中 `stop_reason` 必须与 `status` 分离，例如：
+#### Terminal Status 与 Cap 必须正交
+
+Pinned DeerFlow 明确允许：
 
 ```text
-status = completed
-stop_reason = turn_capped
+completed + token_capped
+completed + turn_capped
+completed + loop_capped
 ```
 
-表示任务产生了可用结果，但执行过程触发了 Runtime Guardrail，不应被误认为 clean completion。
+用于“有可用 partial result 的 capped run”。
 
-映射冻结：
+同时也允许：
 
 ```text
-backend status = completed
-AND stop_reason is None
-→ completeness = CLEAN
+failed + turn_capped
+failed + token_capped / loop_capped
+```
 
-backend status = completed
-AND stop_reason in {token_capped, turn_capped, loop_capped}
-→ completeness = CAPPED_PARTIAL
+用于“cap fired but no usable partial result”。
 
+所以 P1 不再使用：
+
+```text
 backend status != completed
 → completeness = None
 ```
 
-> **ExecutionCompleteness 描述执行是否被 guard cap 提前截断；它仍然不等于 Node acceptance。**
+而是：
+
+```text
+stop_reason is None
+→ completeness = UNCAPPED
+
+stop_reason in {
+    token_capped,
+    turn_capped,
+    loop_capped
+}
+→ completeness = CAPPED
+```
+
+即：
+
+> **Execution completeness is orthogonal to terminal success/failure.**
+
+A-SWE 后续 logical-success gate 再解释：
+
+```text
+COMPLETED + UNCAPPED
+→ backend clean completion candidate
+
+COMPLETED + CAPPED
+→ capped partial candidate
+→ only deterministic-completeness proof may promote to logical success
+
+FAILED + CAPPED
+→ capped execution failure
+→ never logical success
+→ retry/repair only under mutation-safety rules
+
+FAILED + UNCAPPED
+→ ordinary backend failure
+
+TIMED_OUT
+→ timeout termination
+
+CANCELLED
+→ cancellation termination
+```
+
+#### Admission Failure 映射
+
+Pinned DeerFlow `SubagentResult.admission_failure=True` 的语义是：
+
+> capacity rejection / queue admission timeout occurred before the subagent execution acquired a running slot.
 
 因此：
 
 ```text
-Backend COMPLETED
-≠ A-SWE Node SUCCEEDED
+terminal_status == FAILED
+AND admission_failure == true
+→ failure_class = ADMISSION
 ```
+
+它不是：
+
+- model authorization failure；
+- A-SWE Provider preflight failure；
+- NodeToolPolicy synthetic mismatch；
+- general LLM provider failure。
+
+这些必须保留不同 taxonomy。
+
+#### Synthetic A-SWE Failure 映射
+
+A-SWE synthetic policy response 仍通过：
+
+```text
+terminal_status = FAILED
+```
+
+返回，但 Adapter 必须读取 terminal AIMessage 的 server-owned：
+
+```text
+aswe_policy_failure
+aswe_failure_code
+aswe_node_execution_id
+```
+
+映射为：
+
+```text
+failure_class = POLICY_OR_ASSEMBLY
+```
+
+而不是靠 `error` 自由文本猜测。
+
+其他：
+
+```text
+FAILED
++ admission_failure == false
++ no A-SWE failure marker
+→ failure_class = EXECUTION
+
+TIMED_OUT
+→ failure_class = TIMEOUT
+
+CANCELLED
+→ failure_class = CANCELLED
+
+COMPLETED
+→ failure_class = NONE
+```
+
+#### Adapter Mapping 必须穷举
+
+DeerFlow Adapter 对 pinned `SubagentStatus` / `stop_reason` 使用 exhaustive mapping。
+
+未知 status / stop_reason：
+
+```text
+→ BACKEND_CONTRACT_MISMATCH
+→ fail closed
+```
+
+禁止：
+
+```text
+unknown string
+→ treat as failed / clean by default
+```
+
+这样 DeerFlow 升级新增 terminal semantics 时，会由 compatibility test 暴露，而不是静默改变 Retry/Repair 行为。
+
+> **Backend COMPLETED 仍然不等于 A-SWE Node SUCCEEDED。**
 
 ### 3.6 DeerFlow 集成基线与升级策略
 
@@ -3283,7 +3456,7 @@ UNVERIFIED
 → gate unsatisfied
 ```
 
-`CAPPED_PARTIAL` 即使已经产生旧/中间 reviewer prose，也不能 satisfy mandatory Review。
+`CAPPED` 即使已经产生旧/中间 reviewer prose，也不能 satisfy mandatory Review。
 
 如果 TaskContract 的 review 只是 advisory 而不是 mandatory，可在未来定义 softer semantics；P1 runtime-owned `__aswe_review` 默认是 hard gate。
 
@@ -6909,7 +7082,7 @@ completed + loop_capped
 统一映射为：
 
 ```text
-ExecutionCompleteness.CAPPED_PARTIAL
+ExecutionCompleteness.CAPPED
 ```
 
 DeerFlow delegation ledger 自身也明确：
@@ -6940,7 +7113,7 @@ Logical Node Outcome
 
 P1 保守规则：
 
-| 条件 | CAPPED_PARTIAL 是否可被逻辑接受 |
+| 条件 | CAPPED 是否可被逻辑接受 |
 |---|---:|
 | deterministic acceptance coverage 完整，所有 load-bearing leaves checked + holds，所有 repository / contract invariants 通过 | 可以，但必须携带 capped warning |
 | 没有 acceptance criteria / completeness proof | 不可以 |
@@ -6969,7 +7142,7 @@ warning = EXECUTION_CAPPED_BUT_ACCEPTED
 
 ```text
 backend_stop_reason
-execution_completeness = capped_partial
+execution_completeness = capped
 ```
 
 不能向下游伪装成 clean completion。
@@ -7002,7 +7175,7 @@ ExecutionCappedPartial
 P1 mandatory Review 是 semantic gate：
 
 ```text
-REVIEW + CAPPED_PARTIAL
+REVIEW + CAPPED
 → review gate unsatisfied
 ```
 
@@ -8386,10 +8559,10 @@ Execution Completeness Gate
    ├── CLEAN + acceptance/invariants satisfied
    │     → logical success
    │
-   ├── CAPPED_PARTIAL + complete deterministic proof
+   ├── CAPPED + complete deterministic proof
    │     → success with EXECUTION_CAPPED_BUT_ACCEPTED
    │
-   └── CAPPED_PARTIAL without complete proof
+   └── CAPPED without complete proof
          → retry / repair / fail according to mutation safety
    │
    ▼
@@ -10670,7 +10843,7 @@ Integration PoC Pending
 - physical WorkspaceAccess 与 semantic repository-mutation authority 分离；
 - VERIFICATION/REVIEW 等 READ_ONLY authority Node 可因 bash 获得 WRITE lock，但 Git-visible patch 必须保持不变；
 - DeerFlow backend `completed` 不等于 A-SWE logical success；
-- `completed + stop_reason` 映射为 `CAPPED_PARTIAL`；
+- `completed + stop_reason` 映射为 `CAPPED`；
 - capped partial 只有完整 deterministic acceptance + invariants 全通过时才可带 warning 接受；
 - mandatory REVIEW / 无 deterministic completeness proof 的 DISCOVERY capped run 不得静默成功；
 - 未接受的 capped partial 保留 evidence，但不产生 normal success Handoff。
@@ -10818,6 +10991,10 @@ Source Audit In Progress
 - P1 不支持已提交普通 downstream success 后的隐式 descendant rollback；此时 Repair scope invalidated。
 - RepairFeedback 是 revision-scoped deterministic evidence；真正 REPAIR dispatch 前必须在 WRITE lock 内做 freshness check；
 - stale verification/acceptance feedback 不能直接变成 current repair instruction；必须 refresh/reverify 或 fail closed。
+- direct SubagentExecutor terminal vocabulary 固定为 completed/failed/cancelled/timed_out；polling_timed_out 不进入 Adapter backend status；
+- `stop_reason` 与 terminal status 正交；FAILED 也可能是 capped execution；
+- capacity `admission_failure` 只映射 backend admission，不与 policy/preflight/model auth failure 混用；
+- NodeExecutionResult 使用 exhaustive typed status/stop-reason mapping，未知值视为 BACKEND_CONTRACT_MISMATCH。
 
 审计目标：
 
@@ -10880,6 +11057,13 @@ P0-7 新增 PoC：
 | POC-R24 | own AcceptanceFailure 后 current revision 改变 | 重跑 deterministic acceptance；旧 Feedback 不原地复用 |
 | POC-R25 | stale feedback refresh 后仍失败 | 创建新的 EvidenceRef / observed revision / fingerprint，再允许 REPAIR |
 | POC-R26 | stale feedback refresh 后已通过 | 旧 RepairFeedback 作废，不执行多余 repair |
+| POC-R27 | completed + turn_capped | terminal=COMPLETED，completeness=CAPPED，不自动等价 logical success |
+| POC-R28 | failed + turn_capped | terminal=FAILED，completeness=CAPPED，保留 cap failure 语义 |
+| POC-R29 | capacity reject / queue timeout | FAILED + admission_failure=true → failure_class=ADMISSION |
+| POC-R30 | NodeToolPolicy synthetic failure | FAILED + A-SWE marker → POLICY_OR_ASSEMBLY，不误归类 LLM execution failure |
+| POC-R31 | direct executor timeout | terminal=TIMED_OUT → failure_class=TIMEOUT |
+| POC-R32 | direct executor cancellation | terminal=CANCELLED → failure_class=CANCELLED |
+| POC-R33 | DeerFlow 新增未知 status / stop_reason | Adapter BACKEND_CONTRACT_MISMATCH，compat test fail |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
