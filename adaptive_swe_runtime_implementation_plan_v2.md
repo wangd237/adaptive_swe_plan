@@ -2686,6 +2686,95 @@ Pinned DeerFlow 的 `get_available_tools()` 会按 exposed name 去重，且 con
 
 同名 implementation 发生变化时，A-SWE 必须将其视为 inventory drift，而不是继续沿用旧 ToolEffect。
 
+#### P1 Canonical Tool Identity
+
+P1 不做通用 Python Tool 对象哈希。
+
+对于 core SWE hard-required business tools，identity contract 收窄到 **config-defined eager tool**：
+
+```text
+Tool Contract ID
+      ↓
+expected ToolConfig.use
+      ↓
+resolve_variable(use)
+      ↓
+loaded BaseTool.name
+```
+
+例如：
+
+```text
+read_file
+→ deerflow.sandbox.tools:read_file_tool
+→ loaded tool.name == read_file
+```
+
+Pinned DeerFlow `ToolConfig` 原生包含：
+
+```text
+name
+group
+use
+```
+
+且 `get_available_tools()` 通过 `resolve_variable(cfg.use, BaseTool)` 加载。实际路由名以 loaded Tool 的 `.name` 为准；若 `cfg.name != loaded.name`，DeerFlow 只 warning，不改回 cfg.name。
+
+因此 P1 的稳定 identity anchor 定义为：
+
+```text
+implementation_id
+=
+config:<ToolConfig.use>
+```
+
+同时记录：
+
+```text
+configured_name
+resolved_exposed_name
+group
+schema_hash
+```
+
+其中：
+
+- `ToolConfig.use` 是 implementation identity anchor；
+- `resolved_exposed_name` 是实际 DeerFlow routing key；
+- `schema_hash` 是 compatibility / drift evidence，不作为 implementation identity 本身；
+- Python object id 不进入 fingerprint；
+- runtime clone / description augmentation 不改变 implementation identity。
+
+如果 required Tool Contract ID：
+
+- 找不到对应 expected `ToolConfig.use`；
+- 被同名其他 config implementation 取代；
+- resolved Tool name 与 Contract mapping 不兼容；
+
+则：
+
+```text
+PROVIDER_TOOL_IDENTITY_MISMATCH
+```
+
+而不是仅仅把它当作“同名 Tool 仍然可用”。
+
+对于 P1 的 MCP / plugin / ACP optional tools：
+
+> 可以进入 inventory，但若没有 Adapter 明确认可的 stable identity / effect contract，则 `ToolEffect.UNKNOWN`，不得成为 READ safety proof。
+
+未来再扩展：
+
+```text
+MCP identity
+→ server identity + tool identity + schema/version evidence
+
+Plugin identity
+→ namespace + declaration + installation/version
+```
+
+不在 MVP 为 optional enhancement 预先建设完整跨后端 identity protocol。
+
 ### 5.4.1 CapabilityBinding Merge
 
 一个 WorkItem 可以要求多个 Capability，而一个 AgentProvider 可以同时覆盖它们。
@@ -3199,15 +3288,20 @@ DeerFlow 的实际 Tool catalog 来自：
 ```python
 class BackendToolInfo(BaseModel):
     contract_id: str
-    name: str
+
+    configured_name: str | None
+    resolved_exposed_name: str
+
     source: str
     delivery: Literal["eager", "deferred"]
 
-    # Adapter-owned opaque identity of the resolved implementation.
+    # P1 core required tools: "config:<ToolConfig.use>"
     implementation_id: str
+
+    group: str | None = None
     schema_hash: str | None = None
 
-    # Display/source metadata is informative; implementation_id is used for matching.
+    # Display/source metadata is informative; never sufficient as identity authority.
     provenance: str | None = None
 
     effect: ToolEffect
@@ -7211,6 +7305,9 @@ Implementation PoC Pending
 - Semantic NodeBoundaryPolicy 必须 provider-neutral；
 - Provider Assignment 不允许反向合并 / 拆分 WorkItem；
 - cross-node context 只通过 explicit NodeHandoff / shared Workspace evidence 传递。
+- P1 core hard-required Tool identity 以 `ToolConfig.use` 为稳定 anchor；
+- Python object identity / Tool provenance label 不作为 Provider hard-feasibility authority；
+- schema_hash 只用于 compatibility drift，不替代 implementation identity。
 
 新增 PoC：
 
@@ -7218,6 +7315,9 @@ Implementation PoC Pending
 |---|---|---|
 | POC-27 | operator tools ∩ A-SWE Node tools | A-SWE 不会扩大 SubagentConfig 权限 |
 | POC-28 | Provider 声明 required tool 但 backend inventory 缺失 | preflight fail，不进入 Team |
+| POC-28A | 同名 config tool 覆盖标准 read_file | expected ToolConfig.use 不匹配 → PROVIDER_TOOL_IDENTITY_MISMATCH |
+| POC-28B | ToolConfig.name 与 loaded tool.name 不一致 | inventory 使用 loaded exposed name，并记录 drift/warning |
+| POC-28C | write_file 因 model budget 被 clone/改 description | implementation_id 仍稳定为 config:ToolConfig.use |
 | POC-29 | 安装 A-SWE assembly observer | executor.assembly_descriptor 非空且 fingerprint 可读取 |
 | POC-30 | runtime policy 在首轮前移除 required eager tool | NodeToolPolicy synthetic short-circuit；LLM provider 零调用；SubagentResult=FAILED |
 | POC-31 | preferred skill enabled 但未 activation | 不误报 skill-used，也不把 Node 判失败 |
