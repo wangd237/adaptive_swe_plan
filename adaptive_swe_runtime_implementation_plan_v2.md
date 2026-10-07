@@ -6201,6 +6201,10 @@ release workspace access
 - exact `run_id` 作为唯一 key，不使用可碰撞的 node_id；
 - immutable policy + immutable invocation；
 - mutable outcome 独立并由 concurrency-safe holder 管理；
+- Store 必须 cross-thread / cross-event-loop safe；
+- P1 使用 `threading.Lock / RLock` 或等价同步 primitive 保护短临界区，**不能使用绑定单一 event loop 的 asyncio.Lock 作为共享 Store 锁**；
+- middleware lookup 只做 O(1) 内存读取，锁内禁止文件 I/O / Git / await；
+- outcome append/update 在相同同步边界内完成，Adapter 终态读取拿 snapshot copy；
 - bounded / cleanup-safe；
 - cancellation / timeout / exception 都必须 finally cleanup；
 - ordinary DeerFlow run 没有 matching A-SWE binding → pass-through；
@@ -6213,6 +6217,8 @@ release workspace access
 > **single-process P1 runtime。**
 
 分布式 Worker 后续必须把 BindingStore 换成显式 durable / remote execution-context carrier。
+
+Pinned DeerFlow 的 native subagent 可能运行在独立 persistent event-loop thread；BindingStore 的 producer（A-SWE Scheduler/Adapter）与 consumer（configured middleware）因此不保证同线程。这个 cross-loop boundary 是实现约束，不只是测试细节。
 
 ##### Middleware Enforcement
 
@@ -8802,6 +8808,7 @@ Source Audit In Progress
 - DeerFlow Adapter 用 exact run_id 绑定 immutable NodeExecutionBinding；
 - Handoff middleware 不在 isolated loop 读取 EvidenceStore / Git；
 - run_id prefix 不是 authority，exact BindingStore entry 才是 authority。
+- BindingStore 横跨 Scheduler loop 与 DeerFlow isolated subagent loop，P1 使用 thread-safe 同步而非 loop-bound asyncio.Lock。
 
 新增 PoC：
 
@@ -8865,6 +8872,8 @@ Source Audit In Progress
 | POC-H55 | ordinary DeerFlow run 无 binding | 两个 A-SWE middleware 都 pass-through |
 | POC-H56 | 多轮 model call | middleware 不读 Git/EvidenceStore，只复用 immutable rendered context |
 | POC-H57 | cancellation / timeout | finally 删除 execution binding，无 store leak |
+| POC-H58 | Scheduler loop 写 binding、isolated subagent loop 读 | 无 cross-loop lock error / context 串线 |
+| POC-H59 | 并发 middleware outcome update | snapshot consistency，锁内无 await/I/O |
 
 ---
 
