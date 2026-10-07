@@ -1194,6 +1194,78 @@ cancel_node() returns
 
 > **Cancellation acknowledgement is not quiescence. Quiescence is the workspace-lock release boundary.**
 
+#### 3.4.4 Quiescence Guarantee Scope
+
+Pinned DeerFlow 对 **sandbox-backed core tools** 已提供 cancellation drain：
+
+```text
+async sandbox wrapper
+→ run_sync_lifecycle_operation(...)
+→ asyncio.to_thread(...)
+→ asyncio.shield(worker)
+→ cancellation
+→ drain worker until done
+→ only then propagate cancellation
+```
+
+Sandbox lease release 也使用同样的 shield/drain 思路，确保 provider acquire/release 或同步 client operation 不会在 execution holder 释放后继续运行。
+
+因此 A-SWE P1 对以下 core execution surface：
+
+```text
+ls / glob / grep / read_file
+write_file / str_replace
+bash
+```
+
+可以复用 DeerFlow 的：
+
+> **execution coroutine quiescence → sandbox-backed worker quiescence**
+
+而不额外实现 thread kill / process kill。
+
+但这个结论不能泛化到所有扩展工具。
+
+对于：
+
+```text
+MCP
+plugin
+ACP
+custom external-side-effect tool
+```
+
+若其实现不受 DeerFlow sandbox execution lease / drained worker contract 约束：
+
+- backend execution quiescent 只表示 DeerFlow agent/tool-call coroutine 已结束；
+- 不能证明远端服务没有异步继续处理已经提交的 side effect；
+- 不能证明外部系统可以 rollback；
+- `MutationEvidence.PROVEN_NONE` 不得仅依赖 DeerFlow workspace snapshot。
+
+所以 P1：
+
+```text
+EXTERNAL_SIDE_EFFECT
+OR unverified custom UNKNOWN tool admitted
+→ automatic clean retry disabled by default
+```
+
+除非该 Tool Contract 明确提供：
+
+```text
+idempotency key
+or
+transaction / rollback contract
+or
+backend-specific quiescence/idempotency proof
+```
+
+一期 core SWE Runtime 不以外部 side-effect Tool 作为 hard dependency，因此不需要预先实现通用 distributed side-effect recovery。
+
+原则：
+
+> **Workspace quiescence is not distributed side-effect quiescence.**
+
 ### 3.5 NodeExecutionResult
 
 A-SWE 不直接暴露 DeerFlow `SubagentResult`，而映射成自身稳定 Schema。
@@ -10499,6 +10571,9 @@ Source Audit In Progress
 - DeerFlow ToolProgress / ToolReceipt 都属于 post-handler evidence，不能证明 cancellation 前“未启动 mutating tool”；
 - ASWENodeToolPolicyMiddleware 必须在 allowed tool call 进入 downstream handler 前记录 ToolCallAdmissionRecord；
 - `PROVEN_NONE` 需要完整 pre-handler admission audit + complete no-change snapshot；receipt absence 不构成 clean proof。
+- DeerFlow sandbox-backed sync work通过 shield + drain 防止 worker outlive execution holder；
+- A-SWE quiescence join 可以作为 core sandbox tool 的 workspace-lock release fence；
+- external MCP/plugin/custom side effect 不继承该保证，默认不参与 automatic clean retry。
 
 审计目标：
 
@@ -10547,6 +10622,9 @@ P0-7 新增 PoC：
 | POC-R10 | A-SWE admission 后内层 middleware short-circuit | 保守 UNKNOWN，不误判 PROVEN_NONE |
 | POC-R11 | admitted-tool audit overflow / missing Binding outcome | mutation proof incomplete → UNKNOWN |
 | POC-R12 | no receipt + no snapshot change | 单独不足以证明 PROVEN_NONE |
+| POC-R13 | cancelled sandbox bash 内部 worker 延迟退出 | completion join 在 worker drain / lease cleanup 完成后才返回 |
+| POC-R14 | admitted EXTERNAL_SIDE_EFFECT tool 后 execution failure | 即使 workspace 无变化也不判 PROVEN_NONE / 不自动 retry |
+| POC-R15 | ordinary core read-only sandbox Node cancellation | quiescence 后无 executor-owned late workspace worker |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
