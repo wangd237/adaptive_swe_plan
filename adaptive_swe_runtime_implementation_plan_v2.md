@@ -2393,31 +2393,277 @@ Union(all validated work-item capabilities)
 
 ### 4.17 Handoff Contract
 
-DAG dependency 不只表示 control order，还表示 data handoff。
+DAG dependency 不只表示 control order，还表示 data dependency。
 
-一期不强求把 Agent 自由文本完全解析成复杂语义对象；优先使用：
+Pinned DeerFlow native subagent 是 one-shot execution，因此跨 Node continuity 不能依赖隐藏 conversation/session state，只能依赖显式 Handoff、共享 Workspace 与 deterministic evidence。
 
-```python
-class NodeHandoff(BaseModel):
-    source_node_id: str
+#### 4.17.1 Handoff 双通道
 
-    report: str
+NodeHandoff 必须区分：
 
-    evidence_paths: list[str]
-    changed_paths: list[str]
+```text
+Model Self-Report
+→ untrusted semantic interpretation
 
-    acceptance_summary: dict | None
-    receipt_ids: list[str]
+Runtime Evidence
+→ deterministic / runtime-authored facts and references
 ```
 
-其中：
+禁止把两者压成一个自由文本 `report` 后再交给下游。
 
-- `report` 必须 bounded；
-- `changed_paths` 优先来自 deterministic workspace/git evidence；
-- `receipt_ids` 来自 DeerFlow Tool Receipt；
-- Handoff 仍然是 model report，不是事实权威。
+建议：
 
-后续若确有价值，再扩展结构化 findings / unresolved_questions。
+```python
+class WorkspaceRevision(BaseModel):
+    generation: int
+
+    base_sha: str
+    head_sha: str
+    head_matches_baseline: bool
+
+    repository_state_fingerprint: str
+    dirty: bool
+
+class HandoffEvidence(BaseModel):
+    receipt_ids: tuple[str, ...] = ()
+
+    changed_paths: tuple[str, ...] = ()
+    untracked_paths: tuple[str, ...] = ()
+
+    repository_changeset_id: str | None = None
+    workspace_changeset_id: str | None = None
+
+    acceptance_verdict_id: str | None = None
+    verification_result_id: str | None = None
+
+class NodeHandoff(BaseModel):
+    source_node_id: str
+    source_execution_id: str
+    source_attempt: int
+
+    source_provider_id: str
+
+    observed_workspace_revision: WorkspaceRevision
+
+    # Model-authored, bounded, untrusted interpretation.
+    self_report: str
+
+    # Runtime-authored evidence references / facts.
+    evidence: HandoffEvidence
+
+    # Runtime-generated diagnostics, not model claims.
+    warnings: tuple[str, ...] = ()
+
+    fingerprint: str
+```
+
+#### 4.17.2 Workspace Revision
+
+Repository `HEAD` 在 P1 中通常固定于 `resolved_base_sha`，因此不能只用 Git HEAD 表示 Workspace 版本。
+
+Runtime 维护 task-local monotonic：
+
+```text
+WorkspaceRevision.generation
+```
+
+规则：
+
+- bootstrap 完成后：`generation = 0`；
+- successful WRITE Node 且 Workspace state 发生变化：generation + 1；
+- READ Node：不递增；
+- failed dirty WRITE：Workspace 进入 dirty failure state，不发布可供正常下游消费的新 successful Handoff；
+- `repository_state_fingerprint` 来自 Runtime canonical RepositoryChangeSet / state digest，而不是 Agent self-report。
+
+Handoff 创建时绑定：
+
+```text
+observed_workspace_revision
+```
+
+因此下游可判断：
+
+```text
+handoff revision == current revision
+→ evidence observed on current workspace state
+
+handoff revision < current revision
+→ historical evidence
+→ load-bearing claims may require revalidation
+```
+
+Revision mismatch 本身不是自动失败；它是 staleness signal。
+
+#### 4.17.3 Evidence Authority
+
+字段 authority 冻结：
+
+| Field | Authority |
+|---|---|
+| `self_report` | model-authored / untrusted |
+| `receipt_ids` | DeerFlow execution evidence reference |
+| `changed_paths` | Git / Workspace deterministic evidence |
+| `untracked_paths` | Git-aware Runtime evidence |
+| acceptance verdict | deterministic checker output |
+| verification result | Runtime verifier output |
+| workspace revision | A-SWE Workspace Runtime |
+
+禁止：
+
+```text
+Agent says "I changed src/a.py"
+→ changed_paths = ["src/a.py"]
+```
+
+必须：
+
+```text
+Git / Workspace ChangeSet says src/a.py changed
+→ changed_paths includes src/a.py
+```
+
+Agent 的路径声明若与 Runtime evidence 不一致，只能进入 warning / trace，不升级为事实。
+
+#### 4.17.4 Receipt 继承边界
+
+上游 receipt id 是历史证据引用，不是下游执行证据。
+
+下游 prompt 必须明确：
+
+```text
+[rN] from dependency handoff
+≠ your own tool execution
+```
+
+不得让 Node B 引用 Node A 的 receipt 来证明“Node B 已执行该动作”。
+
+这一点与 DeerFlow `ParentContextSnapshot` 的历史 receipt 边界保持一致。
+
+#### 4.17.5 Handoff Sanitization
+
+`self_report` 来自模型，必须按 untrusted data 处理。
+
+P1：
+
+- NodeExecutionResult 可保留原始 backend result 供 Trace；
+- NodeHandoff.self_report 在进入任何下游模型上下文前必须做 deterministic bound + injection neutralization；
+- DeerFlow Adapter 可以复用公开 `neutralize_untrusted_tags()`；
+- A-SWE Core 不直接 import DeerFlow sanitizer；
+- 如果未来 Handoff 以 hidden/framework HumanMessage 注入，必须显式 sanitize，不能依赖 InputSanitizationMiddleware 自动处理；
+- Handoff 不能进入 SystemMessage authority channel。
+
+#### 4.17.6 Bounded Handoff
+
+P1 推荐 Runtime config：
+
+```text
+max_handoff_report_chars = 4000
+max_dependency_handoff_chars_per_node = 12000
+```
+
+超出时：
+
+1. deterministic truncate self-report；
+2. 保留 evidence references、revision、warnings；
+3. 不删除 acceptance / verification / changed-path evidence 来给自由文本让位。
+
+即：
+
+> **Evidence survives before prose.**
+
+#### 4.17.7 Multi-Parent Merge
+
+当 Node 依赖多个上游：
+
+```text
+A ─┐
+   ├→ C
+B ─┘
+```
+
+Runtime 不调用 LLM 先把多个 Handoff 合成一个“总结事实”。
+
+采用 deterministic envelope：
+
+```text
+Dependency Handoffs
+- source=A
+  revision=...
+  self_report=...
+  evidence=...
+
+- source=B
+  revision=...
+  self_report=...
+  evidence=...
+```
+
+排序使用 DAG dependency canonical order。
+
+这样保留 source provenance，避免：
+
+```text
+LLM merge
+→ provenance loss
+→ conflicting claims silently collapsed
+```
+
+若两个 self-report 冲突，保留冲突并提示下游验证；Runtime 只对 deterministic evidence 做机器级 reconciliation。
+
+#### 4.17.8 Repair Handoff
+
+Repair 不复用普通 success handoff 语义。
+
+Verification failure 产生：
+
+```python
+class RepairFeedback(BaseModel):
+    failed_verification_node_id: str
+    target_write_node_id: str
+
+    observed_workspace_revision: WorkspaceRevision
+
+    deterministic_failures: tuple[str, ...]
+    verification_result_id: str | None
+    receipt_ids: tuple[str, ...]
+
+    verifier_report: str | None  # untrusted if model-authored
+```
+
+Repair attempt 输入：
+
+```text
+Original Write Objective
++
+Previous Write Handoff
++
+RepairFeedback
++
+Current Workspace Revision
+```
+
+而不是只把 Tester 的自由文本“tests failed because ...”拼进 prompt。
+
+#### 4.17.9 Handoff Fingerprint
+
+Handoff fingerprint 至少覆盖：
+
+```text
+source node / execution / attempt
+observed workspace revision
+runtime evidence refs
+bounded self-report
+warnings
+```
+
+用于：
+
+- Trace correlation；
+- retry / repair reproducibility；
+- 防止下游执行时误读旧 attempt handoff；
+- execution-plan evidence chain。
+
+Handoff fingerprint 不等于 Workspace state fingerprint，两者职责分离。
 
 ### 4.18 Planning Replan Boundary
 
@@ -4270,21 +4516,32 @@ Control Dependency
 Data Dependency
 ```
 
-下游请求：
+下游请求由 Runtime 组装：
 
 ```text
 Original Task
 +
 Current Node Objective
 +
-Bounded Dependency Handoffs
+Bounded Dependency Handoff Envelopes
 +
-Runtime Constraints
+Current Workspace Revision
++
+Runtime Guidance
 +
 Acceptance Criteria
 ```
 
-Handoff 进入 untrusted data channel。
+其中：
+
+- Handoff `self_report` 永远是 untrusted data；
+- Runtime evidence / revision 由 framework-owned envelope 标识其 provenance；
+- evidence reference 的存在不代表下游已经重验证其语义；
+- 上游 receipt 不成为下游 receipt；
+- revision stale 的 handoff 要显式标注；
+- 多 parent handoff 按 canonical dependency order 保持分离，不做 LLM pre-merge。
+
+安全 authority 仍来自 NodeExecutionPolicy / Guardrail / Sandbox，而不是 prompt 中的 Runtime Guidance。
 
 ### 9.7 Scheduler 的职责
 
@@ -5212,6 +5469,9 @@ Acceptance Check
    │
    ▼
 Repository Invariant Check（WRITE）
+   │
+   ▼
+Publish / Update WorkspaceRevision（WRITE）
    │
    ▼
 Create NodeHandoff
@@ -6451,6 +6711,7 @@ a-swe-runtime/
 │   ├── normalizer.py
 │   ├── node_boundary.py
 │   ├── handoff.py
+│   ├── workspace_revision.py
 │   ├── acceptance_compiler.py
 │   └── materializer.py
 │
@@ -7346,6 +7607,47 @@ Implementation PoC Pending
 
 ---
 
+#### P0-6：NodeHandoff / Cross-Node Context Audit
+
+状态：
+
+```text
+Architecture Updated
+Source Audit In Progress
+```
+
+当前冻结结论：
+
+- DeerFlow native Subagent 是 one-shot execution，跨 Node 无隐式 conversation continuity；
+- NodeHandoff 分离 model self-report 与 Runtime evidence；
+- self-report 永远是 untrusted data；
+- changed_paths / untracked_paths 不接受 Agent 自报，来自 Git / Workspace deterministic evidence；
+- Handoff 绑定 WorkspaceRevision；
+- WorkspaceRevision 使用 monotonic generation + repository state fingerprint，不能只看 HEAD；
+- historical receipt 不能作为下游自身 execution proof；
+- model-facing handoff 必须 bounded + neutralized；
+- hidden/framework handoff injection 不能依赖 DeerFlow InputSanitizationMiddleware 自动处理；
+- 多 parent handoff deterministic merge，保留 source provenance；
+- repair feedback 使用独立 typed contract；
+- Handoff fingerprint 与 Workspace state fingerprint 分离。
+
+新增 PoC：
+
+| PoC | 测试内容 | 必须验证 |
+|---|---|---|
+| POC-H01 | Agent 自报修改不存在文件 | changed_paths 不采信 self-report |
+| POC-H02 | WRITE Node 成功修改文件 | generation +1，Handoff revision 匹配新 state |
+| POC-H03 | READ Node | generation 不变化 |
+| POC-H04 | 上游 receipt 传给下游 | 只作为 historical reference，不进入下游 own receipts |
+| POC-H05 | self_report 含 framework/injection tag | 下游模型看到 neutralized data |
+| POC-H06 | hidden handoff message | 显式 sanitizer 生效，不依赖 generic user-input middleware |
+| POC-H07 | 两个并行 parent handoff | canonical order + provenance preserved |
+| POC-H08 | handoff revision 落后 current workspace | 标记 stale，不静默当 current fact |
+| POC-H09 | verification failure → repair | 使用 typed RepairFeedback，不只拼自由文本 |
+| POC-H10 | handoff 超预算 | prose truncate，evidence/revision 不丢失 |
+
+---
+
 ### Phase 1：Adaptive SWE Runtime MVP
 
 这是当前唯一必须完成的产品阶段。
@@ -7432,7 +7734,10 @@ ValidatedWorkPlan
 - ProviderContract fingerprint；
 - Minimal Feasible Team Policy；
 - TeamSpec（roster only）；
-- NodeHandoff schema；
+- WorkspaceRevision；
+- NodeHandoff dual-channel schema；
+- Handoff evidence authority；
+- deterministic multi-parent handoff merge；
 - DAG Materializer；
 - TaskNode；
 - ToolEffect Registry；
@@ -7458,6 +7763,8 @@ Executable TaskDAG
 - Backend snapshot pinning；
 - `BACKEND_PREFLIGHT_STALE` classification；
 - Dependency Handoff Routing；
+- Handoff staleness / revision check；
+- RepairFeedback routing；
 - READ / WRITE Workspace Access；
 - provably READ-only Basic Parallel Execution；
 - WRITE / UNKNOWN-MUTATING Exclusive Execution；
