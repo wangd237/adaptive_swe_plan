@@ -4850,7 +4850,67 @@ RepairFeedback
 Current Workspace Revision
 ```
 
-其中 `Current Workspace Revision` 必须等于 failed acceptance / verification 所观察到的 post-attempt revision；Repair 不允许偷偷回到 pre-attempt revision，除非未来实现显式 rollback/checkpoint。
+其中 `RepairFeedback.observed_workspace_revision` 表示 deterministic failure evidence 真正观察到的状态。
+
+但它不能在 Feedback 创建时验证一次就永久有效。
+
+Repair attempt 的顺序冻结为：
+
+```text
+RepairFeedback created @ observed revision Rn
+        ↓
+Scheduler prepares repair
+        ↓
+Acquire target WRITE workspace lock
+        ↓
+freeze execution_workspace_revision = Rcurrent
+        ↓
+compare Rcurrent with RepairFeedback.observed_workspace_revision
+        │
+        ├─ exact current-state match
+        │     → render RepairFeedback
+        │     → execute REPAIR
+        │
+        └─ mismatch
+              → RepairFeedback is STALE
+              → do NOT send it as current deterministic failure
+```
+
+P1 不允许把：
+
+```text
+historical test failure @ Rn
+```
+
+直接升级成：
+
+```text
+current repair instruction @ Rn+1
+```
+
+Mismatch 时：
+
+- `DOWNSTREAM_VERIFICATION` trigger：
+  - 若 verifier 可安全 deterministic re-run，先执行 REVERIFY / refresh feedback；
+  - 否则 `REPAIR_FEEDBACK_STALE`，fail closed。
+- `NODE_ACCEPTANCE` trigger：
+  - 在 current revision 重新运行同一 deterministic acceptance checker；
+  - 若 failure 仍成立，生成新的 Feedback；
+  - 若已经 holds，旧 feedback 作废，不应继续 repair；
+  - 无法重验则 `REPAIR_FEEDBACK_STALE`。
+
+任何 refresh 都必须产生新的：
+
+```text
+source execution / attempt
+EvidenceRef
+observed_workspace_revision
+RepairFeedback fingerprint
+```
+
+不能原地改旧 Feedback。
+
+Repair 不允许偷偷回到 pre-attempt revision，除非未来实现显式 rollback/checkpoint。
 
 而不是只把 Tester 的自由文本“tests failed because ...”拼进 prompt。
 
@@ -6799,6 +6859,8 @@ PolicyViolation
 RepositoryInvariantFailure
 RepositoryMutationAuthorityViolation
 EvidenceFinalizationFailure
+RepairFeedbackStale
+RepairScopeInvalidated
 Cancelled
 ```
 
@@ -6817,6 +6879,8 @@ Cancelled
 | WRITE failure 且 `mutation_evidence == OBSERVED / UNKNOWN` | publish dirty/advanced post revision，然后 fail closed |
 | acceptance does-not-hold | repair unmet condition / fail |
 | verification test failure | bounded upstream repair，再 verify |
+| repair feedback revision stale | refresh deterministic checker / reverify；无法刷新则 REPAIR_FEEDBACK_STALE |
+| repair scope invalidated | fail closed / restart-from-baseline；不隐式 rollback descendants |
 | review decision = REQUEST_CHANGES | REVIEW_GATE_REJECTED；保留 findings；P1 不自动 semantic repair |
 | review decision = UNVERIFIED | REVIEW_GATE_UNVERIFIED；gate unsatisfied |
 | UNVERIFIED | additional deterministic check 或保留 uncertainty |
@@ -7280,6 +7344,8 @@ Repair 不允许：
 - 创建任意新 dependency；
 - 回滚到 pre-attempt state。
 
+Repair 还必须在 WRITE lock 内完成 Feedback freshness check；`RepairFeedback` 与普通 `NodeHandoff` 一样属于 revision-scoped state-dependent evidence，而不是永不过期的命令。
+
 如果修复确实需要这些变化，P1 视为：
 
 ```text
@@ -7323,6 +7389,7 @@ class RepairFeedback(BaseModel):
     target_write_node_id: str
     target_write_attempt: int
 
+    # Revision whose state the deterministic failure evidence actually observed.
     observed_workspace_revision: WorkspaceRevision
 
     deterministic_failures: tuple[str, ...]
@@ -7330,7 +7397,10 @@ class RepairFeedback(BaseModel):
     acceptance_verdict: EvidenceRef | None
     receipt_refs: tuple[ReceiptRef, ...]
 
+    # Untrusted explanatory prose only.
     verifier_report: str | None
+
+    fingerprint: str
 ```
 
 #### Repair Loop
@@ -10746,6 +10816,8 @@ Source Audit In Progress
 - ordinary dependency 只由当前 SUCCEEDED + accepted_attempt/handoff 满足；
 - Writer reopen for Repair 会立即撤销旧 accepted handoff 的 dependency authority；
 - P1 不支持已提交普通 downstream success 后的隐式 descendant rollback；此时 Repair scope invalidated。
+- RepairFeedback 是 revision-scoped deterministic evidence；真正 REPAIR dispatch 前必须在 WRITE lock 内做 freshness check；
+- stale verification/acceptance feedback 不能直接变成 current repair instruction；必须 refresh/reverify 或 fail closed。
 
 审计目标：
 
@@ -10804,6 +10876,10 @@ P0-7 新增 PoC：
 | POC-R20 | upstream FAILED 有多层 descendants | descendants BLOCKED，但 Task aggregation 只保留 root failure ownership |
 | POC-R21 | local node cancellation | node=CANCELLED；ordinary descendants BLOCKED |
 | POC-R22 | task-wide cancellation | running nodes cancel+join；未运行 descendants=CANCELLED，不误标 business failure |
+| POC-R23 | Verification failure @ R5，Repair lock 时 Workspace=R6 | 不向 Coder注入旧 failure；先 refresh/reverify 或 REPAIR_FEEDBACK_STALE |
+| POC-R24 | own AcceptanceFailure 后 current revision 改变 | 重跑 deterministic acceptance；旧 Feedback 不原地复用 |
+| POC-R25 | stale feedback refresh 后仍失败 | 创建新的 EvidenceRef / observed revision / fingerprint，再允许 REPAIR |
+| POC-R26 | stale feedback refresh 后已通过 | 旧 RepairFeedback 作废，不执行多余 repair |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
