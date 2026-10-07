@@ -574,6 +574,9 @@ class NodeExecutionResult(BaseModel):
     tool_receipts: list[dict] | None
     bash_executions: list[dict] | None
 
+    # Provider-neutral mapped advisory evidence, completed runs only.
+    report_receipt_verdict: ReportReceiptVerdict | None
+
     backend_trace_id: str | None
 ```
 
@@ -2442,6 +2445,7 @@ class EvidenceRef(BaseModel):
     kind: Literal[
         "repository_changeset",
         "workspace_changeset",
+        "report_receipt_verdict",
         "acceptance_verdict",
         "verification_result",
         "repository_invariant",
@@ -2462,6 +2466,7 @@ class HandoffEvidence(BaseModel):
     repository_changeset: EvidenceRef | None = None
     workspace_changeset: EvidenceRef | None = None
 
+    report_receipt_verdict: EvidenceRef | None = None
     acceptance_verdict: EvidenceRef | None = None
     verification_result: EvidenceRef | None = None
 
@@ -2593,6 +2598,120 @@ Git / Workspace ChangeSet says src/a.py changed
 ```
 
 Agent 的路径声明若与 Runtime evidence 不一致，只能进入 warning / trace，不升级为事实。
+
+#### 4.17.3.1 Self-Report Receipt Citation Verification
+
+Pinned DeerFlow 会在每个 Subagent system prompt 注入 `report_contract`，要求 Agent 对 action claim 使用 `[rN tool_name]` citation。
+
+但这只是 producer-side contract。
+
+标准 DeerFlow `task_tool` 在：
+
+```text
+SubagentStatus.COMPLETED
+```
+
+之后显式调用：
+
+```python
+verify_receipt_citations(
+    result.result or "",
+    result.tool_receipts,
+)
+```
+
+Direct `SubagentExecutor` 不执行这一步。
+
+因此 A-SWE Adapter 必须显式回接同一 verifier，和 acceptance checker 一样不能遗漏。
+
+Provider-neutral 映射建议：
+
+```python
+class ReportReceiptVerdict(BaseModel):
+    citation_resolved: bool
+
+    cited: tuple[str, ...]
+    resolved: tuple[str, ...]
+    failed: tuple[dict, ...]
+    unknown: tuple[str, ...]
+
+    no_citation_claims: bool
+
+    source: str = "receipt_citations"
+    requirement: str = "cited_ids_in_execution_record"
+```
+
+语义严格保持 DeerFlow vocabulary：
+
+```text
+citation_resolved = true
+→ cited display ids resolve against the citing-turn execution ledger
+→ cited receipts have success status
+→ optional tool-name anchors match
+
+citation_resolved = false
+→ failed / unknown citation
+OR
+→ action-looking completed self-report has no citation
+```
+
+这不是：
+
+```text
+claim_correct = true
+task_accepted = true
+```
+
+DeerFlow verifier 自己明确将 limitation 定义为：
+
+```text
+execution evidence only
+does not validate claim correctness
+```
+
+因此 A-SWE 不得把 `citation_resolved` 接入 hard Node acceptance 的 success boolean。
+
+推荐行为：
+
+- verdict true → 正常保存 execution-claim evidence；
+- verdict false → Handoff warning `SELF_REPORT_RECEIPT_UNVERIFIED`；
+- deterministic acceptance / repository invariant 仍独立判断；
+- receipts disabled 或 `SubagentResult.tool_receipts is None` → verdict absent，不伪造 false/true；
+- empty harvested receipt list 是真实 evidence state，可以运行 verifier；
+- failed/cancelled/timed-out Subagent 不生产 completed-report citation verdict。
+
+#### Verification Ordering
+
+必须使用完整 `SubagentResult.result`：
+
+```text
+full untruncated SubagentResult.result
+        ↓
+verify_receipt_citations()
+        ↓
+store ReportReceiptVerdict EvidenceRef
+        ↓
+deterministic acceptance
+        ↓
+repository / workspace evidence
+        ↓
+bound + sanitize self_report
+        ↓
+NodeHandoff
+```
+
+禁止：
+
+```text
+truncate Handoff report first
+→ verify truncated text
+```
+
+因为 citation 可能被截断，zero-citation heuristic 也会失真。
+
+`ReportReceiptVerdict` 作为 attempt-scoped immutable evidence 写入 `ExecutionEvidenceStore`，Handoff 只携带其 `EvidenceRef` 和必要 warning。
+
+---
 
 #### 4.17.4 Receipt 继承边界
 
@@ -5801,6 +5920,9 @@ Failure Classification
    └── continue
    │
    ▼
+Completed? Verify Full Self-Report Receipt Citations
+   │
+   ▼
 Acceptance Check
    │
    ▼
@@ -6548,7 +6670,7 @@ RuntimeEvent
 → timeline / decision / state transition
 
 ExecutionEvidenceStore
-→ changeset / acceptance / verification / invariant payload
+→ changeset / report-receipt verdict / acceptance / verification / invariant payload
 ```
 
 事件可以保存 EvidenceRef，但不把大 Patch、完整验证输出重复塞进 event payload。
@@ -6808,6 +6930,28 @@ NodeAcceptanceResult
 原则：
 
 > **复用 DeerFlow acceptance checker，不重新实现一套平行的 acceptance 语义。**
+
+同样，Direct `SubagentExecutor` 也绕过标准 `task_tool` 的：
+
+```python
+verify_receipt_citations()
+```
+
+因此 Adapter 在 completed result mapping 阶段还必须显式回接 DeerFlow receipt citation verifier。
+
+两者职责不同：
+
+```text
+Receipt Citation Verdict
+→ self-report action claims 是否引用了真实 execution record
+→ advisory only
+
+Acceptance Verdict
+→ canonical acceptance leaves 是否被 deterministic evidence 支持
+→ Node acceptance input
+```
+
+不能把两个 verdict 合并成一个 `verified=true`。
 
 一期优先支持 DeerFlow 已能确定性判断的 criterion，例如：
 
@@ -7139,6 +7283,7 @@ a-swe-runtime/
 │       ├── assembly_attestation.py
 │       ├── attestation_extension.py
 │       ├── result_mapper.py
+│       ├── report_verification.py
 │       ├── acceptance_adapter.py
 │       ├── contract_guardrail.py
 │       └── trace_adapter.py
@@ -8005,6 +8150,9 @@ Source Audit In Progress
 - changeset / acceptance / verification 由 ExecutionEvidenceStore 持有；
 - EvidenceRef immutable 且 attempt-scoped；
 - retry / repair 不覆盖旧 attempt evidence；
+- Direct SubagentExecutor 绕过 task_tool receipt citation verification，Adapter 必须显式回接；
+- citation verdict 只属于 advisory execution evidence，不等于 acceptance；
+- report citation verification 必须发生在 Handoff truncation 之前；
 - Handoff staleness final classification 必须发生在 Workspace lock granted 之后；
 - 每个 Node attempt 冻结 pre-execution WorkspaceRevision；
 
@@ -8036,6 +8184,11 @@ Source Audit In Progress
 | POC-H21 | Node 等待 WRITE lock 期间 revision 改变 | lock granted 后重新分类 handoff staleness |
 | POC-H22 | 两个并行 READ Node | shared READ lock 下 execution_workspace_revision 保持一致 |
 | POC-H23 | WRITE Node 执行 | pre revision 冻结，成功 mutation 后只发布一个新 post revision |
+| POC-H24 | completed report 引用有效 `[rN tool]` | DeerFlow verifier 映射 citation_resolved=true |
+| POC-H25 | report 引用 unknown / failed / wrong-anchor receipt | citation_resolved=false，写 Handoff warning |
+| POC-H26 | action-looking report 无 receipt citation | no_citation_claims=true；不误当 acceptance failure |
+| POC-H27 | receipts disabled / harvest None | receipt verdict absent，不伪造 verdict |
+| POC-H28 | 长 report 尾部含 citation | 对完整 report 先 verify，再做 Handoff truncation |
 
 ---
 
@@ -8204,6 +8357,7 @@ Executable TaskDAG
 
 完成：
 
+- DeerFlow Receipt Citation Verification Adapter；
 - DeerFlow Acceptance Adapter；
 - Build / Import Check；
 - Test Execution；
