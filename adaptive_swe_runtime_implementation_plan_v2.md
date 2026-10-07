@@ -3868,10 +3868,10 @@ PROVENANCE_KEYS
 
 这些 provenance keys 属于 server-owned metadata；Gateway 会从不可信输入中剥离调用方伪造值。
 
-A-SWE Adapter 因此应复用公开 provenance contract：
+A-SWE Adapter 可以对**注入瞬间**的两条 message 复用公开 provenance contract：
 
 ```text
-Authority SystemMessage
+Authority SystemMessage before coalescing
 → ContentKind.MIDDLEWARE_INJECTION
 → producer_kind = aswe_handoff_context
 → producer_entity_id = node_execution_id
@@ -3882,14 +3882,38 @@ Dependency Data HumanMessage
 → producer_entity_id = node_execution_id
 ```
 
-`content_kind` contract 接受字符串，未知的新 kind 会降级为 observer 侧未识别字符串而不是 import failure，因此 A-SWE 可以使用自己的 data-kind 名称。
+但必须注意 pinned DeerFlow 最内层 `SystemMessageCoalescingMiddleware` 的行为：
+
+```text
+merge all SystemMessage.additional_kwargs
+        ↓
+overwrite reserved provenance keys with
+producer_kind = system_coalescing
+```
+
+因此最终 provider-visible merged SystemMessage：
+
+> **不能再通过 DeerFlow reserved provenance keys 证明其中某一段 authority text 来自 ASWEHandoffContextMiddleware。**
+
+这是 coalescer 的正常 contract，不应 fork/patch DeerFlow 去保留多重 producer provenance。
+
+P1 改为：
+
+- hidden dependency HumanMessage：继续使用 A-SWE provenance，最终仍可由 `read_provenance()` 识别；
+- authority SystemMessage：A-SWE provenance 只在 pre-coalescing middleware 单元测试中可观察；
+- provider-bound merged SystemMessage 的 reserved provenance 应预期为 `system_coalescing`；
+- 若 Trace 需要证明 A-SWE authority block 被注入，使用 NodeExecutionBinding / middleware trace event / assembly policy evidence，而不是读取最终 merged SystemMessage 的 producer_kind；
+- 可选增加一个非 reserved、framework-owned diagnostic marker（例如 `aswe_handoff_authority=true`），coalescer 会随 additional_kwargs 合并保留，但该 marker 只用于诊断，不作为 authority/security proof。
+
+`content_kind` contract 接受字符串，未知的新 kind 会降级为 observer 侧未识别字符串而不是 import failure，因此 A-SWE 可以给 hidden dependency HumanMessage 使用自己的 data-kind 名称。
 
 Provenance 的用途是：
 
-- observer / trace 可确定 message producer；
-- 区分 Handoff injection 与用户 HumanMessage；
-- 调试 middleware ordering；
-- 防止依赖 prompt wording 猜来源。
+- observer / trace 确定未被 coalescer 重写的 message producer；
+- 区分 Handoff dependency HumanMessage 与用户 HumanMessage；
+- 调试 middleware ordering。
+
+它不是跨 middleware transform 的不可变 provenance chain；SystemMessage coalescing 本身就是一个新的 producer transform。
 
 它**不是** authority grant：
 
@@ -9664,7 +9688,8 @@ Source Audit In Progress
 - Handoff projection 使用独立 ASWEHandoffContextMiddleware；
 - 不复用 operator-owned prompt_overlay 承载 runtime handoff；
 - system channel 只放固定 authority contract，真实 handoff payload 放 hidden HumanMessage；
-- Handoff injected messages 使用 DeerFlow server-owned provenance metadata 显式标记 producer/content kind；
+- Handoff hidden HumanMessage 使用 DeerFlow server-owned provenance metadata 显式标记 producer/content kind；
+- authority SystemMessage 的 A-SWE provenance 只在 coalescing 前成立；最终 merged SystemMessage provenance 由 DeerFlow system_coalescing 接管；
 - Handoff projection request-scoped，不写回 child graph messages state；
 
 - 多 parent handoff deterministic merge，保留 source provenance；
@@ -9747,7 +9772,8 @@ Source Audit In Progress
 | POC-H31 | Workspace snapshot truncated | changed_paths_complete=false + warning；失败 WRITE 不 retry |
 | POC-H32 | truncated mutating attempt 无 observed files | WorkspaceRevision 仍保守 +1 |
 | POC-H33 | binary/sensitive/large changed file | path mutation 仍记录，diff content 可 unavailable |
-| POC-H34 | Handoff System/Human injection | read_provenance 可识别 aswe_handoff_context producer |
+| POC-H34 | Handoff System/Human injection | hidden HumanMessage provenance=aswe_handoff_context；pre-coalescing SystemMessage 可识别 A-SWE producer |
+| POC-H34A | SystemMessageCoalescing 后 provider-bound request | merged SystemMessage reserved provenance=system_coalescing，不误断言为 A-SWE producer |
 | POC-H35 | caller 伪造 DeerFlow provenance keys | host sanitization 不允许其伪装为 A-SWE injected context |
 | POC-H36 | WRITE 修改成功但 acceptance fail | WorkspaceRevision 已 +1，Repair 观察新 revision |
 | POC-H37 | WRITE execution fail 且留下 mutation | 发布 dirty post revision 后 fail closed |
