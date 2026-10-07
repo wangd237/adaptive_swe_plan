@@ -900,14 +900,22 @@ A-SWE 不直接暴露 DeerFlow `SubagentResult`，而映射成自身稳定 Schem
 建议至少保留：
 
 ```python
+class ExecutionCompleteness(str, Enum):
+    CLEAN = "clean"
+    CAPPED_PARTIAL = "capped_partial"
+
 class NodeExecutionResult(BaseModel):
     execution_id: str
     node_id: str
+
+    # Backend terminal status; not A-SWE logical Node success.
     status: str
+
     result: str | None
     error: str | None
 
     stop_reason: str | None
+    completeness: ExecutionCompleteness | None
 
     started_at: datetime | None
     completed_at: datetime | None
@@ -930,6 +938,30 @@ stop_reason = turn_capped
 ```
 
 表示任务产生了可用结果，但执行过程触发了 Runtime Guardrail，不应被误认为 clean completion。
+
+映射冻结：
+
+```text
+backend status = completed
+AND stop_reason is None
+→ completeness = CLEAN
+
+backend status = completed
+AND stop_reason in {token_capped, turn_capped, loop_capped}
+→ completeness = CAPPED_PARTIAL
+
+backend status != completed
+→ completeness = None
+```
+
+> **ExecutionCompleteness 描述执行是否被 guard cap 提前截断；它仍然不等于 Node acceptance。**
+
+因此：
+
+```text
+Backend COMPLETED
+≠ A-SWE Node SUCCEEDED
+```
 
 ### 3.6 DeerFlow 集成基线与升级策略
 
@@ -2833,6 +2865,9 @@ class NodeHandoff(BaseModel):
 
     # Runtime-authored evidence references / facts.
     evidence: HandoffEvidence
+
+    backend_stop_reason: str | None
+    execution_completeness: ExecutionCompleteness
 
     # Runtime-generated diagnostics, not model claims.
     warnings: tuple[str, ...] = ()
@@ -5719,6 +5754,7 @@ AdmissionFailure
 BackendPreflightStale
 ProviderAssemblyMismatch
 ExecutionTransientFailure
+ExecutionCappedPartial
 AcceptanceFailure
 VerificationFailure
 PlanInvalidated
@@ -5736,6 +5772,9 @@ Cancelled
 | backend preflight stale | fail before execution；pre-WRITE 时可 bounded replan |
 | provider assembly mismatch | fail closed；P1 不自动换 Provider |
 | READ transient failure | RetryPolicy |
+| capped partial + complete deterministic proof | accept with `EXECUTION_CAPPED_BUT_ACCEPTED` warning |
+| capped partial + no complete proof + proven-clean READ | bounded retry / fail |
+| capped partial + dirty/unknown WRITE | no blind retry；deterministic repair evidence exists 才 repair，否则 fail closed |
 | WRITE failure 且无 workspace change | bounded retry |
 | WRITE failure 且已有/无法排除 workspace change | publish dirty post revision，然后 fail closed |
 | acceptance does-not-hold | repair unmet condition / fail |
@@ -5746,6 +5785,147 @@ Cancelled
 | policy / repository invariant violation | fail closed |
 | read-only semantic Node changes Git-visible Repository state | REPOSITORY_MUTATION_AUTHORITY_VIOLATION；fail closed |
 | cancelled | propagate cancellation |
+
+### 9.8.1 Backend Completion vs Logical Node Success
+
+Pinned DeerFlow 的 `completed` 只表示：
+
+> execution ended with usable result text.
+
+它不保证 objective 已完整完成，也不保证 guard budget 未提前终止。
+
+尤其：
+
+```text
+completed + token_capped
+completed + turn_capped
+completed + loop_capped
+```
+
+统一映射为：
+
+```text
+ExecutionCompleteness.CAPPED_PARTIAL
+```
+
+DeerFlow delegation ledger 自身也明确：
+
+```text
+Completed means execution ended, not task acceptance.
+```
+
+因此 A-SWE logical Node outcome 由：
+
+```text
+Backend terminal status
++
+ExecutionCompleteness
++
+Workspace / Repository invariants
++
+Acceptance verdict
++
+WorkKind semantic-gate policy
+        ↓
+Logical Node Outcome
+```
+
+共同决定。
+
+#### Capped Completion Admission Matrix
+
+P1 保守规则：
+
+| 条件 | CAPPED_PARTIAL 是否可被逻辑接受 |
+|---|---:|
+| deterministic acceptance coverage 完整，所有 load-bearing leaves checked + holds，所有 repository / contract invariants 通过 | 可以，但必须携带 capped warning |
+| 没有 acceptance criteria / completeness proof | 不可以 |
+| 任一 criterion does-not-hold | 不可以 |
+| 任一 load-bearing criterion UNVERIFIED | 不可以 |
+| mandatory REVIEW | 不可以 |
+| DISCOVERY 且没有 deterministic completeness proof | 不可以 |
+| WRITE 已修改 Workspace，但缺少完整 deterministic proof | 不可以，也不能 blind retry |
+
+这里的：
+
+```text
+deterministic acceptance coverage complete
+```
+
+必须由 Acceptance Compiler / ExecutionPlanValidator 显式生成，不等于“恰好存在一个 acceptance criterion”。
+
+只有满足完整 proof 的 capped run 才能：
+
+```text
+Logical Node Status = SUCCEEDED
+warning = EXECUTION_CAPPED_BUT_ACCEPTED
+```
+
+其 Handoff 仍必须标记：
+
+```text
+backend_stop_reason
+execution_completeness = capped_partial
+```
+
+不能向下游伪装成 clean completion。
+
+#### Unaccepted Capped Completion
+
+否则：
+
+```text
+ExecutionCappedPartial
+```
+
+不是普通 `ExecutionTransientFailure`。
+
+处理：
+
+- READ / semantic READ_ONLY 且 Workspace proven unchanged：
+  - 可按 bounded RetryPolicy 重试；
+  - Runtime 可以缩小 attempt context / objective projection；
+  - P1 不自动提高 DeerFlow operator `max_turns` / token budget。
+- WRITE / UNKNOWN-mutating 且 Workspace proven unchanged：
+  - 可 bounded retry。
+- WRITE / UNKNOWN-mutating 已发生或无法排除 mutation：
+  - 不自动 retry；
+  - 若存在 deterministic unmet acceptance，可进入既有 Repair 规则；
+  - 若只有“被 cap 截断”而没有 deterministic repair evidence，则 fail closed。
+
+#### Mandatory Review
+
+P1 mandatory Review 是 semantic gate：
+
+```text
+REVIEW + CAPPED_PARTIAL
+→ review gate unsatisfied
+```
+
+即使 reviewer 的部分文本看起来像“looks good”，也不算完整 review evidence。
+
+#### Partial Result Preservation
+
+未被接受的 capped run 的：
+
+- result；
+- receipts；
+- workspace delta；
+- report receipt verdict；
+
+仍进入 Trace / EvidenceStore。
+
+但：
+
+- 不产生 normal success NodeHandoff；
+- 不解锁普通 downstream dependency；
+- retry / repair 可以显式消费 failure context。
+
+原则：
+
+> **Preserve partial work as evidence; do not silently promote partial execution to logical success.**
+
+---
 
 ### 9.9 WRITE Retry Safety
 
@@ -6247,6 +6427,10 @@ class NodeExecutionPolicy(BaseModel):
 
     contract_guard_rules: tuple[str, ...]
     post_node_invariants: tuple[str, ...]
+
+    # True only when every load-bearing Node acceptance obligation has a
+    # deterministic P1 checker.
+    deterministic_acceptance_complete: bool
 
     timeout_seconds: int
     max_turns: int
@@ -6885,11 +7069,20 @@ Completed? Verify Full Self-Report Receipt Citations
 Acceptance Check
 (bind to post-attempt revision)
    │
-   ├── holds → continue
-   └── fails / unverified → repair policy / fail
+   ▼
+Execution Completeness Gate
+   │
+   ├── CLEAN + acceptance/invariants satisfied
+   │     → logical success
+   │
+   ├── CAPPED_PARTIAL + complete deterministic proof
+   │     → success with EXECUTION_CAPPED_BUT_ACCEPTED
+   │
+   └── CAPPED_PARTIAL without complete proof
+         → retry / repair / fail according to mutation safety
    │
    ▼
-Create NodeHandoff
+Create NodeHandoff only for logically accepted attempt
 (bind to post-attempt revision)
    │
    ▼
@@ -9149,6 +9342,11 @@ Source Audit In Progress
 - run_id prefix 不是 authority，exact BindingStore entry 才是 authority。
 - physical WorkspaceAccess 与 semantic repository-mutation authority 分离；
 - VERIFICATION/REVIEW 等 READ_ONLY authority Node 可因 bash 获得 WRITE lock，但 Git-visible patch 必须保持不变；
+- DeerFlow backend `completed` 不等于 A-SWE logical success；
+- `completed + stop_reason` 映射为 `CAPPED_PARTIAL`；
+- capped partial 只有完整 deterministic acceptance + invariants 全通过时才可带 warning 接受；
+- mandatory REVIEW / 无 deterministic completeness proof 的 DISCOVERY capped run 不得静默成功；
+- 未接受的 capped partial 保留 evidence，但不产生 normal success Handoff。
 - BindingStore 横跨 Scheduler loop 与 DeerFlow isolated subagent loop，P1 使用 thread-safe 同步而非 loop-bound asyncio.Lock。
 
 新增 PoC：
@@ -9223,6 +9421,13 @@ Source Audit In Progress
 | POC-H65 | Tester 创建 non-ignored source file | RepositoryStateDigest 改变，fail closed |
 | POC-H66 | verifier 自身污染 repo | 不生成指向 writer 的 RepairFeedback |
 | POC-H67 | Reviewer/Discovery 意外改 repo | 同一 semantic mutation invariant fail closed |
+| POC-H68 | completed + turn_capped + 无 acceptance | logical Node 不成功；proven-clean READ 可 bounded retry |
+| POC-H69 | completed + token_capped + 全部 deterministic acceptance holds | success + EXECUTION_CAPPED_BUT_ACCEPTED warning |
+| POC-H70 | capped WRITE 已 mutation 且无完整 proof | 不 blind retry；fail closed |
+| POC-H71 | mandatory REVIEW + loop_capped | review gate unsatisfied |
+| POC-H72 | capped run 未被接受 | partial result/evidence 保留，但不生成 normal success Handoff |
+| POC-H73 | capped run acceptance 含 UNVERIFIED | 不允许提升为 success |
+| POC-H74 | capped clean retry | new attempt/evidence；Runtime 不自动提高 operator guard budget |
 
 ---
 
@@ -9368,6 +9573,7 @@ Executable TaskDAG
 - NodeAttemptRecord / NodeRuntimeState；
 - Retry / Repair / Reverify attempt state machine；
 - Cancellation；
+- ExecutionCompleteness / capped-partial logical acceptance gate；
 - Failure Propagation；
 - Result Aggregation；
 - Node Acceptance Gate；
@@ -9582,6 +9788,7 @@ Coder            exclusive WRITE
 38. 为什么 P1 不在 runtime 自动切换另一个 Provider？
 39. DeerFlow 的 one-AppConfig-snapshot 设计如何减少 TOCTOU？
 40. 为什么 Tester 可以获得 WRITE lock，却仍然不能修改 Git-visible Repository patch？
+41. 为什么 DeerFlow `completed + stop_reason` 不能直接映射为 A-SWE Node success？
 
 ### 21.4 代码掌握边界
 
