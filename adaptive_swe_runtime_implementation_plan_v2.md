@@ -2233,11 +2233,11 @@ execution replan only before first WRITE
 
 ### 5.1 核心设计原则
 
-A-SWE Runtime 将 Capability 作为 Runtime 的语义调度单位。
+A-SWE Runtime 将 Capability 作为 Runtime 的**语义调度词汇**。
 
-Capability 表示：
+Capability 只回答：
 
-> **一个 bounded work package 为完成目标所需要的能力。**
+> **一个 bounded work package 需要具备什么能力？**
 
 例如：
 
@@ -2253,49 +2253,73 @@ regression_testing
 code_review
 ```
 
-Agent、Skill 和 Tool 是 Capability Provider。
+一期必须避免让 Capability Registry 同时承担 Provider Registry 的职责。
 
-### 5.2 Capability 与 Capability Provider
+因此：
 
 ```text
-                     Capability
-                         │
-                         ▼
-                Capability Provider
-                         │
-          ┌──────────────┼──────────────┐
-          ▼              ▼              ▼
-        Agent           Skill           Tool
-                                         │
-                              ┌──────────┴──────────┐
-                              ▼                     ▼
-                        Built-in Tool            MCP Tool
+CapabilitySpec
+≠ eligible agent list
+≠ concrete tool list
+≠ skill allowlist
 ```
 
-该模型中：
+这些实现细节属于 Provider Contract。
 
-- Capability：WorkItem 需要做什么；
-- Agent：谁来执行；
-- Skill：执行时加载哪些 SOP / domain knowledge；
-- Tool：真正执行外部动作；
-- MCP：Tool 的一种外部接入来源，而不是 Capability 本身。
+### 5.2 P1 的 Provider 模型
 
-### 5.3 Capability Metadata
+一期只把：
 
-Capability 不只保存 provider mapping，还应保存 Plan Compiler 所需要的执行约束。
+> **AgentProvider**
 
-建议：
+作为可被 Scheduler / Team Builder 选择的 execution carrier。
+
+Tool 与 Skill 不再和 Agent 并列为“可调度 Capability Provider”。
+
+关系冻结为：
+
+```text
+WorkItem
+   │
+   ▼
+Required Capabilities
+   │
+   ▼
+AgentProvider
+   │
+   ├── CapabilityBinding
+   │       ├── required tools
+   │       ├── optional tools
+   │       └── preferred skills
+   │
+   └── DeerFlow Subagent
+```
+
+其中：
+
+- AgentProvider：真正承担一个 DAG Node 的执行主体；
+- Tool：Provider 完成 Capability 所依赖的 execution resource；
+- Skill：可选的 workflow / SOP / domain enhancement；
+- MCP：Tool 的外部接入机制，不是 Capability，也不是 P1 的独立 schedulable provider。
+
+未来如果需要 deterministic ToolNode，再单独增加：
+
+```text
+DirectToolProvider
+```
+
+但不进入 MVP。
+
+### 5.3 CapabilitySpec
+
+Capability Registry 只保存 provider-neutral semantic metadata：
 
 ```python
 class CapabilitySpec(BaseModel):
     id: str
     description: str
 
-    side_effect: Literal["read", "write"]
-
-    eligible_agents: list[str]
-    preferred_skills: list[str]
-    required_tools: list[str]
+    semantic_effect: Literal["read", "write"]
 
     default_acceptance_kind: str | None = None
 ```
@@ -2306,35 +2330,109 @@ class CapabilitySpec(BaseModel):
 capability:
   id: code_modification
   description: modify repository source code
-
-  side_effect: write
-
-  eligible_agents:
-    - coder
-
-  required_tools:
-    - read_file
-    - write_file
-    - str_replace
+  semantic_effect: write
 ```
 
-### 5.4 Capability / Tool Side-Effect Authority
+明确不保存：
 
-最终 `workspace_access` 不由 LLM 决定，也不能只从 Capability 的语义名称推断。
+```text
+eligible_agents
+required_tools
+preferred_skills
+```
+
+原因：
+
+> 同一 Capability 可以被不同 Provider 用不同 Tool / Skill 组合实现。
+
+例如：
+
+```text
+code_search
+
+Provider A
+→ grep + glob + read_file
+
+Provider B
+→ repository-search MCP tool
+```
+
+如果 concrete tools 写进 CapabilitySpec，会把“语义能力”错误绑定到一种实现。
+
+### 5.4 CapabilityBinding
+
+Provider 对自己支持的每个 Capability 声明实现契约：
+
+```python
+class CapabilityBinding(BaseModel):
+    capability_id: str
+
+    required_tools: tuple[str, ...] = ()
+    optional_tools: tuple[str, ...] = ()
+
+    preferred_skills: tuple[str, ...] = ()
+
+    notes: str | None = None
+```
+
+例如 Tester：
+
+```yaml
+capability: regression_testing
+
+required_tools:
+  - bash
+
+preferred_skills:
+  - pytest
+```
+
+Repo Explorer：
+
+```yaml
+capability: repo_exploration
+
+required_tools:
+  - ls
+  - glob
+  - grep
+  - read_file
+
+preferred_skills:
+  - repository-navigation
+```
+
+因此 authoritative resolution 变为：
+
+```text
+WorkItem Capability
+      ↓
+Candidate AgentProvider
+      ↓
+Provider CapabilityBinding
+      ↓
+Concrete Resource Requirements
+```
+
+### 5.5 Capability / Tool Side-Effect Authority
+
+最终 `workspace_access` 不由 LLM 决定，也不能只从 Capability 名称推断。
 
 必须同时考虑：
 
 ```text
 Capability Semantic Effect
 +
-Actual Required Tool Effect
+Selected Provider's CapabilityBinding
++
+Required Tool Effects
 +
 Backend / Sandbox Contract
         ↓
 Effective WorkspaceAccess
 ```
 
-Capability metadata 只提供 semantic lower bound：
+Capability semantic effect 只是 lower bound：
 
 ```text
 repo_exploration   → READ
@@ -2342,17 +2440,20 @@ code_search        → READ
 bug_diagnosis      → READ
 code_modification  → WRITE
 test_generation    → WRITE
-regression_testing → READ_HINT
+regression_testing → READ semantic intent
 code_review        → READ
 ```
 
-其中 `regression_testing → READ_HINT` 不能直接成为最终 READ。
+其中：
 
-原因：
+```text
+regression_testing + bash
+→ WRITE / exclusive
+```
 
-> DeerFlow 的 `bash` 是通用 shell execution；源码明确说明 local bash path validation **不实施 bash command write prevention**。测试命令可以生成 cache、coverage、snapshot、安装依赖，甚至修改源码。
+因为 DeerFlow `bash` 是通用 shell execution；pinned 源码明确说明 local bash path validation 不实施 bash-command write prevention。
 
-因此新增：
+ToolEffect：
 
 ```python
 class ToolEffect(str, Enum):
@@ -2371,11 +2472,11 @@ P1 保守分类：
 | `bash` | WORKSPACE_MUTATING |
 | 未声明 effect 的 MCP / Extension Tool | UNKNOWN |
 
-最终编译：
+最终：
 
 ```text
-all required tools provably READ_ONLY
-AND capability semantic effect is read
+semantic effect == READ
+AND all required execution resources are provably READ_ONLY
 → WorkspaceAccess.READ
 
 otherwise
@@ -2384,15 +2485,11 @@ otherwise
 
 即：
 
-> **MVP 只有“可证明只读”才获得 READ；未知或可写一律按 WRITE 调度。**
+> **MVP 只有“可证明只读”的 Node 才能并发读取 Workspace。**
 
-这意味着使用 `bash` 的 Tester / Verification Node 默认获得 Workspace 独占，而不是与其他 READ Node 并发。
+LLM 的 `effect_hint` 仍然只是 hint，可以更保守，但不能降低 Runtime 编译结果。
 
-后续若引入命令级 effect verifier 或真正的 read-only sandbox，可以再缩窄该保守策略。
-
-LLM 的 `effect_hint` 仍然只是 hint，可以更保守，但不能降低 Runtime 从 Capability / Tool Contract 编译出的权限。
-
-### 5.5 与 Plugin System 的边界
+### 5.6 与 Plugin / Extension System 的边界
 
 Capability-Centric Runtime 与“Everything is a Plugin”不是同一层概念。
 
@@ -2401,12 +2498,15 @@ Plugin / Extension System
 → 系统组件如何注册、加载、替换
 
 Capability System
-→ 当前 WorkItem 需要什么能力，应选择哪些 Provider
+→ 当前 WorkItem 需要什么语义能力
+
+Provider Contract
+→ 某个执行主体如何实现这些能力
 ```
 
-A-SWE 不重新实现底层 Plugin Framework。
+A-SWE 不重新实现 DeerFlow Plugin / Extension Framework。
 
-### 5.6 一期 Capability 范围
+### 5.7 一期 Capability 范围
 
 一期建议：
 
@@ -2428,7 +2528,7 @@ database_analysis
 architecture_analysis
 ```
 
-Repository clone / checkout / base SHA / final patch 不属于普通 Agent Capability，而属于 Workspace Runtime。
+Repository clone / checkout / base SHA / final patch 属于 Workspace Runtime，不属于普通 Agent Capability。
 
 ---
 
@@ -2436,20 +2536,26 @@ Repository clone / checkout / base SHA / final patch 不属于普通 Agent Capab
 
 ### 6.1 模块职责
 
-Capability Resolver 的 authoritative input 不再是 `TaskSpec.required_capabilities`，而是：
+Capability Resolver 的 authoritative input：
 
 ```text
 ValidatedWorkPlan
 +
 Capability Registry
 +
-Available Providers
+AgentProvider Registry
++
+BackendInventorySnapshot
++
+CompiledTaskContract
 ```
 
-对每一个 WorkItem 输出：
+对每一个 WorkItem 形成：
 
 ```text
-ResolvedWorkItemCapabilities
+ProviderAssignment
++
+NodeResourceRequirements
 ```
 
 ### 6.2 Node-Level Resolution
@@ -2469,9 +2575,131 @@ WorkItem: verify
 → regression_testing
 ```
 
-Resolver 输出候选 Agent / Skill / Tool 组合。
+Resolver 不再输出“Agent / Skill / Tool 三类 provider 组合”。
 
-### 6.3 Provider Selection
+它执行：
+
+```text
+Required Capabilities
+      ↓
+AgentProvider semantic coverage
+      ↓
+CapabilityBinding expansion
+      ↓
+Required / Optional Tools
+Preferred Skills
+      ↓
+Backend Preflight
+      ↓
+Provider Assignment
+```
+
+### 6.3 Backend Inventory Snapshot
+
+Compile-time 不能把 A-SWE Registry 中声明的 Tool 当成真实运行时事实。
+
+DeerFlow 的实际 Tool catalog 来自：
+
+- config-defined tools；
+- built-ins；
+- model-dependent tools；
+- MCP cache / personal MCP；
+- ACP；
+- plugin tools；
+- tool groups；
+- sandbox / host-bash availability。
+
+因此 DeerFlow Adapter 需要给 Core 提供 provider-neutral inventory snapshot：
+
+```python
+class BackendInventorySnapshot(BaseModel):
+    backend_id: str
+    captured_at: datetime
+
+    candidate_agent_types: frozenset[str]
+    candidate_tool_names: frozenset[str]
+    enabled_skill_names: frozenset[str]
+    configured_model_names: frozenset[str]
+
+    sandbox_features: frozenset[str]
+    max_parallel_executions: int
+
+    fingerprint: str
+```
+
+注意命名：
+
+> **candidate_tool_names，而不是 actual_bound_tools。**
+
+Inventory 只能回答：
+
+> 当前 deployment 看起来有没有这些资源？
+
+不能证明：
+
+> 当前用户、当前 Node 最终 assembly 后一定拿得到这些资源。
+
+因为后续还有：
+
+- operator SubagentConfig；
+- runtime authorization；
+- skill authorization；
+- dynamic MCP/config drift；
+- deferred-tool assembly；
+- middleware-declared tools。
+
+DeerFlow inventory 构建属于 Adapter；Core 不直接 import `deerflow.tools.get_available_tools`。
+
+### 6.4 Feasibility 分层
+
+A-SWE 不把“Provider 声明自己会做”直接等价为可执行。
+
+冻结四层状态：
+
+```text
+DECLARED
+→ ProviderContract 声明 semantic capability
+
+PREFLIGHT_FEASIBLE
+→ 当前 Backend inventory / static policy 看起来可执行
+
+ASSEMBLED_MATCH
+→ DeerFlow 实际 assembly 与 NodeExecutionPolicy 一致
+
+EXECUTED
+→ Node 真正执行并产生 evidence
+```
+
+因此：
+
+```text
+Declared Capability
+≠ Executable Capability
+≠ Successful Execution
+```
+
+### 6.5 Provider Preflight
+
+每个 Candidate AgentProvider 至少检查：
+
+1. required capability 是否都有 CapabilityBinding；
+2. binding.required_tools 是否存在于 backend candidate inventory；
+3. operator SubagentConfig 静态 allow / deny 是否允许这些 required tools；
+4. Sandbox / backend 是否支持 required execution primitive；
+5. TaskContract 是否禁止该 Tool / effect；
+6. resolved model 是否存在；
+7. authorization-enabled deployment 下，model 是否通过 Adapter 的 model-use preflight；
+8. 由 Capability + ToolEffect 编译后的 WorkspaceAccess 是否满足 Node policy。
+
+通过后才进入：
+
+```text
+PREFLIGHT_FEASIBLE
+```
+
+但 runtime authorization 仍可能在真正 assembly 时进一步收窄。
+
+### 6.6 Provider Selection
 
 一期：
 
@@ -2479,43 +2707,80 @@ Resolver 输出候选 Agent / Skill / Tool 组合。
 Required Capability
         │
         ▼
-Candidate Providers
+Semantic Coverage
         │
         ▼
-Availability Filter
+CapabilityBinding Expansion
         │
         ▼
-Compatibility / Permission Filter
+Backend Inventory Preflight
         │
         ▼
-Workspace / Tool Requirement Filter
+Static Operator Policy Check
         │
         ▼
-Priority / Estimated Cost Rule
+Contract / ToolEffect Compatibility
+        │
+        ▼
+Minimal / Priority Rule
         │
         ▼
 Provider Assignment
 ```
 
-不需要一期实现学习型成功率预测。
+不需要一期实现学习型 success probability。
 
-### 6.4 核心价值
+### 6.7 Single Source of Truth
 
-Capability Resolver 将：
-
-```text
-Work Package Semantics
-```
-
-与：
+Capability Registry 不维护：
 
 ```text
-具体 Agent / Skill / Tool
+eligible_agents
 ```
 
-解耦。
+AgentProvider Registry 才声明：
 
-因此 SemanticPlanner 不需要知道 Agent roster，Team Builder 也不需要重新理解任务语义。
+```text
+provider → capability bindings
+```
+
+若需要 capability → providers 的反向查询：
+
+```text
+Runtime derives reverse index
+```
+
+而不是维护双向配置。
+
+否则容易出现：
+
+```text
+Capability says Coder eligible
+AgentRegistry says Coder does not support capability
+```
+
+这种 drift。
+
+### 6.8 核心价值
+
+最终解耦成：
+
+```text
+SemanticPlanner
+→ bounded work semantics
+
+Capability Registry
+→ semantic vocabulary
+
+AgentProvider Contract
+→ implementation choice
+
+Backend Inventory
+→ current deployment preflight
+
+DeerFlow Assembly Attestation
+→ actual runtime evidence
+```
 
 ---
 
@@ -2643,20 +2908,28 @@ Team Builder 仍需记录：
 
 ### 8.1 一期选择目标
 
-在：
+Provider 只有进入：
 
 ```text
-Capability Coverage
-Risk Constraint
-Provider Compatibility
-Tool / Permission Availability
+PREFLIGHT_FEASIBLE
+```
+
+集合以后，才参与 Team Selection。
+
+然后在：
+
+```text
+WorkItem Capability Coverage
+Task / Contract Constraints
+Provider Static Compatibility
+Backend Preflight
 ```
 
 全部满足的前提下：
 
-> **选择最小可行 Provider Set。**
+> **选择最小可行 AgentProvider Set。**
 
-形式化表达：
+形式化：
 
 ```text
 Minimize:
@@ -2665,42 +2938,103 @@ Minimize:
 
 Subject to:
     WorkItemCapabilityCoverage == 100%
-    RiskConstraints == satisfied
-    ProviderCompatibility == satisfied
+    EveryAssignment == PREFLIGHT_FEASIBLE
+    ContractConstraints == satisfied
 ```
 
-### 8.2 一期不构造虚假 Success Probability
+### 8.2 Feasibility 先于 Ranking
+
+一期禁止这种逻辑：
+
+```text
+Provider A score higher
+但 required tool 缺失
+→ 仍然选 A
+```
+
+必须先做 hard feasibility filter，再做 ranking。
+
+```text
+All Providers
+      ↓
+Hard Feasibility
+      ↓
+Feasible Providers
+      ↓
+Priority / Cost
+      ↓
+Selection
+```
+
+### 8.3 一期不构造虚假 Success Probability
 
 一期没有足够历史数据可靠估计：
 
 ```text
-P(success | task, team)
+P(success | task, provider, repo)
 ```
 
 因此不使用形式复杂但无数据基础的模型。
 
-### 8.3 规则示例
+### 8.4 规则示例
 
 ```text
 低风险单文件修改
-且 Coder 覆盖全部所需 Capability
+且 Coder capability bindings 覆盖全部 required capabilities
+且 required tools preflight 可用
 → Team = {Coder}
 
-Diagnosis WorkItem 需要 repo_exploration + bug_diagnosis
-且 Coder profile 不满足
-→ 加入 Explorer
+Diagnosis 需要 repo_exploration + bug_diagnosis
+且 Coder 没有完整 binding
+→ Explorer 进入候选
 
 testing_required == true
-且没有现有 Provider 覆盖 regression_testing
-→ 加入 Tester
+→ 必须有 Provider 能覆盖 regression_testing
+→ 若其实现依赖 bash，则 Node workspace_access = WRITE
 
 risk == high
-→ Review WorkItem 必须有 Reviewer-compatible Provider
+→ Review WorkItem 必须有 code_review-compatible Provider
 ```
 
 注意：
 
-> Team Selection Rule 不负责决定这些 Provider 的先后关系。
+> Team Selection Rule 不负责决定 Provider 先后关系。
+
+### 8.5 Provider Reuse
+
+如果同一个 Provider 可以覆盖多个不同 WorkItem：
+
+```text
+Provider Count
+```
+
+只计算一次。
+
+但每个 Node 仍独立生成：
+
+```text
+NodeExecutionPolicy
+```
+
+因此：
+
+```text
+same Provider
+≠ same tool allowlist
+≠ same workspace access
+```
+
+例如同一个 Coder：
+
+```text
+Diagnosis Node
+→ read_file / grep only
+→ READ
+
+Implementation Node
+→ read_file / write_file / str_replace
+→ WRITE
+```
 
 ---
 
@@ -3033,87 +3367,291 @@ AND replan budget remains
 
 ### 9.12 Runtime Assembly Attestation
 
-Compile-time Provider feasibility 基于 A-SWE Provider Contract。
+Compile-time Provider feasibility 基于：
 
-但 DeerFlow 真正组装 Subagent 时还会执行：
+```text
+ProviderContract
++
+BackendInventorySnapshot
++
+Operator SubagentConfig
+```
+
+它只能达到：
+
+```text
+PREFLIGHT_FEASIBLE
+```
+
+DeerFlow 真正组装 Subagent 时还会执行：
 
 - `SubagentConfig.tools` allowlist；
 - `disallowed_tools` denylist；
 - runtime authorization filter；
 - Skill authorization；
 - MCP / deferred tool assembly；
+- middleware-declared tools；
+- model resolution；
 - Sandbox policy。
 
-因此实际 bound tools 可能被进一步收窄。
+因此真实 assembly 可能与 preflight 不同。
 
-DeerFlow `SubagentExecutor.assembly_descriptor` 在 assembly 后记录：
+#### Descriptor 不是默认白送
 
-- effective model；
-- authorization-filtered tools；
-- enabled skills；
-- effective policies；
-- assembly fingerprint。
+Pinned DeerFlow 中：
 
-A-SWE Adapter 在 Node 结果中记录 descriptor / fingerprint，并检查：
+```text
+SubagentExecutor.assembly_descriptor
+```
+
+默认是 `None`。
+
+只有当前 extension snapshot 中存在：
+
+```text
+AgentAssemblyObserver
+```
+
+时，`_describe_assembly()` 才会真正构建 descriptor。
+
+这是有意的性能优化，因为 descriptor 需要 hash：
+
+- tool descriptions；
+- tool JSON schemas；
+- middleware policy；
+- prompt；
+- skills；
+- model policies。
+
+因此 A-SWE 不能假设 descriptor 永远存在。
+
+#### A-SWE Attestation Extension
+
+好消息是 `AgentAssemblyObserver` 属于公开：
+
+```text
+deerflow_extension_api.ExtensionRegistry
+```
+
+contract。
+
+P1 增加一个极薄的 DeerFlow extension：
+
+```python
+@extension(api="0.2.0", name="a_swe_attestation")
+def install(registry, config):
+    registry.agent_assembly_observer(ASWEAssemblyObserver())
+```
+
+Observer 本身只做轻量记录即可。
+
+它的关键作用之一是让 DeerFlow 构建：
+
+```text
+AgentAssemblyDescriptor
+```
+
+随后 A-SWE Adapter 从**当前 SubagentExecutor 实例**读取：
+
+```text
+executor.assembly_descriptor
+```
+
+避免自行重建 assembly 描述。
+
+禁止：
+
+- subclass SubagentExecutor 只为取 assembly；
+- 直接调用 private `_describe_assembly()`；
+- 根据 prompt / config 猜 actual tools。
+
+#### AssemblyAttestation
+
+建议映射：
+
+```python
+class AssemblyAttestation(BaseModel):
+    provider_id: str
+    node_id: str
+
+    effective_model: str
+    actual_tool_names: frozenset[str]
+    enabled_skill_names: frozenset[str]
+
+    middleware_names: tuple[str, ...]
+    deferred_tool_names: frozenset[str]
+
+    backend_fingerprint: str
+
+    matches_node_policy: bool
+    diagnostics: list[str]
+```
+
+至少检查：
 
 ```text
 required_tools ⊆ actual_bound_tools
-required_skills ⊆ actual_enabled_skills  # when hard-required
 ```
 
-若不满足：
+以及：
+
+```text
+actual business tools
+⊆ effective node allowlist
+```
+
+同时可以检查：
+
+- expected Contract Guard middleware / policy 是否存在；
+- resolved model 是否符合 Node model policy；
+- expected runtime ceilings 是否进入 effective policies。
+
+Skill 只做 availability evidence：
+
+```text
+preferred_skills ⊆ enabled_skills
+→ informational / warning
+```
+
+不能把它当成 Skill was used 的证明。
+
+若 required tool 缺失：
 
 ```text
 PROVIDER_ASSEMBLY_MISMATCH
 ```
 
-Node 不得因为模型自报成功而被接受。
+Node 不得因为模型自报 completed 而被 A-SWE 接受。
 
-DeerFlow 的 `AgentAssemblyObserver` 是 fail-open notification hook，异常会被吞并记录，因此不能作为 execution safety gate。
+#### Attestation 不是 Security Gate
+
+DeerFlow 的 `AgentAssemblyObserver` 是 fail-open notification hook。
+
+同时 descriptor 是 Agent assembly 结束时产生，不能把它当成真正的 pre-execution authorization barrier。
+
+因此：
+
+```text
+Security / authority
+→ operator config narrowing
+→ runtime authorization
+→ ContractGuardrailProvider
+→ sandbox policy
+
+AssemblyAttestation
+→ runtime evidence
+→ compatibility / validity gate
+```
+
+即：
+
+> **Attestation 可以让 A-SWE 拒绝一个“不符合编译契约”的 Node 结果，但不能替代真正的执行前权限控制。**
 
 ### 9.13 Node-Scoped Least Privilege
 
-A-SWE 不应仅选择 Agent，然后让其继承一大包工具。
-
-ExecutionPlanValidator 生成：
+ExecutionPlanValidator 为每个 Node 编译独立 policy：
 
 ```python
 class NodeExecutionPolicy(BaseModel):
-    required_tools: list[str]
-    allowed_tools: list[str]
-    required_skills: list[str]
+    provider_id: str
+    required_capabilities: tuple[str, ...]
+
+    required_tools: tuple[str, ...]
+    optional_tools: tuple[str, ...]
+    allowed_tools: tuple[str, ...]
+    denied_tools: tuple[str, ...]
+
+    preferred_skills: tuple[str, ...]
 
     tool_effects: dict[str, ToolEffect]
     workspace_access: WorkspaceAccess
 
-    contract_guard_rules: list[str]
-    post_node_invariants: list[str]
+    model_policy: str
+
+    contract_guard_rules: tuple[str, ...]
+    post_node_invariants: tuple[str, ...]
 
     timeout_seconds: int
     max_turns: int
+
+    fingerprint: str
 ```
 
-Adapter 将 Node policy 映射成显式 `SubagentConfig.tools` allowlist。
+`allowed_tools` 是该 Node 的**最大业务工具集**，不是“建议工具”。
 
 例如 Recon Probe：
 
 ```text
+allowed:
 ls
 glob
 grep
 read_file
-```
 
-明确没有：
-
-```text
+denied:
 bash
 write_file
 str_replace
 task
 ```
 
-Runtime authorization 仍可进一步收窄，但不能由 A-SWE 绕过。
+#### Adapter 必须 Monotonic Narrowing
+
+不能：
+
+```text
+Node allowed_tools
+→ 直接覆盖 operator SubagentConfig.tools
+```
+
+必须：
+
+```text
+Operator allow
+∩ Node allow
+
+Operator deny
+∪ Node deny
+```
+
+然后 Runtime authorization 还可以继续收窄。
+
+因此：
+
+> **NodeExecutionPolicy 永远不能扩大 DeerFlow Operator 已经设置的权限。**
+
+#### Skill Narrowing
+
+Node 可以只开放：
+
+```text
+preferred_skills
+```
+
+作为 `SubagentConfig.skills` discoverability scope。
+
+如果 operator config 也有 Skill allowlist：
+
+```text
+Operator skill allow
+∩ Node skill allow
+```
+
+但 Skill 缺失在 P1 默认不导致 Provider hard failure。
+
+#### Runtime Ceiling Narrowing
+
+```text
+effective max_turns
+= min(operator max_turns, node max_turns)
+
+effective timeout
+= min(operator timeout, node timeout)
+```
+
+A-SWE 不能提高 operator ceiling。
+
+#### WorkspaceAccess
 
 对于使用 `bash` 的 Node：
 
@@ -3121,9 +3659,11 @@ Runtime authorization 仍可进一步收窄，但不能由 A-SWE 绕过。
 workspace_access = WRITE
 ```
 
-除非未来 Backend 明确提供“可证明只读”的 shell contract。
+除非未来 Backend 明确提供可证明 read-only 的 shell contract。
 
-Tester 可以拥有 `bash`，但在调度层不再被视为 READ Node。
+Tester 因此默认不会和普通 READ Explorer 并行共享可变 Workspace。
+
+---
 
 ### 9.14 Compiled Plan Descriptor / Fingerprint
 
@@ -3252,13 +3792,15 @@ A-SWE 不应把自身并行预算设置得高于 backend 实际 capacity。
 
 Capability Registry 定义：
 
-> 系统需要 / 拥有什么能力。
+> 系统使用什么语义能力词汇。
 
 Agent Registry 定义：
 
-> 哪些执行主体能够提供这些能力，以及该执行主体在 DeerFlow Execution Plane 中应被映射成怎样的 `SubagentConfig`。
+> 哪些 execution carrier 可以实现这些 Capability，以及每种实现需要哪些 execution resources。
 
-### 10.2 一期 Agent
+Agent Registry 不直接保存 DeerFlow runtime object。
+
+### 10.2 一期 AgentProvider
 
 一期只保留：
 
@@ -3269,82 +3811,256 @@ Tester
 Reviewer
 ```
 
-`SWE Lead` 作为 A-SWE Runtime Coordinator 的逻辑角色存在，不实现为一个负责自主 delegation 的长期 DeerFlow Lead Agent。
+`SWE Lead` 作为 A-SWE Runtime Coordinator 的逻辑角色存在，不实现为负责自主 delegation 的长期 DeerFlow Lead Agent。
 
-### 10.3 Agent Metadata
+### 10.3 Provider Contract
 
-```yaml
-agent:
-  id: repo_explorer
-  role: explorer
-
-capabilities:
-  - repo_exploration
-  - code_search
-  - dependency_analysis
-
-preferred_tools:
-  - search_code
-  - read_file
-  - git
-
-preferred_skills:
-  - repository_navigation
-
-workspace_access: read
-cost_class: low
-parallelizable: true
-```
-
-Tester：
-
-```yaml
-agent:
-  id: tester
-  role: tester
-
-capabilities:
-  - test_generation
-  - regression_testing
-  - failure_analysis
-
-preferred_tools:
-  - shell
-
-preferred_skills:
-  - pytest
-
-workspace_access: read
-```
-
-Coder 默认具有：
-
-```text
-workspace_access = write
-```
-
-Reviewer 默认只读。
-
-### 10.4 AgentProvider
-
-A-SWE 内部使用 `AgentProvider`，而不是直接持有 DeerFlow 对象：
+建议：
 
 ```python
 class AgentProvider(BaseModel):
     id: str
     role: str
-    capabilities: list[str]
 
-    tools: list[str]
-    skills: list[str]
-
-    workspace_access: WorkspaceAccess
-
-    backend: str = "deerflow"
+    backend: Literal["deerflow"] = "deerflow"
     backend_agent_type: str
+
+    capability_bindings: dict[str, CapabilityBinding]
+
+    model_policy: Literal["operator_config_or_inherit"] = "operator_config_or_inherit"
+
+    cost_class: Literal["low", "medium", "high"] = "medium"
+
+    fingerprint: str
 ```
 
-### 10.5 DeerFlow 映射
+明确不保存：
+
+```text
+workspace_access
+actual_tools
+actual_skills
+```
+
+原因：
+
+- workspace access 是 Node + selected binding + ToolEffect 的编译结果；
+- actual tools 只有 DeerFlow assembly 后才能知道；
+- Skill allowlist 只表示 discoverability，不表示实际 activation/use。
+
+### 10.4 Provider 示例
+
+Repo Explorer：
+
+```yaml
+provider:
+  id: repo_explorer
+  role: explorer
+  backend_agent_type: repo-explorer
+
+capability_bindings:
+  repo_exploration:
+    required_tools:
+      - ls
+      - glob
+      - grep
+      - read_file
+    preferred_skills:
+      - repository-navigation
+
+  code_search:
+    required_tools:
+      - grep
+      - read_file
+```
+
+Tester：
+
+```yaml
+provider:
+  id: tester
+  role: tester
+  backend_agent_type: tester
+
+capability_bindings:
+  regression_testing:
+    required_tools:
+      - bash
+    preferred_skills:
+      - pytest
+
+  test_generation:
+    required_tools:
+      - read_file
+      - write_file
+      - str_replace
+```
+
+注意：
+
+> Tester 不再静态声明 `workspace_access=read`。
+
+`regression_testing + bash` 会在 Node 编译阶段得到 `WorkspaceAccess.WRITE`。
+
+### 10.5 Operator Config 与 A-SWE Policy 的关系
+
+DeerFlow 的 `SubagentConfig.tools` 是 operator / deployment 侧的静态 allowlist。
+
+A-SWE Node policy 只能继续收窄它，不能扩权。
+
+正确关系：
+
+```text
+Operator SubagentConfig
+        ∩
+A-SWE Node Allowlist
+        ∩
+Runtime Authorization
+        ↓
+Actual Bound Tools
+```
+
+Adapter 的 monotonic narrowing：
+
+```python
+base = get_subagent_config(provider.backend_agent_type)
+
+if base.tools is None:
+    narrowed_allow = node_policy.allowed_tools
+else:
+    narrowed_allow = intersection(base.tools, node_policy.allowed_tools)
+
+narrowed_deny = union(
+    base.disallowed_tools,
+    node_policy.denied_tools,
+)
+
+if not required_tools <= (narrowed_allow - narrowed_deny):
+    raise ProviderStaticContractMismatch
+```
+
+实际实现必须保留稳定顺序，不要求用无序 set 直接输出。
+
+核心原则：
+
+> **A-SWE may narrow operator authority; it must never widen it.**
+
+同样：
+
+```text
+effective max_turns
+→ min(operator limit, node budget)
+
+effective timeout
+→ min(operator limit, node budget)
+```
+
+A-SWE 不应通过 Node policy 抬高 operator 已配置的 execution ceiling。
+
+### 10.6 Skill Contract
+
+Provider binding 中的：
+
+```text
+preferred_skills
+```
+
+一期表示：
+
+> 希望该 Skill 对此 Capability 可发现 / 可激活。
+
+不是：
+
+> 该 Skill 必须被实际加载后任务才算完成。
+
+因此 Skill 缺失默认：
+
+```text
+warning / lower preference
+```
+
+而不是 hard feasibility failure。
+
+如果未来确实需要：
+
+```text
+MUST_ACTIVATE skill X
+```
+
+必须单独定义 SkillRequirement，并验证 runtime skill-usage evidence；不能用 `enabled_skills` 冒充 activation 证据。
+
+### 10.7 Model Policy
+
+P1 的 AgentProvider 不自行指定高低模型，也不做 provider-level model routing。
+
+使用：
+
+```text
+operator-configured Subagent model
+or
+inherit runtime/default model
+```
+
+这样避免：
+
+```text
+Capability Resolver
+→ 顺便变成 Model Router
+```
+
+当前 pinned DeerFlow 有一个必须记录的 direct-executor compatibility boundary：
+
+- Lead Agent / DeerFlowClient 会显式执行 `model:use` authorization；
+- `SubagentExecutor` 自身直接 `create_chat_model(...)`；
+- `create_chat_model()` 不负责 model authorization。
+
+因此 A-SWE DeerFlow Adapter 在 authorization-enabled deployment 下必须进行：
+
+```text
+Resolved Model
+      ↓
+Model Authorization Preflight
+      ↓
+SubagentExecutor
+```
+
+P1 优先复用 DeerFlow 现有 model authorization semantics；若只能通过 pinned private helper `_authorize_model_name`，则必须封装在 Anti-Corruption Layer 并由 compatibility test 钉住，禁止 Core 直接 import。
+
+不复制一套独立 RBAC / fallback 逻辑。
+
+### 10.8 Provider Contract Fingerprint
+
+A-SWE 自己维护：
+
+```text
+ProviderContractFingerprint
+```
+
+绑定：
+
+- provider id / role；
+- backend agent type；
+- capability bindings；
+- required / optional tools；
+- preferred skills；
+- model policy；
+- runtime ceilings。
+
+最终 Trace 关联：
+
+```text
+ProviderContractFingerprint
+        ↓
+NodeExecutionPolicyFingerprint
+        ↓
+DeerFlowAssemblyFingerprint
+```
+
+从而区分：
+
+> 我声明了什么、我编译了什么、Backend 实际装配了什么。
+
+### 10.9 DeerFlow 映射
 
 执行时：
 
@@ -3352,30 +4068,43 @@ class AgentProvider(BaseModel):
 AgentProvider
      │
      ▼
+CapabilityBinding
+     │
+     ▼
+NodeExecutionPolicy
+     │
+     ▼
 DeerFlowExecutionBackend
      │
-     ▼
-SubagentConfig
-     │
-     ▼
-SubagentExecutor
+     ├─ load operator SubagentConfig
+     ├─ monotonic narrowing
+     ├─ model authorization preflight
+     └─ backend inventory / identity context
+             │
+             ▼
+      Effective SubagentConfig
+             │
+             ▼
+       SubagentExecutor
 ```
 
-A-SWE 的 Agent Registry 不直接实例化 LangGraph Agent，也不直接管理 Sandbox。
+A-SWE Agent Registry 不实例化 LangGraph Agent，也不管理 Sandbox。
 
-### 10.6 Agent Registry 不负责的事情
+### 10.10 Agent Registry 不负责
 
 Agent Registry 不负责：
 
 - DAG Scheduling；
 - Workspace Lock；
+- Backend resource discovery；
+- Runtime authorization；
 - Sandbox 生命周期；
 - Tool 实际执行；
 - Skill 文件加载；
 - MCP Session；
 - Evaluation。
 
-这些职责分别归 Scheduler、Workspace Runtime、Execution Backend 与 Evaluation 模块。
+这些职责分别归 Resolver / Backend Adapter / Scheduler / Workspace Runtime / Evaluation。
 
 ---
 
@@ -3427,57 +4156,140 @@ git
 
 ### 11.3 动态装配
 
+Skill 在 P1 是 Provider 的 optional execution enhancement。
+
 例如：
 
 ```text
-Task: Python Bug
+Capability: python_debugging
 
-Coder
+Coder CapabilityBinding
 +
-python-debugging
-+
-pytest
+preferred skill: python-debugging
 ```
+
+或者：
 
 ```text
-Task: Repository Exploration
+Capability: regression_testing
 
-Explorer
+Tester CapabilityBinding
 +
-repository-navigation
+preferred skill: pytest
 ```
+
+Adapter 可以将 Node 相关 Skill 收窄成 DeerFlow `SubagentConfig.skills` discoverability allowlist。
+
+但：
+
+> **allowlisted ≠ loaded ≠ used。**
 
 ### 11.4 Progressive Loading
 
-继续复用 Harness 已有 Progressive Loading 思路：
+继续复用 DeerFlow Harness 已有 Progressive Loading：
 
 ```text
 Skill Metadata
       ↓
-Capability Match
+Discovery
       ↓
-Load SKILL.md
+Model chooses to load / activate
       ↓
-Load Reference / Script on Demand
+SKILL.md
+      ↓
+Reference / Script on Demand
 ```
 
-避免一次性加载所有 Skill 内容。
+A-SWE 不自行实现 Skill Loader。
 
 ### 11.5 DeerFlow Direct Subagent 的 Skill Boundary
 
-DeerFlow 标准设计中，Lead Agent 通常拥有 thread-level `/mnt/skills` physical projection，Subagent 的 `skills` 配置主要限制：
+DeerFlow 标准设计中，Subagent 的 `skills` 配置主要限制：
 
 - Skill discovery；
 - Skill activation；
 - active skill 的 allowed-tools policy。
 
-A-SWE 一期直接使用 `SubagentExecutor`，不依赖 DeerFlow Lead Agent 进行自主 delegation，因此必须明确：
+它不是：
 
-> **Phase 1 的 Skill allowlist 是 capability / execution policy boundary，不宣称为每个 Subagent 独立的 filesystem security boundary。**
+```text
+eager skill loading list
+```
 
-这对面试型 MVP 不构成阻塞，但属于 Known Boundary。
+也不是：
 
-后续若需要多租户或强安全隔离，再单独设计 per-agent filesystem projection / sandbox isolation。
+```text
+per-subagent filesystem isolation declaration
+```
+
+A-SWE 一期直接使用 `SubagentExecutor`，因此必须明确：
+
+> **Phase 1 的 Skill allowlist 是 discoverability / activation policy，不宣称为每个 Subagent 独立的 filesystem security boundary。**
+
+### 11.6 Skill Availability 与 Skill Usage
+
+DeerFlow `AgentAssemblyDescriptor.enabled_skills` 只能证明：
+
+> 该 Skill 在 assembly 时处于可发现的 enabled set。
+
+不能证明：
+
+> Agent 真正加载 / 激活 / 采用了该 Skill。
+
+DeerFlow 对显式 skill activation 存在 server-owned usage metadata：
+
+```text
+skill_usage
+skill_usages
+```
+
+并包含 skill path / content hash / activation mode 等 evidence。
+
+但 P1 不把 Skill activation 设为普通 Node 的 hard feasibility requirement。
+
+因此：
+
+```text
+preferred skill missing
+→ warning
+
+preferred skill enabled but unused
+→ normal
+
+hard MUST_ACTIVATE skill
+→ P1 默认不支持
+```
+
+后续若增加 hard skill usage contract：
+
+```text
+SkillRequirement(MUST_ACTIVATE)
+      ↓
+Runtime skill-usage evidence
+      ↓
+content hash / activation provenance
+```
+
+而不是：
+
+```text
+enabled_skills contains X
+→ claim X was used
+```
+
+### 11.7 一期 Skills
+
+一期只建设或复用少量真正能提升执行质量的 Skill：
+
+```text
+repository-navigation
+python-debugging
+pytest
+code-review
+git
+```
+
+不以 Skill 数量作为项目复杂度指标。
 
 ---
 
@@ -4125,7 +4937,7 @@ a-swe-runtime/
 ├── capability/
 │   ├── registry.py
 │   ├── resolver.py
-│   ├── provider.py
+│   ├── bindings.py
 │   ├── tool_effects.py
 │   └── schema.py
 │
@@ -4141,7 +4953,9 @@ a-swe-runtime/
 │   └── retry.py
 │
 ├── agents/
-│   └── registry.py
+│   ├── registry.py
+│   ├── provider.py
+│   └── contract.py
 │
 ├── skills/
 │   ├── repository-navigation/
@@ -4166,7 +4980,12 @@ a-swe-runtime/
 │   └── deerflow/
 │       ├── backend.py
 │       ├── reasoning.py
+│       ├── inventory.py
+│       ├── preflight.py
+│       ├── model_auth.py
 │       ├── config_mapper.py
+│       ├── assembly_attestation.py
+│       ├── attestation_extension.py
 │       ├── result_mapper.py
 │       ├── acceptance_adapter.py
 │       ├── contract_guardrail.py
@@ -4308,6 +5127,26 @@ Minimal Team
 ```
 
 形成可解释、可实现的团队选择逻辑。
+
+### 17.3.1 Provider Feasibility Ladder
+
+A-SWE 不把 Registry 声明当成 execution truth。
+
+```text
+DECLARED
+   ↓
+PREFLIGHT_FEASIBLE
+   ↓
+ASSEMBLED_MATCH
+   ↓
+EXECUTED
+   ↓
+ACCEPTED / EVALUATED
+```
+
+这一分层让系统可以解释：
+
+> 一个 Agent“理论上会做”、当前部署“看起来能做”、运行时“实际拿到了什么”、以及最终“有没有做成”，是四个不同问题。
 
 ### 17.4 Workspace-Aware Task DAG Scheduling
 
@@ -4872,6 +5711,48 @@ Implementation PoC Pending
 
 ---
 
+#### P0-5：Capability / Provider Contract Audit
+
+状态：
+
+```text
+Architecture Audited
+Implementation PoC Pending
+```
+
+冻结结论：
+
+- Capability Registry 只保存 semantic vocabulary；
+- P1 只有 AgentProvider 是 schedulable execution provider；
+- Tool / Skill 是 AgentProvider 的 supporting resources；
+- concrete Tool requirement 从 Provider CapabilityBinding 产生，而不是写死在 CapabilitySpec；
+- Provider Registry 是 capability mapping 的 single source of truth；
+- BackendInventorySnapshot 只提供 compile-time candidate resource preflight；
+- `SubagentConfig.tools` 是 name-level allowlist，不是 actual-tool proof；
+- A-SWE Node policy 只能 intersection / union 式继续收窄 operator SubagentConfig；
+- A-SWE 不允许通过 Node policy 抬高 operator max_turns / timeout；
+- Skill allowlist 只代表 discovery / activation scope，enabled skill 不等于 skill was used；
+- Skill 在 P1 默认 optional enhancement，不参与 hard feasibility；
+- DeerFlow AssemblyDescriptor 是 runtime evidence，不是默认存在；
+- A-SWE 通过公开 AgentAssemblyObserver extension 开启 descriptor generation；
+- AssemblyAttestation 是 compatibility / validity gate，不替代 authorization；
+- direct SubagentExecutor 的 model authorization 需要 Adapter 显式 preflight；
+- private DeerFlow model helper 若被复用，只能封装在 ACL 并用 pinned compatibility tests 保护。
+
+新增 PoC：
+
+| PoC | 测试内容 | 必须验证 |
+|---|---|---|
+| POC-27 | operator tools ∩ A-SWE Node tools | A-SWE 不会扩大 SubagentConfig 权限 |
+| POC-28 | Provider 声明 required tool 但 backend inventory 缺失 | preflight fail，不进入 Team |
+| POC-29 | 安装 A-SWE assembly observer | executor.assembly_descriptor 非空且 fingerprint 可读取 |
+| POC-30 | runtime authorization 移除 required tool | assembly mismatch 被 A-SWE 检出 |
+| POC-31 | preferred skill enabled 但未 activation | 不误报 skill-used，也不把 Node 判失败 |
+| POC-32 | authorization deny resolved model | direct-executor Adapter 在 LLM 调用前按 DeerFlow policy fail/fallback |
+| POC-33 | ordinary DeerFlow run | A-SWE attestation extension 不改变普通 Agent execution semantics |
+
+---
+
 ### Phase 1：Adaptive SWE Runtime MVP
 
 这是当前唯一必须完成的产品阶段。
@@ -4945,10 +5826,14 @@ ValidatedWorkPlan
 
 完成：
 
-- Capability Metadata；
+- provider-neutral CapabilitySpec；
+- CapabilityBinding；
 - Node-Level Capability Resolver；
 - Agent Registry；
-- AgentProvider；
+- AgentProvider / ProviderContract；
+- BackendInventorySnapshot；
+- Provider preflight feasibility；
+- ProviderContract fingerprint；
 - Minimal Feasible Team Policy；
 - TeamSpec（roster only）；
 - NodeHandoff schema；
@@ -4978,6 +5863,11 @@ Executable TaskDAG
 - WRITE / UNKNOWN-MUTATING Exclusive Execution；
 - ContractGuardrailProvider integration；
 - Pre-tool constraint guard；
+- monotonic SubagentConfig narrowing；
+- model authorization preflight；
+- A-SWE AgentAssemblyObserver extension；
+- DeerFlow AssemblyAttestation；
+- PROVIDER_ASSEMBLY_MISMATCH classification；
 - Post-node Git-aware contract invariant；
 - Retry；
 - Cancellation；
@@ -5171,6 +6061,14 @@ Coder            exclusive WRITE
 19. Evaluation 为什么优先使用确定性检查？
 20. Direct Subagent 的 Skill projection 有什么已知边界？
 21. 为什么一期限制 Local Sandbox / Local AIO，而不直接承诺 Remote Sandbox？
+22. 为什么 CapabilitySpec 不直接保存 required_tools / eligible_agents？
+23. CapabilityBinding 为什么属于 Provider，而不是 Capability？
+24. Backend Inventory 与 DeerFlow Assembly Attestation 有什么区别？
+25. 为什么 SubagentConfig.tools 不能当作实际 Tool 可用性证明？
+26. A-SWE 如何保证 Node policy 不扩大 operator SubagentConfig 权限？
+27. enabled skill 与 skill activation / usage 有什么区别？
+28. 为什么 AssemblyObserver 不能作为 execution safety gate？
+29. direct SubagentExecutor 的 model authorization 边界是什么？
 
 ### 21.4 代码掌握边界
 
@@ -5188,6 +6086,10 @@ Scheduler
 Execution Trace
 Evaluation
 DeerFlowExecutionBackend
+BackendInventory / ProviderPreflight
+SubagentConfig Narrowing
+AssemblyAttestation
+ContractGuardrailProvider
 Acceptance Adapter
 Result Mapper
 ```
@@ -5214,7 +6116,7 @@ Tool Receipt 如何进入节点证据
 
 ```text
 A-SWE:
-Task → Capability → Team → DAG → Scheduling → Evaluation
+Task → Contract → Capability → Provider Preflight → Team → DAG → Scheduling → Evaluation
 
 DeerFlow:
 Subagent → Skill / Tool / MCP → Sandbox → Execution Evidence
