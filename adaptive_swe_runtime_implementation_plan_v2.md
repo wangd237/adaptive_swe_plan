@@ -3400,21 +3400,28 @@ LLM merge
 
 Repair 不复用普通 success handoff 语义。
 
-Verification failure 产生：
+Repair feedback 使用 9.10 定义的 typed `RepairFeedback`，并绑定：
 
-```python
-class RepairFeedback(BaseModel):
-    failed_verification_node_id: str
-    target_write_node_id: str
-
-    observed_workspace_revision: WorkspaceRevision
-
-    deterministic_failures: tuple[str, ...]
-    verification_result: EvidenceRef | None
-    receipt_refs: tuple[ReceiptRef, ...]
-
-    verifier_report: str | None  # untrusted if model-authored
+```text
+trigger source node / execution / attempt
+target write node / previous attempt
+current observed WorkspaceRevision
+deterministic failure evidence
 ```
+
+它既可来自：
+
+```text
+write-node own AcceptanceFailure
+```
+
+也可来自：
+
+```text
+downstream deterministic VERIFICATION failure
+```
+
+但 P1 只允许唯一 target writer。
 
 Repair attempt 输入：
 
@@ -5013,6 +5020,8 @@ class TaskNode(BaseModel):
     status: NodeStatus
 ```
 
+实现时建议进一步将 mutable `status` 从 immutable TaskNode schema 移入 `NodeRuntimeState`；TaskNode 本体作为 plan artifact 不承担 attempt lifecycle。
+
 ### 9.3 Side-Effect Compilation
 
 `workspace_access` 由 Runtime 根据：
@@ -5344,7 +5353,8 @@ Scheduler 不负责 Task decomposition。
 - WRITE exclusivity；
 - Node status tracking；
 - retry classification；
-- bounded repair；
+- NodeRuntimeState / attempt lifecycle；
+- bounded repair / reverify；
 - cancellation；
 - failure propagation；
 - acceptance gate；
@@ -5422,38 +5432,218 @@ OR attribution truncated / unknown
 
 ```text
 Retry
-→ 同一个 Node 因 transient execution fault 再执行
+→ 同一个逻辑 Node 因 transient execution fault 再执行
+→ 前一 attempt 必须 proven-clean / 无 Workspace mutation
 
 Repair
-→ 下游 acceptance / verification 提供了新 evidence，
-  让 upstream WRITE Node 修正已有 patch
+→ acceptance / downstream verification 提供新 deterministic evidence
+→ 在当前 mutated Workspace 上对原 WRITE objective 做 bounded amendment
 ```
+
+二者都不创建新的语义 WorkItem，也不改 TaskDAG topology。
+
+#### Immutable TaskNode + Mutable NodeRuntimeState
+
+P1 冻结：
+
+> **TaskNode / TaskDAG 是编译产物，执行期不原地改 objective / capability / provider / dependency。**
+
+运行状态单独保存：
+
+```python
+class NodeAttemptKind(str, Enum):
+    INITIAL = "initial"
+    RETRY = "retry"
+    REPAIR = "repair"
+    REVERIFY = "reverify"
+
+class NodeAttemptRecord(BaseModel):
+    node_id: str
+    attempt: int
+    kind: NodeAttemptKind
+
+    execution_id: str
+
+    pre_workspace_revision: WorkspaceRevision
+    post_workspace_revision: WorkspaceRevision | None
+
+    status: str
+    failure_kind: str | None
+
+    evidence_refs: tuple[EvidenceRef, ...] = ()
+
+class NodeRuntimeState(BaseModel):
+    node_id: str
+    logical_status: str
+
+    next_attempt: int
+    repair_count: int
+
+    attempts: tuple[NodeAttemptRecord, ...]
+```
+
+因此：
+
+```text
+same TaskNode
+→ attempt 1 INITIAL
+→ attempt 2 RETRY or REPAIR
+```
+
+而不是生成：
+
+```text
+implement
+implement_repair_1
+implement_repair_2
+```
+
+这种动态 DAG 节点。
+
+#### Retry Semantics
+
+Retry：
+
+- objective 不变；
+- ProviderAssignment 不变；
+- compiled NodeExecutionPolicy 不变；
+- live `prepare_node()` 仍重新做 backend revalidation；
+- 只允许上一 attempt 为 transient failure 且 Workspace delta proven-clean；
+- 新 execution_id；
+- 新 attempt number；
+- 所有 evidence 重新生成，绝不沿用前一 attempt acceptance / receipt verdict。
+
+#### Repair Semantics
+
+Repair 是**同一 Write TaskNode 的新 attempt**，但输入额外携带 typed `RepairFeedback`。
+
+保持不变：
+
+```text
+TaskNode.id
+objective
+required_capabilities
+provider_id
+compiled NodeExecutionPolicy authority ceiling
+dependencies
+```
+
+允许变化：
+
+```text
+attempt execution_id
+live narrowed effective policy
+current WorkspaceRevision
+RepairFeedback
+dependency evidence staleness projection
+```
+
+Repair 不允许：
+
+- 换 Provider；
+- 增加 Capability；
+- 扩大 Tool authority；
+- 改写原 objective；
+- 创建任意新 dependency；
+- 回滚到 pre-attempt state。
+
+如果修复确实需要这些变化，P1 视为：
+
+```text
+PLAN_INVALIDATED / requires explicit replan
+```
+
+而 WRITE 之后 arbitrary replan 已关闭，因此默认 fail / restart-from-baseline。
+
+#### Repair Trigger
+
+P1 只允许：
+
+```text
+A. mutated WRITE Node own AcceptanceFailure
+B. downstream deterministic VERIFICATION failure
+   且可以唯一绑定到 single target WRITE Node
+```
+
+不允许：
+
+- 纯 model reviewer opinion 自动触发 patch repair；
+- 多 writer 情况下猜测“哪个 writer 导致测试失败”；
+- UNVERIFIED 当作 deterministic failure 自动修代码。
+
+`RepairFeedback` 增加 trigger ownership：
+
+```python
+class RepairTriggerKind(str, Enum):
+    NODE_ACCEPTANCE = "node_acceptance"
+    DOWNSTREAM_VERIFICATION = "downstream_verification"
+
+class RepairFeedback(BaseModel):
+    trigger_kind: RepairTriggerKind
+
+    feedback_source_node_id: str
+    feedback_source_execution_id: str
+    feedback_source_attempt: int
+
+    target_write_node_id: str
+    target_write_attempt: int
+
+    observed_workspace_revision: WorkspaceRevision
+
+    deterministic_failures: tuple[str, ...]
+    verification_result: EvidenceRef | None
+    acceptance_verdict: EvidenceRef | None
+    receipt_refs: tuple[ReceiptRef, ...]
+
+    verifier_report: str | None
+```
+
+#### Repair Loop
 
 典型闭环：
 
 ```text
-Implement
-   ↓
-Verify
-   │
-   └─ tests fail
-        ↓
-Repair Implement with failure handoff
-        ↓
-Verify again
+Implement attempt 1
+      ↓
+post revision R1
+      ↓
+Verify attempt 1
+      ↓
+deterministic failure @ R1/R2
+      ↓
+RepairFeedback
+      ↓
+Implement attempt 2 (REPAIR)
+on CURRENT workspace revision
+      ↓
+post revision R3
+      ↓
+Verify attempt 2 (REVERIFY)
+      ↓
+fresh verdict only
 ```
 
-MVP 推荐：
+若 Verification 自身因 physical WRITE class 产生非业务生成文件并推进 revision，Repair 仍从**当前 revision**开始；不会假装回到 Implement attempt 1 的 post revision。
+
+#### Reverify Semantics
+
+Repair 成功后：
+
+- downstream VERIFICATION Node 使用同一个 immutable TaskNode；
+- 新 attempt kind = `REVERIFY`；
+- 原 verification attempt evidence 保留在 Trace；
+- 旧 verification verdict 不进入新 success Handoff；
+- Reviewer 若依赖 verification，只能消费最新 accepted verification attempt。
+
+MVP：
 
 ```text
 max_repairs_per_write = 1
 ```
 
-Repair 不创建任意新 DAG topology，而是静态 DAG 上的 bounded attempt state machine。
-
 优先只支持：
 
-> **single-writer → deterministic verification failure → repair → reverify**
+> **single-writer → deterministic failure → repair → reverify**
 
 多 Writer repair、任意 rollback、Reviewer-only feedback 自动修复暂不做。
 
@@ -8527,6 +8717,10 @@ Source Audit In Progress
 - EvidenceRef 是 persistence reference，HandoffEvidenceProjection 才是模型消费视图；
 - state-dependent evidence 按 WorkspaceRevision 标记 CURRENT / HISTORICAL；
 - historical acceptance / verification 不得渲染成 current-state proof；
+- Repair 是 immutable Write TaskNode 的新 attempt，不是动态新增 DAG Node；
+- Retry 与 Repair 共享 attempt ledger，但触发条件完全不同；
+- repair/reverify 全部生成 fresh execution/evidence，旧 verdict 只保留 Trace；
+- P1 repair 只支持 deterministic failure + unique single writer target；
 
 新增 PoC：
 
@@ -8578,6 +8772,12 @@ Source Audit In Progress
 | POC-H43 | 完整 pytest log 很大 | 默认 Handoff 只渲染 bounded verification summary + EvidenceRef |
 | POC-H44 | criterion 含换行/伪造 checklist | projection collapse + neutralize，不能伪造 Runtime verdict line |
 | POC-H45 | receipt evidence stale by workspace revision | 保留“调用曾发生”事实，但不升级为 current-state proof |
+| POC-H46 | transient clean WRITE failure | 同 Node 新 RETRY attempt；DAG 不变 |
+| POC-H47 | own acceptance failure after mutation | 同 Write Node 新 REPAIR attempt，current revision 不回滚 |
+| POC-H48 | downstream verification fail | RepairFeedback 精确绑定 source attempt + target writer attempt |
+| POC-H49 | repair succeeded | Verification 同 Node 以 REVERIFY 新 attempt 执行，旧 verdict 不复用 |
+| POC-H50 | 两个 writer 都可能致因 | P1 不自动 repair，fail / explicit restart path |
+| POC-H51 | repair 需要额外 Tool/Capability | 不扩权，判 plan invalidated / unsupported repair |
 
 ---
 
@@ -8719,7 +8919,8 @@ Executable TaskDAG
 - DeerFlow AssemblyAttestation；
 - PROVIDER_ASSEMBLY_MISMATCH classification；
 - Post-node Git-aware contract invariant；
-- Retry；
+- NodeAttemptRecord / NodeRuntimeState；
+- Retry / Repair / Reverify attempt state machine；
 - Cancellation；
 - Failure Propagation；
 - Result Aggregation；
