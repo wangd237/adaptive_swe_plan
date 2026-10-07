@@ -6813,8 +6813,8 @@ Cancelled
 | capped partial + complete deterministic proof | accept with `EXECUTION_CAPPED_BUT_ACCEPTED` warning |
 | capped partial + no complete proof + proven-clean READ | bounded retry / fail |
 | capped partial + dirty/unknown WRITE | no blind retry；deterministic repair evidence exists 才 repair，否则 fail closed |
-| WRITE failure 且无 workspace change | bounded retry |
-| WRITE failure 且已有/无法排除 workspace change | publish dirty post revision，然后 fail closed |
+| WRITE failure 且 `mutation_evidence == PROVEN_NONE` | bounded retry candidate |
+| WRITE failure 且 `mutation_evidence == OBSERVED / UNKNOWN` | publish dirty/advanced post revision，然后 fail closed |
 | acceptance does-not-hold | repair unmet condition / fail |
 | verification test failure | bounded upstream repair，再 verify |
 | review decision = REQUEST_CHANGES | REVIEW_GATE_REJECTED；保留 findings；P1 不自动 semantic repair |
@@ -6981,17 +6981,16 @@ DeerFlow `workspace_changes` snapshot 适合作为 evidence / diff，不是通�
 失败后：
 
 ```text
-complete before/after attribution
-AND no workspace change
+mutation_evidence == PROVEN_NONE
 → retry may be allowed
 
-observed workspace change
-OR attribution truncated / unknown
+mutation_evidence == OBSERVED
+OR mutation_evidence == UNKNOWN
 → DIRTY_WRITE_FAILURE
 → no automatic retry in MVP
 ```
 
-因此“无修改可安全重试”必须是**可证明的 clean delta**，不是“snapshot 没列出文件”。
+因此“无修改可安全重试”必须满足冻结的 `PROVEN_NONE` predicate，而不是“snapshot 没列出文件”。
 
 后续若实现真正的 Git/worktree checkpoint，再开放 dirty-write rollback + retry。
 
@@ -7008,6 +7007,151 @@ Repair
 ```
 
 二者都不创建新的语义 WorkItem，也不改 TaskDAG topology。
+
+#### Logical Node State 与 Dependency Satisfaction
+
+P1 必须区分：
+
+```text
+Attempt Outcome
+vs
+Logical Node Status
+```
+
+一次 attempt 失败后，如果 Runtime 已合法选择：
+
+```text
+RETRY
+REPAIR
+REVERIFY
+```
+
+则 Node **尚未 terminal FAILED**，而进入：
+
+```text
+REMEDIATION_PENDING
+```
+
+只有：
+
+- 没有合法 remediation transition；
+- remediation budget 耗尽；
+- policy / dirty-state / invariant 要求 fail closed；
+
+才进入最终：
+
+```text
+FAILED
+```
+
+普通 DAG dependency edge 的 ready predicate 冻结为：
+
+```text
+for every upstream dependency U:
+
+U.logical_status == SUCCEEDED
+AND U.accepted_attempt is not None
+AND U.accepted_handoff resolves successfully
+AND accepted_handoff belongs to U.accepted_attempt
+AND Handoff / evidence satisfies current revision-staleness rules
+```
+
+因此：
+
+| Upstream logical state | Ordinary downstream |
+|---|---|
+| PENDING / READY / RUNNING | 保持 PENDING |
+| REMEDIATION_PENDING | 保持 PENDING；不能消费旧 success handoff |
+| SUCCEEDED | 满足 handoff/revision gate 后才可 READY |
+| FAILED | BLOCKED |
+| BLOCKED | BLOCKED，记录 root blockers |
+| CANCELLED | local cancel → BLOCKED；task-wide cancel → CANCELLED |
+
+P1 不把失败处理建模成普通 failure-edge DAG：
+
+```text
+Writer FAILED → Repair Node
+```
+
+Repair / Retry / Reverify 是 Scheduler 对**原 immutable TaskNode**的 attempt transition，不创建新语义节点。
+
+#### Accepted Handoff Single-Owner Rule
+
+同一 Node 任意时刻最多只有一个：
+
+```text
+accepted_attempt
+accepted_handoff
+```
+
+能够满足普通 downstream dependency。
+
+当已 SUCCEEDED 的 Writer 因 downstream deterministic verification failure 被重新打开进入 REPAIR：
+
+1. Writer 从 `SUCCEEDED` → `REMEDIATION_PENDING`；
+2. 原 `accepted_handoff` 立即标记 HISTORICAL / 不再满足 ordinary dependency；
+3. 新 Repair attempt 基于 current WorkspaceRevision 执行；
+4. Repair 成功后产生新的 accepted attempt/handoff；
+5. Verification 使用 REVERIFY attempt 重新验证；
+6. 只有最新 verification accepted attempt 才能继续解锁 Review / final downstream。
+
+这防止：
+
+```text
+Writer attempt 1 succeeded
+→ Reviewer/consumer keeps running on H1
+while
+Writer attempt 2 is repairing the same workspace
+```
+
+#### Repair Reopen Safety Gate
+
+由于 P1 不实现 arbitrary DAG rollback / descendant invalidation，已成功 Writer 只能在满足以下条件时被 verification-triggered Repair 重新打开：
+
+```text
+single target WRITE Node uniquely identified
+AND repair budget remains
+AND target's mutation authority permits repair
+AND no ordinary non-verification descendant has already committed
+    a logical success that depends on the target's currently accepted Handoff
+AND no later business WRITE has made target repair ownership ambiguous
+```
+
+否则：
+
+```text
+REPAIR_SCOPE_INVALIDATED
+→ fail closed / restart-from-baseline
+```
+
+mandatory phase ordering通常使：
+
+```text
+IMPLEMENTATION → VERIFICATION → REVIEW
+```
+
+天然满足这个条件；但 Runtime 仍必须检查，不能仅靠 prompt/plan 假设。
+
+#### Failure Propagation Root Cause
+
+BLOCKED Node 自身不是新的业务失败根因。
+
+它必须记录：
+
+```text
+blocked_by = terminal upstream node ids
+root_failure_refs = upstream failure evidence refs
+```
+
+最终 Task Result 聚合时：
+
+- 首先报告 root terminal failures；
+- blocked descendants 作为 propagation consequence；
+- 不把 10 个 BLOCKED descendants 统计成 10 个独立 Agent failures。
+
+原则：
+
+> **A failed attempt may be remediable; a failed logical node blocks the DAG.**
 
 #### Immutable TaskNode + Mutable NodeRuntimeState
 
@@ -7039,12 +7183,34 @@ class NodeAttemptRecord(BaseModel):
 
     evidence_refs: tuple[EvidenceRef, ...] = ()
 
+class NodeLogicalStatus(str, Enum):
+    PENDING = "pending"
+    READY = "ready"
+    RUNNING = "running"
+
+    # Previous attempt did not establish terminal success/failure because
+    # a bounded retry / repair / reverify transition is active.
+    REMEDIATION_PENDING = "remediation_pending"
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+    CANCELLED = "cancelled"
+
 class NodeRuntimeState(BaseModel):
     node_id: str
-    logical_status: str
+    logical_status: NodeLogicalStatus
 
     next_attempt: int
     repair_count: int
+
+    # Only the currently accepted logical-success attempt may own a normal
+    # downstream handoff.
+    accepted_attempt: int | None = None
+    accepted_handoff: EvidenceRef | None = None
+
+    terminal_failure_kind: str | None = None
+    blocked_by: tuple[str, ...] = ()
 
     attempts: tuple[NodeAttemptRecord, ...]
 ```
@@ -7075,7 +7241,7 @@ Retry：
 - ProviderAssignment 不变；
 - compiled NodeExecutionPolicy 不变；
 - live `prepare_node()` 仍重新做 backend revalidation；
-- 只允许上一 attempt 为 transient failure 且 Workspace delta proven-clean；
+- 只允许上一 attempt 属于 RetryPolicy 允许的 transient/capped-clean class，且 `mutation_evidence == PROVEN_NONE`；
 - 新 execution_id；
 - 新 attempt number；
 - 所有 evidence 重新生成，绝不沿用前一 attempt acceptance / receipt verdict。
@@ -7137,6 +7303,8 @@ B. downstream deterministic VERIFICATION failure
 - 纯 model reviewer opinion 自动触发 patch repair；
 - 多 writer 情况下猜测“哪个 writer 导致测试失败”；
 - UNVERIFIED 当作 deterministic failure 自动修代码。
+- 已有普通 downstream logical success 消费旧 Writer Handoff 后再静默 reopen Writer；
+- later business WRITE 已让 single-writer ownership 失效时继续自动 Repair。
 
 `RepairFeedback` 增加 trigger ownership：
 
@@ -10574,6 +10742,10 @@ Source Audit In Progress
 - DeerFlow sandbox-backed sync work通过 shield + drain 防止 worker outlive execution holder；
 - A-SWE quiescence join 可以作为 core sandbox tool 的 workspace-lock release fence；
 - external MCP/plugin/custom side effect 不继承该保证，默认不参与 automatic clean retry。
+- Attempt failure 与 Logical Node failure 分离；有合法 remediation 时 Node=REMEDIATION_PENDING；
+- ordinary dependency 只由当前 SUCCEEDED + accepted_attempt/handoff 满足；
+- Writer reopen for Repair 会立即撤销旧 accepted handoff 的 dependency authority；
+- P1 不支持已提交普通 downstream success 后的隐式 descendant rollback；此时 Repair scope invalidated。
 
 审计目标：
 
@@ -10625,6 +10797,13 @@ P0-7 新增 PoC：
 | POC-R13 | cancelled sandbox bash 内部 worker 延迟退出 | completion join 在 worker drain / lease cleanup 完成后才返回 |
 | POC-R14 | admitted EXTERNAL_SIDE_EFFECT tool 后 execution failure | 即使 workspace 无变化也不判 PROVEN_NONE / 不自动 retry |
 | POC-R15 | ordinary core read-only sandbox Node cancellation | quiescence 后无 executor-owned late workspace worker |
+| POC-R16 | attempt transient fail 且 retry budget exists | Node=REMEDIATION_PENDING，下游保持 PENDING 而非 BLOCKED |
+| POC-R17 | retry budget耗尽 | Node=FAILED，ordinary descendants 转 BLOCKED |
+| POC-R18 | Writer SUCCEEDED 后 verification triggers repair | old accepted_handoff 立即失效；Reviewer 不可提前 READY |
+| POC-R19 | Writer 已被普通 downstream SUCCEEDED 消费后再触发 repair | REPAIR_SCOPE_INVALIDATED，P1 fail closed |
+| POC-R20 | upstream FAILED 有多层 descendants | descendants BLOCKED，但 Task aggregation 只保留 root failure ownership |
+| POC-R21 | local node cancellation | node=CANCELLED；ordinary descendants BLOCKED |
+| POC-R22 | task-wide cancellation | running nodes cancel+join；未运行 descendants=CANCELLED，不误标 business failure |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
