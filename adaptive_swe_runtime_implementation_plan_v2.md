@@ -547,6 +547,142 @@ P1 规则：
 
 > **Unknown mutation state is treated as dirty for retry safety and stale-context invalidation.**
 
+### 3.2.3 RepositoryStateDigest 与 Semantic Mutation Invariant
+
+`WorkspaceAccess.WRITE` 只表示：
+
+> 该 Node 的物理工具可能修改共享 Workspace，因此需要 exclusive scheduling。
+
+它不自动授予：
+
+> 修改 Repository patch 的业务权限。
+
+典型：
+
+```text
+VERIFICATION
+CapabilityAuthorityClass = READ_ONLY
+Tool = bash
+WorkspaceAccess = WRITE
+```
+
+Tester 可以运行 pytest，但不能因为拥有 shell 就顺手修改源码让测试通过。
+
+P1 增加 deterministic：
+
+```python
+class RepositoryStateDigest(BaseModel):
+    base_sha: str
+    head_sha: str
+
+    tracked_state_hash: str
+    untracked_nonignored_hash: str
+
+    changed_paths: tuple[str, ...]
+
+    fingerprint: str
+```
+
+Digest 表达当前 **Git-visible Repository working state**，不复制完整 patch。
+
+构建至少覆盖：
+
+- `HEAD`；
+- tracked working-tree/index relevant state；
+- non-ignored untracked paths/content identity；
+- canonical path ordering。
+
+它与 WorkspaceRevision 不同：
+
+```text
+WorkspaceRevision
+→ 共享 Workspace 的物理状态版本
+→ cache/build artifact 变化也可能推进
+
+RepositoryStateDigest
+→ Git-visible business patch state
+→ 用于 semantic repository-mutation authority
+```
+
+#### READ_ONLY Semantic Authority Invariant
+
+对：
+
+```text
+CapabilityAuthorityClass = READ_ONLY
+```
+
+但物理：
+
+```text
+WorkspaceAccess = WRITE
+```
+
+的 Node attempt，Scheduler/Runtime 必须在执行前后 capture：
+
+```text
+pre_repository_state_digest
+post_repository_state_digest
+```
+
+要求：
+
+```text
+pre.fingerprint == post.fingerprint
+```
+
+否则：
+
+```text
+REPOSITORY_MUTATION_AUTHORITY_VIOLATION
+```
+
+即使：
+
+- SubagentResult.status == completed；
+- tests_passed criterion holds；
+- Agent 自报“只是修了一个小问题”；
+
+也不得接受该 Node。
+
+典型允许：
+
+```text
+.pytest_cache/
+coverage cache
+ignored build output
+/mnt/user-data/outputs/*
+```
+
+只要它们不改变 Git-visible Repository patch state。
+
+典型禁止：
+
+```text
+Tester modifies src/auth.py
+Tester rewrites expected snapshot tracked in Git
+Reviewer edits README.md
+Discovery agent creates non-ignored source file
+```
+
+除非对应 WorkItem 本身拥有 `REPOSITORY_MUTATION` authority。
+
+#### Verification Contamination
+
+若 Verification Node 改变 RepositoryStateDigest：
+
+1. 先发布真实 post WorkspaceRevision / NodeWorkspaceDelta；
+2. 产生 `REPOSITORY_MUTATION_AUTHORITY_VIOLATION`；
+3. verification verdict 不得作为“writer patch failed”的 RepairFeedback；
+4. P1 fail closed，因为 verifier 已污染共享 Repository；
+5. 不自动尝试推断并撤销 verifier 的修改。
+
+原则：
+
+> **A verifier may physically write; it may not semantically rewrite the patch being verified.**
+
+---
+
 ### 3.3 DeerFlow Execution Adapter
 
 Adapter 不再暴露：
@@ -5408,6 +5544,7 @@ VerificationFailure
 PlanInvalidated
 PolicyViolation
 RepositoryInvariantFailure
+RepositoryMutationAuthorityViolation
 Cancelled
 ```
 
@@ -5427,6 +5564,7 @@ Cancelled
 | PLAN_INVALIDATED before any WRITE | bounded replan |
 | PLAN_INVALIDATED after WRITE | MVP fail / restart-from-baseline |
 | policy / repository invariant violation | fail closed |
+| read-only semantic Node changes Git-visible Repository state | REPOSITORY_MUTATION_AUTHORITY_VIOLATION；fail closed |
 | cancelled | propagate cancellation |
 
 ### 9.9 WRITE Retry Safety
@@ -6523,6 +6661,9 @@ against frozen revision
    ▼
 WRITE / UNKNOWN-MUTATING → mandatory pre-attempt snapshot
    │
+   ├── semantic READ_ONLY + physical WRITE
+   │     → capture pre_repository_state_digest
+   │
    ▼
 ExecutionBackend.execute_prepared()
    │
@@ -6545,6 +6686,10 @@ Publish post_attempt_workspace_revision
    │
    ▼
 Repository Invariant Check（mutating）
+   │
+   ├── semantic READ_ONLY + physical WRITE
+   │     → compare RepositoryStateDigest
+   │     → mutation => authority violation
    │
    ▼
 Execution / Dirty-State Failure Classification
@@ -8810,6 +8955,8 @@ Source Audit In Progress
 - DeerFlow Adapter 用 exact run_id 绑定 immutable NodeExecutionBinding；
 - Handoff middleware 不在 isolated loop 读取 EvidenceStore / Git；
 - run_id prefix 不是 authority，exact BindingStore entry 才是 authority。
+- physical WorkspaceAccess 与 semantic repository-mutation authority 分离；
+- VERIFICATION/REVIEW 等 READ_ONLY authority Node 可因 bash 获得 WRITE lock，但 Git-visible patch 必须保持不变；
 - BindingStore 横跨 Scheduler loop 与 DeerFlow isolated subagent loop，P1 使用 thread-safe 同步而非 loop-bound asyncio.Lock。
 
 新增 PoC：
@@ -8879,6 +9026,11 @@ Source Audit In Progress
 | POC-H60 | 强制触发 subagent summarization | 每次 model request 仍有且只有一份 A-SWE dependency projection |
 | POC-H61 | summarization 后检查 child graph state | Handoff projection 未持久写入 messages state |
 | POC-H62 | SystemMessageCoalescing | A-SWE authority note 与 DeerFlow system blocks 合并后仍保持单一 leading system message |
+| POC-H63 | Tester 运行 pytest 产生 ignored cache | WorkspaceRevision 可变化，但 RepositoryStateDigest 不变，verification 可继续 |
+| POC-H64 | Tester 修改 tracked source 后 tests pass | REPOSITORY_MUTATION_AUTHORITY_VIOLATION，不能接受 |
+| POC-H65 | Tester 创建 non-ignored source file | RepositoryStateDigest 改变，fail closed |
+| POC-H66 | verifier 自身污染 repo | 不生成指向 writer 的 RepairFeedback |
+| POC-H67 | Reviewer/Discovery 意外改 repo | 同一 semantic mutation invariant fail closed |
 
 ---
 
@@ -9020,6 +9172,7 @@ Executable TaskDAG
 - DeerFlow AssemblyAttestation；
 - PROVIDER_ASSEMBLY_MISMATCH classification；
 - Post-node Git-aware contract invariant；
+- RepositoryStateDigest / semantic mutation authority invariant；
 - NodeAttemptRecord / NodeRuntimeState；
 - Retry / Repair / Reverify attempt state machine；
 - Cancellation；
@@ -9236,6 +9389,7 @@ Coder            exclusive WRITE
 37. 为什么 authorization 不能被当成 frozen snapshot？
 38. 为什么 P1 不在 runtime 自动切换另一个 Provider？
 39. DeerFlow 的 one-AppConfig-snapshot 设计如何减少 TOCTOU？
+40. 为什么 Tester 可以获得 WRITE lock，却仍然不能修改 Git-visible Repository patch？
 
 ### 21.4 代码掌握边界
 
