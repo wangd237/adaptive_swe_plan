@@ -459,10 +459,17 @@ run_in_sandbox()
 
 ```python
 class ExecutionBackend(Protocol):
-    async def execute_node(
+    async def prepare_node(
         self,
         node: TaskNode,
-        provider: AgentProvider,
+        policy: NodeExecutionPolicy,
+        workspace: WorkspaceSession,
+    ) -> NodeExecutionPreparation:
+        ...
+
+    async def execute_prepared(
+        self,
+        preparation: NodeExecutionPreparation,
         workspace: WorkspaceSession,
     ) -> NodeExecutionResult:
         ...
@@ -486,7 +493,8 @@ class ExecutionBackend(Protocol):
 
 ```text
 TaskNode
-AgentProvider
+NodeExecutionPolicy
+NodeExecutionPreparation
 WorkspaceSession
 NodeExecutionResult
 NodeAcceptanceResult
@@ -2754,6 +2762,39 @@ ProviderAssignment
 NodeResourceRequirements
 ```
 
+建议：
+
+```python
+class NodeResourceRequirements(BaseModel):
+    required_capabilities: tuple[str, ...]
+    required_tools: tuple[str, ...]
+    optional_tools: tuple[str, ...]
+    preferred_skills: tuple[str, ...]
+    required_sandbox_features: tuple[str, ...]
+
+class ProviderAssignment(BaseModel):
+    work_item_id: str
+    provider_id: str
+
+    provider_contract_fingerprint: str
+    planning_inventory_fingerprint: str
+
+    resources: NodeResourceRequirements
+
+    preflight_status: Literal["preflight_feasible"]
+    preflight_diagnostics: tuple[str, ...]
+
+    fingerprint: str
+```
+
+`ProviderAssignment` 是 planning artifact。
+
+它记录：
+
+> **为什么在当时的 Backend snapshot 下选择了这个 Provider。**
+
+它不承诺未来执行时 deployment 永远不变。
+
 ### 6.2 Node-Level Resolution
 
 例如：
@@ -2924,6 +2965,156 @@ PREFLIGHT_FEASIBLE
 ```
 
 但 runtime authorization 仍可能在真正 assembly 时进一步收窄。
+
+### 6.5.1 Execution-Time Live Revalidation
+
+`PREFLIGHT_FEASIBLE` 是 planning-time 判断，会过期。
+
+因此 Scheduler 在 NodeReady 后、不获取 Workspace WRITE lock 之前调用：
+
+```text
+ExecutionBackend.prepare_node()
+```
+
+DeerFlow Adapter 在这一阶段重新解析当前 deployment，并形成：
+
+```python
+class NodeExecutionPreparation(BaseModel):
+    execution_id: str
+    node_id: str
+    provider_id: str
+
+    compiled_policy_fingerprint: str
+
+    planning_inventory_fingerprint: str
+    live_inventory_fingerprint: str
+
+    effective_policy_fingerprint: str
+
+    backend_snapshot_id: str
+
+    drift_observed: bool
+    drift_diagnostics: tuple[str, ...]
+
+    status: Literal["prepared"]
+```
+
+`backend_snapshot_id` 是 provider-neutral opaque id。Core 不通过它读取 DeerFlow object；它只让 Adapter 在 `execute_prepared()` 时取回本次准备阶段冻结的 concrete resources。
+
+### 6.5.2 Fingerprint Drift Semantics
+
+不能：
+
+```text
+planning fingerprint != live fingerprint
+→ automatically fail
+```
+
+因为无关资源变化也会改变 fingerprint。
+
+正确规则：
+
+```text
+fingerprint changed
+      ↓
+re-run hard feasibility against live snapshot
+      │
+      ├─ all constraints still hold
+      │     → PREPARED
+      │     → record BACKEND_DRIFT_OBSERVED
+      │
+      └─ required condition no longer holds
+            → BACKEND_PREFLIGHT_STALE
+            → fail before workspace mutation
+```
+
+Fingerprint 变化本身不是 failure；重新验证后 required condition 不再成立才是 failure。
+
+### 6.5.3 Monotonic Runtime Narrowing
+
+Execution preparation 只允许继续收窄 compiled Node policy。
+
+允许：
+
+- optional tool disappeared → drop optional tool；
+- preferred skill disappeared → warning / drop；
+- operator timeout 变小 → lower effective timeout；
+- operator max_turns 变小 → lower effective turns；
+- authorization 移除 optional tool → drop；
+- new unrelated tools appear → ignore。
+
+禁止：
+
+- 自动添加新 Tool；
+- 用新 Tool 替代 required Tool；
+- 扩大 path / action authority；
+- 提高 operator ceiling；
+- 自动换 Provider；
+- 改 WorkItem objective。
+
+准备后形成：
+
+```text
+Compiled NodeExecutionPolicy
+      ↓ monotonic narrowing
+Effective NodeExecutionPolicy
+```
+
+`WorkspaceAccess` 一期保持 compiled upper-bound lock class，不因 runtime narrowing 从 WRITE 动态降回 READ。
+
+### 6.5.4 DeerFlow Execution Snapshot Pinning
+
+Pinned DeerFlow `SubagentExecutor` 自身已经明确采用：
+
+> **one AppConfig snapshot per execution**
+
+A-SWE Adapter 应强化而不是破坏这个性质。
+
+`prepare_node()` 一次性解析并冻结：
+
+```text
+AppConfig snapshot
+effective SubagentConfig
+concrete base tool objects
+resolved model
+LoadedExtensions generation
+user / auth identity
+inventory fingerprint
+```
+
+随后 `execute_prepared()` 必须把同一份 AppConfig、tools、SubagentConfig、extensions snapshot 传给 `SubagentExecutor`。
+
+禁止：
+
+```text
+prepare with config A
+execute later with get_app_config() → config B
+```
+
+### 6.5.5 Authorization 是 Live Gate，不伪装成 Snapshot
+
+AuthorizationProvider 不能被 A-SWE 宣称为冻结 policy snapshot。
+
+DeerFlow 当前执行链会在 assembly、middleware-declared tools、tool call 与 Skill activation 等位置继续重新授权。
+
+因此 planning/preparation preflight 只是早失败优化；真正 authority 仍来自运行时 DeerFlow authorization / guardrail。
+
+### 6.5.6 Provider Rebinding Boundary
+
+如果 live revalidation 失败，P1 不自动 switch 到另一个 Provider。
+
+原因：ProviderAssignment、Tool policy、WorkspaceAccess、prompt/skills、fingerprint 都属于已编译 execution plan。
+
+结果：
+
+```text
+BACKEND_PREFLIGHT_STALE
+→ explicit node admission failure
+```
+
+发生在首次 business WRITE 前时，上层可使用已有 bounded replan policy 重新编译；Workspace 已有 mutation 时，MVP fail closed。
+
+未来若做 Provider Rebinding，也必须是带 Trace 与新 fingerprint 的显式 Plan Repair，而不是 Scheduler 私下替换。
 
 ### 6.6 Provider Selection
 
