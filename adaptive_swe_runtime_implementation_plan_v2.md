@@ -526,7 +526,7 @@ class NodeWorkspaceDelta(BaseModel):
     has_observed_changes: bool
     attribution_truncated: bool
 
-    mutating_tool_invoked: bool | None
+    mutating_tool_admitted: bool | None
     mutation_evidence: MutationEvidence
 
     summary: dict
@@ -577,6 +577,123 @@ bash executed
 而不是 `PROVEN_NONE`。
 
 Tool receipt 只证明调用发生；它不能证明 bash 命令无副作用。因此任何实际执行过的通用 `bash` 在没有更强 sandbox transaction evidence 时，至少使 mutation state 进入 `UNKNOWN`。
+
+#### Tool-Start Evidence：PROVEN_NONE 的必要条件
+
+Pinned DeerFlow 的两个现成 evidence layer 都不够早：
+
+```text
+ToolProgressMiddleware
+→ handler(request) 返回后更新/记录状态
+
+ToolReceiptMiddleware
+→ handler(request) 返回后 stamp receipt
+```
+
+因此 cancellation / exception 可能发生在：
+
+```text
+mutating tool 已开始
+        ↓
+workspace/environment 已发生副作用
+        ↓
+尚未形成 ToolMessage / Receipt
+        ↓
+execution 被取消
+```
+
+这时：
+
+```text
+no receipt
++ no scanner-visible change
+```
+
+绝不能推出 `PROVEN_NONE`。
+
+P1 复用已经存在的 trusted `ASWENodeToolPolicyMiddleware`，在它的 tool-call enforcement boundary 增加一个**pre-handler admission record**：
+
+```text
+tool call reaches A-SWE trusted middleware
+        ↓
+resolve exact NodeExecutionBinding
+        ↓
+verify name / identity / Node policy
+        ↓
+if allowed:
+    record ToolCallAdmissionRecord
+        ↓
+call downstream handler
+```
+
+记录必须发生在 downstream handler 前。
+
+它不是“工具成功执行”的证明，只表示：
+
+> **该 tool call 已经越过 A-SWE 自己的最后 policy gate，并可能在后续 execution chain 产生副作用。**
+
+对于：
+
+```text
+effect == WORKSPACE_MUTATING
+OR effect == EXTERNAL_SIDE_EFFECT
+OR effect == UNKNOWN
+```
+
+一旦存在 admission record，即使：
+
+- 没有 receipt；
+- tool handler 被 cancellation 打断；
+- DeerFlow snapshot 无 changed path；
+
+P1 也不能判 `PROVEN_NONE`。
+
+若更外层 DeerFlow Guardrail / ReadBeforeWrite 在调用到 A-SWE middleware 前就 short-circuit：
+
+- 不会产生 A-SWE admission record；
+- actual business tool 也没有越过该 outer gate；
+- 仍可结合其他 evidence 判断 clean。
+
+若 A-SWE admission 后，后续更内层 middleware 又 short-circuit：
+
+- A-SWE 会保守认为 mutation possibility 已打开；
+- 最多把本可 clean 的 attempt 降为 UNKNOWN；
+- 不会把危险 attempt 错判 clean。
+
+这是 deliberate fail-safe asymmetry。
+
+#### PROVEN_NONE Frozen Predicate
+
+P1 的 `MutationEvidence.PROVEN_NONE` 必须同时满足：
+
+```text
+before/after workspace snapshot available
+AND snapshot attribution not truncated
+AND no observed workspace change
+AND NodeExecutionBinding / RuntimeOutcome intact
+AND admitted_tool_calls_truncated == false
+AND no admitted tool call whose effect is:
+    WORKSPACE_MUTATING
+    EXTERNAL_SIDE_EFFECT
+    UNKNOWN
+AND no independent runtime evidence of mutation
+```
+
+否则：
+
+```text
+observed mutation
+→ OBSERVED
+
+not observed but proof incomplete / mutating admission exists
+→ UNKNOWN
+```
+
+注意：
+
+> **Receipt absence is never a clean-execution proof.**
+
+Receipt 仍用于“某个工具调用完成并返回了什么”的 execution evidence；pre-handler admission record 专门用于“是否可能已经进入副作用区间”的 retry-safety proof。
 
 #### Snapshot Truncation Fail-Safe
 
@@ -7268,11 +7385,20 @@ class NodeExecutionBinding:
     policy: NodeExecutionPolicy
     invocation: NodeExecutionInvocation
 
+class ToolCallAdmissionRecord(BaseModel):
+    tool_call_id: str
+    tool_name: str
+    effect: ToolEffect
+
 class NodeExecutionRuntimeOutcome:
     admission_checked: bool
     admission_failure: str | None
     missing_required_tools: tuple[str, ...]
     denied_tool_calls: list[dict]
+
+    # Recorded before downstream handler invocation.
+    admitted_tool_calls: list[ToolCallAdmissionRecord]
+    admitted_tool_calls_truncated: bool
 
 NodeExecutionBindingStore[run_id]
     = (NodeExecutionBinding, NodeExecutionRuntimeOutcome)
@@ -10191,6 +10317,9 @@ Source Audit In Progress
 - P1 采用 `execute_async + public awaitable completion/join seam`；
 - `execute_prepared()` 对 Core 承诺 return == backend quiescent；
 - `cancel_node()` 对 Core 承诺 return == cancelled execution quiescent，而不是 signal-only。
+- DeerFlow ToolProgress / ToolReceipt 都属于 post-handler evidence，不能证明 cancellation 前“未启动 mutating tool”；
+- ASWENodeToolPolicyMiddleware 必须在 allowed tool call 进入 downstream handler 前记录 ToolCallAdmissionRecord；
+- `PROVEN_NONE` 需要完整 pre-handler admission audit + complete no-change snapshot；receipt absence 不构成 clean proof。
 
 审计目标：
 
@@ -10234,6 +10363,11 @@ P0-7 新增 PoC：
 | POC-R05 | terminal background result + delayed sandbox release | 下一个 WRITE Node 不提前启动 |
 | POC-R06 | A-SWE execution_id 与 DeerFlow background id | 显式 mapping；provider/external id 不作为 registry ownership key |
 | POC-R07 | background registry cleanup | 只在 completion join 后 cleanup，不删除仍 unwind 的 Future ownership |
+| POC-R08 | bash 已进入 handler 后被 cancellation 打断、无 receipt | admission record 存在 → mutation_evidence=UNKNOWN |
+| POC-R09 | mutating call 被外层 Guardrail 在 A-SWE gate 前 short-circuit | 无 A-SWE admission；结合 complete snapshot 可保持 clean candidate |
+| POC-R10 | A-SWE admission 后内层 middleware short-circuit | 保守 UNKNOWN，不误判 PROVEN_NONE |
+| POC-R11 | admitted-tool audit overflow / missing Binding outcome | mutation proof incomplete → UNKNOWN |
+| POC-R12 | no receipt + no snapshot change | 单独不足以证明 PROVEN_NONE |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
