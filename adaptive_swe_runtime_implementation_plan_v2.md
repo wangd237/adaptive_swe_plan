@@ -796,6 +796,7 @@ class TaskSpec(BaseModel):
     complexity: Complexity
     risk: RiskLevel
 
+    # inference hints only; TaskContract owns authoritative obligations
     testing_required: bool
     review_required: bool
 
@@ -911,10 +912,12 @@ LLM 输出不能直接作为最终调度依据。
 → capability_hints 至少包含 code_modification
 
 如果用户明确要求 regression test
-→ testing_required = true
+→ TaskSpec.testing_required = true  # planning hint
+→ TaskContract candidate: verification.required = regression
 
 如果 risk == high
-→ review_required = true
+→ TaskSpec.review_required = true   # planning hint
+→ Runtime Policy Rule 可生成 RUNTIME_DERIVED review.required
 
 如果目标文件 / symbol 在 Profile 中没有解析到
 → 增加 planning_uncertainty
@@ -1300,12 +1303,21 @@ class ConstraintSpec(BaseModel):
     key: str
     merge_strategy: str
     verification_mode: str
+
+class DeliverableEffect(str, Enum):
+    REPORT_ONLY = "report_only"
+    REPOSITORY_MUTATION = "repository_mutation"
+    EXTERNAL_SIDE_EFFECT = "external_side_effect"
+
+class DeliverableRequirement(BaseModel):
+    description: str
+    effect: DeliverableEffect
 ```
 
 建议首批 key：
 
 ```text
-deliverables.required
+deliverables.required  # value = DeliverableRequirement
 repo.paths.allowed
 repo.paths.forbidden
 actions.forbidden
@@ -1328,6 +1340,57 @@ semantic.requirement
 ```
 
 保证用户要求仍留在 Contract，只是确定性验证能力下降。
+
+#### 4.8.8.1 TaskExecutionAuthority Projection
+
+CompiledTaskContract 还需要投影出一个 coarse-grained execution authority：
+
+```python
+class TaskExecutionAuthority(BaseModel):
+    repository_mutation_allowed: bool
+
+    # P1 默认空；外部写操作默认不开放
+    external_side_effects_allowed: frozenset[str]
+
+    granting_constraint_ids: tuple[str, ...]
+    fingerprint: str
+```
+
+其中：
+
+```text
+deliverables.required(effect = REPOSITORY_MUTATION)
+→ repository_mutation_allowed = true
+```
+
+例如：
+
+```text
+"Fix the connection leak"
+→ DeliverableRequirement(
+     description="fix connection leak",
+     effect=REPOSITORY_MUTATION
+   )
+```
+
+其 evidence 仍回到 immutable TaskRequest 验证。
+
+而：
+
+```text
+"Analyze why the connection leaks"
+→ DeliverableRequirement(
+     description="analysis report",
+     effect=REPORT_ONLY
+   )
+→ repository_mutation_allowed = false
+```
+
+外部写副作用 P1 默认由 Runtime Policy LOCKED deny。
+
+核心原则：
+
+> **TaskContract 决定任务允许产生哪类业务效果；Planner 不能通过 capability_hints 自行扩大 execution authority。**
 
 #### 4.8.9 Constraint Merge Algebra
 
@@ -2158,6 +2221,8 @@ Provider 选择前即可判断：
 - DAG acyclic；
 - WorkKind vocabulary / consistency；
 - capability vocabulary；
+- capability authority 不得超出 TaskExecutionAuthority；
+- mutation WorkItem 必须绑定 repository-mutation deliverable coverage；
 - coverage_claim references 是否只指向存在的 positive constraints；
 - positive obligation structural coverage；
 - node count / plan budget；
@@ -2198,6 +2263,8 @@ dependency references nonexistent item
 unknown / impossible capability
 coverage_claim references nonexistent / negative-only constraint
 WorkKind / capability contradiction
+capability authority exceeds TaskExecutionAuthority
+mutation WorkItem has no mutation-authorizing coverage claim
 REVIEW mixed with business mutation capability
 VERIFICATION mixed with business implementation capability when independent verification is required
 explicit dependency contradicts mandatory phase ordering
@@ -2483,11 +2550,20 @@ DirectToolProvider
 Capability Registry 只保存 provider-neutral semantic metadata：
 
 ```python
+class CapabilityAuthorityClass(str, Enum):
+    READ_ONLY = "read_only"
+    REPOSITORY_MUTATION = "repository_mutation"
+    EXTERNAL_SIDE_EFFECT = "external_side_effect"
+
 class CapabilitySpec(BaseModel):
     id: str
     description: str
 
-    semantic_effect: Literal["read", "write"]
+    # physical shared-workspace lower bound
+    workspace_effect_floor: Literal["read", "write"]
+
+    # semantic/business authority required to select this capability
+    authority_class: CapabilityAuthorityClass
 
     default_acceptance_kind: str | None = None
 ```
@@ -2498,7 +2574,8 @@ class CapabilitySpec(BaseModel):
 capability:
   id: code_modification
   description: modify repository source code
-  semantic_effect: write
+  workspace_effect_floor: write
+  authority_class: repository_mutation
 ```
 
 明确不保存：
@@ -2757,6 +2834,117 @@ ToolRequirement.delivery = EAGER | DEFERRED_OK
 
 并定义 catalog-level attestation；不在 MVP 预先建设。
 
+### 5.4.4 Capability Authority Validation
+
+Planner 的：
+
+```text
+capability_hints
+```
+
+仍然只是 candidate。
+
+不能：
+
+```text
+Planner says code_modification
+→ automatically grant write tools
+```
+
+否则模型仍然可以通过 capability hint 自我扩权。
+
+SemanticPlanValidator / Capability Compiler 必须把 CapabilitySpec.authority_class 与 TaskExecutionAuthority 对齐。
+
+P1 规则：
+
+```text
+READ_ONLY
+→ 可进入普通 planning selection
+
+REPOSITORY_MUTATION
+→ TaskExecutionAuthority.repository_mutation_allowed 必须为 true
+
+EXTERNAL_SIDE_EFFECT
+→ 必须存在 explicit allowed external action
+→ P1 默认 deny
+```
+
+此外，Planner-owned mutation WorkItem 必须至少有一个：
+
+```text
+coverage_claim
+→ 指向 effect = REPOSITORY_MUTATION 的 positive deliverable constraint
+```
+
+否则：
+
+```text
+CAPABILITY_AUTHORITY_VIOLATION
+→ PLAN_INVALID
+```
+
+这不是说 coverage claim 已证明任务完成，而只是要求：
+
+> 每个业务 mutation Node 都必须说明它服务于哪个被 TaskContract 授权的 mutation obligation。
+
+Runtime-owned gate 是例外：
+
+- verification gate 的 regression_testing 属于 READ_ONLY semantic authority；
+- review gate 的 code_review 属于 READ_ONLY semantic authority；
+- 若未来 Runtime Policy 注入真正 mutation gate，必须由对应 Runtime-derived constraint 授权。
+
+### 5.4.5 Authority Effect ≠ ToolEffect
+
+两者必须严格分离：
+
+```text
+CapabilityAuthorityClass
+→ 这个 WorkItem 在业务语义上被允许做什么
+
+ToolEffect
+→ 实际开放的工具在物理上可能产生什么副作用
+```
+
+例如：
+
+```text
+regression_testing
+
+CapabilityAuthorityClass = READ_ONLY
+workspace_effect_floor = READ
+
+Provider requires bash
+ToolEffect(bash) = WORKSPACE_MUTATING
+
+最终：
+semantic authority = no business source mutation
+WorkspaceAccess = WRITE / exclusive
+```
+
+因此 Tester 可以获得 WRITE lock，却仍然没有业务源码修改 authority。
+
+其执行后：
+
+```text
+Git ChangeSet
++
+TaskContract
++
+post-node invariant
+```
+
+必须确认没有超出 verification 允许的 mutation 范围。
+
+同理：
+
+```text
+code_modification
+CapabilityAuthorityClass = REPOSITORY_MUTATION
+workspace_effect_floor = WRITE
+```
+
+只有 TaskContract 授权 repository mutation 才能进入 ValidatedWorkPlan。
+
 ### 5.5 Capability / Tool Side-Effect Authority
 
 最终 `workspace_access` 不由 LLM 决定，也不能只从 Capability 名称推断。
@@ -2764,7 +2952,7 @@ ToolRequirement.delivery = EAGER | DEFERRED_OK
 必须同时考虑：
 
 ```text
-Capability Semantic Effect
+Capability Workspace Effect Floor
 +
 Selected Provider's CapabilityBinding
 +
@@ -2775,7 +2963,7 @@ Backend / Sandbox Contract
 Effective WorkspaceAccess
 ```
 
-Capability semantic effect 只是 lower bound：
+Capability `workspace_effect_floor` 只是物理 Workspace access 的 lower bound：
 
 ```text
 repo_exploration   → READ
@@ -2820,7 +3008,7 @@ P1 保守分类必须基于**已解析 implementation**：
 最终：
 
 ```text
-semantic effect == READ
+workspace_effect_floor == READ
 AND every tool in the final effective Node allowlist
     is provably READ_ONLY
 → WorkspaceAccess.READ
@@ -3565,12 +3753,14 @@ Diagnosis 需要 repo_exploration + bug_diagnosis
 且 Coder 没有完整 binding
 → Explorer 进入候选
 
-testing_required == true
+CompiledTaskContract.verification.required exists
+→ Runtime / validated plan 必须有 VERIFICATION WorkItem
 → 必须有 Provider 能覆盖 regression_testing
 → 若其实现依赖 bash，则 Node workspace_access = WRITE
 
-risk == high
-→ Review WorkItem 必须有 code_review-compatible Provider
+CompiledTaskContract.review.required exists
+→ Runtime / validated plan 必须有 REVIEW WorkItem
+→ 必须有 code_review-compatible Provider
 ```
 
 注意：
@@ -3700,7 +3890,7 @@ class TaskNode(BaseModel):
 `workspace_access` 由 Runtime 根据：
 
 ```text
-Capability Semantic Effect
+Capability Workspace Effect Floor
 +
 Node Required Tools
 +
@@ -6916,15 +7106,19 @@ P0-3 新增 deterministic compiler PoC：
 | POC-P3-06 | 两个独立 DISCOVERY READ | 保持并行 |
 | POC-P3-07 | mandatory verification/review 缺失 | Runtime 注入 reserved gate nodes |
 | POC-P3-08 | Planner 使用 __aswe_ id | hard reject |
+| POC-P3-09 | read-only analysis task + planner code_modification hint | CAPABILITY_AUTHORITY_VIOLATION |
+| POC-P3-10 | bug-fix contract grants repository mutation | implementation capability 可通过 authority validation |
+| POC-P3-11 | Tester bash modifies source | 虽有 WRITE lock但 post-node business-mutation invariant fail |
+| POC-P3-12 | mutation WorkItem 无 mutation deliverable coverage | PLAN_INVALID |
 
 下一步继续审计：
 
 ```text
-Capability Authority
-+
 Coverage Validation
 +
 Runtime Gate Compilation
++
+Canonical Plan Fingerprint
 ```
 
 的 deterministic rule set、repair boundary 与 bounded replan policy。
@@ -7102,6 +7296,8 @@ DeerFlow Subagent Execution
 - ConstraintCompiler；
 - CompiledTaskContract / fingerprint；
 - Contract coverage validation；
+- TaskExecutionAuthority projection；
+- Capability authority validation；
 - Task Analyzer；
 - Planning Context Gate；
 - Read-only Recon Probe；
@@ -7126,6 +7322,7 @@ ValidatedWorkPlan
 完成：
 
 - provider-neutral CapabilitySpec；
+- CapabilityAuthorityClass / workspace_effect_floor；
 - CapabilityBinding；
 - Node-Level Capability Resolver；
 - Agent Registry；
