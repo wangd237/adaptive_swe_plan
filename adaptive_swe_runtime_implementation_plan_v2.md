@@ -3591,62 +3591,118 @@ truncate Handoff report first
 
 #### 4.17.4 Receipt 继承边界
 
-上游 receipt 是历史证据引用，不是下游执行证据。
+上游 receipt 是历史 execution evidence，不是下游自身执行证据。
 
-DeerFlow receipt display id（例如 `r3`）既是 execution-local，又可能在 history compaction 后重新编号。
+Pinned DeerFlow 的 receipt 有三条必须保留的边界：
 
-Pinned DeerFlow `tool_receipt.py` 明确规定：
+1. display id `rN` 是 positional label，compaction 后可能重编号；
+2. `tool_call_id` 是 provider/runtime correlation field，但 DeerFlow receipt structural validation 允许空字符串，不能把它提升成跨持久化层全局主键；
+3. `args_sha256 / output_sha256` 实际由：
+   ```python
+   hashlib.sha256(...).hexdigest()[:16]
+   ```
+   生成，而且源码明确称 `output_sha256` 为 freshness stamp，而不是 persisted-message 可重新验证的 fingerprint。
 
-```text
-rN
-→ positional display id
-→ may renumber after summarization / compaction
-```
-
-Completed SubagentResult 会优先 harvest citing-turn ledger snapshot，避免把终态 compact 后的 `rN` 重新解释为另一条调用；但 A-SWE 仍不能把 `rN` 当 durable evidence key。
-
-因此 Handoff 禁止保存裸：
-
-```text
-receipt_ids = ["r3"]
-```
-
-也不把：
-
-```text
-(source_execution_id, r3)
-```
-
-视为长期稳定主键。
-
-ReceiptRef 使用：
+因此禁止把：
 
 ```text
 source_execution_id
-+
-tool_call_id
-+
-tool_name
-+
-args_sha256
-+
-output_sha256
++ tool_call_id
++ args_sha256
++ output_sha256
 ```
 
-作为稳定 execution fact identity；`display_receipt_id` 仅用于重现模型当时看到的 citation label。
+描述成 cryptographically strong / globally unique receipt identity。
 
-例如：
+#### Receipt Ledger 作为 Durable Evidence Authority
+
+A-SWE 在 Node terminalization 时，把 DeerFlow harvested receipt ledger 原样映射为 provider-neutral：
+
+```text
+ToolReceiptLedgerEvidence
+```
+
+并首先写入 `ExecutionEvidenceStore`。
+
+该 EvidenceStore artifact：
+
+- attempt-scoped；
+- immutable；
+- 整体 canonical payload 使用 A-SWE **full SHA-256** integrity hash；
+- 保留 citing-turn / terminal harvested receipt 顺序；
+- 保留每条 receipt 的 DeerFlow 原始字段：
+  - display `id`；
+  - `tool_call_id`；
+  - `tool_name`；
+  - `status`；
+  - short `args_sha256`；
+  - short `output_sha256`；
+  - `output_bytes`；
+  - `created_at`。
+
+单条 receipt 的 durable reference 改为：
 
 ```python
-ReceiptRef(
-    source_execution_id="exec-123",
-    tool_call_id="call_abc",
-    tool_name="write_file",
-    args_sha256="...",
-    output_sha256="...",
-    display_receipt_id="r3",
-)
+class ReceiptRef(BaseModel):
+    source_execution_id: str
+
+    ledger_evidence: EvidenceRef
+    ledger_index: int
+
+    # Copied facts for bounded rendering / diagnostics.
+    display_receipt_id: str | None
+    tool_call_id: str | None
+    tool_name: str
+
+    args_freshness_stamp: str | None
+    output_freshness_stamp: str | None
 ```
+
+其中 authoritative locator 是：
+
+```text
+ledger_evidence
++
+ledger_index
+```
+
+`source_execution_id` 用于 ownership consistency check。
+
+Resolver 必须：
+
+1. 通过 EvidenceStore 验证 ledger artifact full SHA-256；
+2. 检查 ledger belongs to source_execution_id；
+3. 检查 ledger_index 范围；
+4. 读取该 index 的 canonical receipt；
+5. 对 ReceiptRef 中复制的 tool_name / tool_call_id / freshness stamps 做 consistency check；
+6. 不一致则返回 typed evidence-integrity failure。
+
+这样即使：
+
+- provider tool_call_id 为空；
+- 两次 execution 复用了同一 provider call id；
+- `r3` 在后续 compaction 中被重新编号；
+- short hash 发生理论碰撞；
+
+也不会改变 A-SWE 已持久化 ledger 中该 receipt 的 durable address。
+
+#### DeerFlow 字段的真实语义
+
+```text
+display_receipt_id
+→ 重现模型当时看到的 citation label
+
+tool_call_id
+→ execution/provider correlation hint
+
+args/output short hashes
+→ DeerFlow freshness / diagnostic stamps
+
+EvidenceRef.content_sha256
+→ A-SWE durable artifact integrity hash
+```
+
+这些语义禁止混用。
 
 下游 prompt 必须明确：
 
@@ -3656,9 +3712,9 @@ not a durable global id
 not your own execution proof
 ```
 
-不得让 Node B 引用 Node A 的 receipt 来证明“Node B 已执行该动作”。
+不得让 Node B 引用 Node A receipt 来证明“Node B 已执行该动作”。
 
-这一点与 DeerFlow `ParentContextSnapshot` 的历史 receipt 边界保持一致。
+这与 DeerFlow `ParentContextSnapshot` 的 historical receipt boundary 保持一致。
 
 #### 4.17.4.1 Execution Evidence Store
 
@@ -33695,6 +33751,10 @@ Implementation PoC Pending
 | POC-66 | A-SWE execution run_id | 符合 DeerFlow JsonlRunEventStore safe-id regex；无冒号/路径字符 |
  并可创建 thread workspace |
 | POC-70 | raw external user id 含 unsafe chars | 不直接作为 DeerFlow filesystem user_id |
+| POC-71 | receipt tool_call_id 为空 | ReceiptRef 仍通过 ledger EvidenceRef + ledger_index 稳定解析 |
+| POC-72 | 两个 execution 复用同一 tool_call_id | execution-owned ledger artifact 隔离，无跨 execution 歧义 |
+| POC-73 | receipt short hash 字段相同 | 不作为 durable identity；EvidenceStore full SHA-256 保护 ledger integrity |
+| POC-74 | receipt compaction 后 rN 变化 | 已持久化 citing-turn/terminal ledger index 不重新解释 |
 
 ---
 
@@ -33729,7 +33789,7 @@ Source Audit In Progress
 - repair feedback 使用独立 typed contract；
 - Handoff fingerprint 与 Workspace state fingerprint 分离。
 - DeerFlow receipt 必须 execution-scoped，不保存裸 rN；
-- `rN` 是可重编号 display id；durable ReceiptRef 使用 tool_call_id + hashes；
+- `rN` 是可重编号 display id；durable ReceiptRef 使用 immutable receipt-ledger EvidenceRef + ledger index；tool_call_id / short hashes 仅作一致性字段；
 - changeset / acceptance / verification 由 ExecutionEvidenceStore 持有；
 - EvidenceRef immutable 且 attempt-scoped；
 - retry / repair 不覆盖旧 attempt evidence；
@@ -33789,8 +33849,8 @@ Source Audit In Progress
 | POC-H13 | operator prompt_overlay 已配置 | A-SWE handoff 不修改 overlay 内容/顺序 |
 | POC-H14 | handoff 中含 `<system>` / fake framework tag | renderer neutralize，不能逃逸到 authority channel |
 | POC-H15 | 多轮 model call | handoff request-scoped 重投影，不写入 graph state/不重复累积 |
-| POC-H16 | 两个 Node 都有 r3 receipt | ReceiptRef 通过 source_execution_id + tool_call_id 消除歧义 |
-| POC-H16A | 同一 execution compaction 后 receipt renumber | durable ref 仍由 tool_call_id/hashes 解析，display rN 不作主键 |
+| POC-H16 | 两个 Node 都有 r3 receipt | ReceiptRef 通过 receipt-ledger EvidenceRef + ledger_index 消除歧义 |
+| POC-H16A | 同一 execution compaction 后 receipt renumber | durable ref 仍由 immutable receipt ledger + ledger_index 解析，display rN 不作主键 |
 | POC-H17 | Node retry attempt 2 成功 | Handoff 只引用 terminal attempt 2 evidence |
 | POC-H18 | old attempt evidence | Trace 可查，但不自动进入新 Handoff |
 | POC-H19 | Runtime restart 后读 Demo trace | file-backed EvidenceRef 仍可 resolve |
