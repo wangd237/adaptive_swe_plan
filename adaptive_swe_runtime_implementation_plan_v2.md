@@ -3034,6 +3034,153 @@ required_infrastructure_tools
 
 A-SWE 只能在 operator / Provider static contract 允许该 execution surface 时使用它；不能借 runtime output tool 绕过 operator deny。
 
+#### Review Evidence Resolution
+
+普通 Subagent self-report 的：
+
+```python
+verify_receipt_citations(result.result, result.tool_receipts)
+```
+
+不适用于 structured direct-return Review。
+
+原因：
+
+- direct-return `SubagentResult.result` 来自 ToolMessage content，不是普通 assistant prose；
+- 对 JSON / structured Tool output 运行 action-claim regex 会产生错误的 `no_citation_claims`；
+- Review submission 的证据引用已经是结构化 `receipt_citations` 字段。
+
+Pinned DeerFlow 已经替 A-SWE 解决了最危险的 receipt-renumbering 问题：
+
+```text
+ToolReceiptMiddleware
+→ 每次 model call 把真正渲染给模型的 receipt ledger snapshot
+  stamp 到该轮 AIMessage.additional_kwargs
+
+SubagentExecutor completed terminalization
+→ terminal_receipts(prefer_citing_turn=True)
+→ extract_citing_turn_receipts(...)
+→ missing / malformed snapshot 时 fail closed
+→ 不 fallback 到 post-compaction receipt re-enumeration
+```
+
+因此对于 clean completed Review：
+
+> **`SubagentResult.tool_receipts` 就是 terminal verdict turn 的 authoritative citing-turn ledger snapshot。**
+
+A-SWE 不应再自己扫描整个 message history重建 receipt 顺序。
+
+Review evidence resolution 顺序：
+
+```text
+terminal submit_review_verdict Tool call
+      ↓
+parse ReviewVerdictSubmission
+      ↓
+SubagentResult.tool_receipts
+(exact citing-turn ledger)
+      ↓
+persist ToolReceiptLedgerEvidence
+      ↓
+obtain ledger EvidenceRef
+      ↓
+ReviewEvidenceResolver:
+  display rN
+    → ledger_index
+    → canonical receipt
+    → ledger-backed ReceiptRef
+      ↓
+ReviewVerdict
+```
+
+如果：
+
+```text
+SubagentResult.tool_receipts is None
+```
+
+而 Review submission 声明了任意 receipt citation，则：
+
+```text
+evidence_resolved = false
+→ REVIEW_GATE_UNVERIFIED
+```
+
+不能退回：
+
+```text
+extract current ToolMessages
+re-enumerate rN
+```
+
+因为 DeerFlow 已明确禁止这种 completed-turn fallback。
+
+#### Review Evidence Rules
+
+Mandatory Review P1：
+
+- `APPROVE` 必须至少有一个成功、可解析的 `review_basis_receipt_citation`；
+- basis receipt 必须来自 terminal citing-turn ledger；
+- basis receipt 不能是 `submit_review_verdict` 自己；
+- basis 应来自实际 inspection execution，例如 Reviewer policy 允许的 `read_file / grep / bash`；
+- unknown id / failed status / optional tool-name anchor mismatch → `evidence_resolved=false`；
+- finding 里声明的 receipt citation 必须全部 resolve；
+- finding 的 `path / line` 仍是 model-authored semantic location；receipt resolved 不会把 location 升级为 deterministic truth；
+- display `rN` 在持久化 ReviewVerdict 前全部转换为 ledger-backed ReceiptRef，不把 display id 当 durable key。
+
+因此：
+
+```text
+decision = APPROVE
+AND evidence_resolved = false
+→ REVIEW_GATE_UNVERIFIED
+```
+
+这至少阻止：
+
+```text
+Reviewer 未执行任何 inspection
+→ 直接 submit APPROVE
+```
+
+被当作有效 hard gate。
+
+注意：
+
+> Receipt resolution 只证明 Reviewer 确实执行过被引用的 inspection calls；它不证明 reviewer 的语义判断正确。
+
+#### Review Direct-Return 与普通 Report Verification 分流
+
+Adapter terminal mapping 必须显式分支：
+
+```text
+ordinary assistant self-report
+→ DeerFlow verify_receipt_citations()
+
+structured direct-return output contract
+→ output-contract-specific resolver
+```
+
+P1 当前 structured direct-return contract 只有：
+
+```text
+submit_review_verdict
+→ ReviewEvidenceResolver
+```
+
+禁止：
+
+```text
+verify_receipt_citations(
+    serialized ReviewVerdictSubmission,
+    ...
+)
+```
+
+否则会把 ToolMessage JSON 当成 report prose。
+
+---
+
 #### Review Gate Outcome
 
 Review Node 只有同时满足：
@@ -3042,6 +3189,7 @@ Review Node 只有同时满足：
 backend status = completed
 AND completeness = CLEAN
 AND valid terminal submit_review_verdict
+AND ReviewVerdict.evidence_resolved = true
 AND RepositoryStateDigest unchanged
 ```
 
@@ -3069,32 +3217,33 @@ UNVERIFIED
 
 #### Review Verdict Revision Binding
 
-Tool 实现从当前 immutable `NodeExecutionInvocation` / Binding 读取：
+`submit_review_verdict` Tool 只接受 `ReviewVerdictSubmission`，不接受模型提供 execution/revision authority fields。
+
+Adapter 在 terminal evidence finalization 阶段从当前 immutable `NodeExecutionInvocation` / Binding 读取：
 
 ```text
 execution_workspace_revision
-current repository state fingerprint
+actual post-review RepositoryStateDigest fingerprint
 execution_id
 attempt
 ```
 
-并写入 verdict。
+再结合 ReviewEvidenceResolver 的 ledger-backed ReceiptRefs 构造最终 `ReviewVerdict`。
 
 模型不能自行声称：
 
 ```text
 reviewed revision = 7
+reviewer_execution_id = trusted
 ```
 
-Runtime 收到 verdict 后再验证：
+最终 `ReviewVerdict` 作为：
 
 ```text
-verdict.reviewed revision/fingerprint
-==
-actual review execution state
+EvidenceRef(kind="review_verdict")
 ```
 
-随后作为 `EvidenceRef(kind="review_verdict")` 写入 ExecutionEvidenceStore。
+写入 ExecutionEvidenceStore。
 
 原则：
 
@@ -4426,6 +4575,7 @@ class HandoffEvidenceProjection(BaseModel):
     receipt_citation_summary: str | None
     acceptance_summary: str | None
     verification_summary: str | None
+    review_summary: str | None
 
     evidence_refs: tuple[EvidenceRef, ...]
 
@@ -4480,7 +4630,13 @@ bounded model-facing projection
    - 渲染 deterministic status / failing check identifiers / bounded diagnostics；
    - 完整 stdout/stderr 保留在 EvidenceStore / backend trace，不进入默认 Handoff。
 
-5. **Patch / RepositoryChangeSet**
+5. **Review verdict**
+   - 渲染 decision、bounded summary、finding count 与 bounded blocker/major findings；
+   - 显式渲染 `evidence_resolved`；
+   - ReceiptRef 只作为 inspection execution evidence，不描述成 semantic correctness proof；
+   - historical ReviewVerdict 按 revision 标记，不作为 current review gate proof。
+
+6. **Patch / RepositoryChangeSet**
    - 默认只给 changed paths + evidence ref；
    - 不在普通 Handoff 中复制完整 patch；
    - Reviewer / Repair 若需要具体 diff，通过 Workspace 重新读取当前文件或显式 evidence-resolution tool/path 获取。
@@ -10212,7 +10368,7 @@ Integration PoC Pending
 - ReviewDecision 是 semantic evidence，Runtime 拥有 revision/execution envelope；
 - mandatory Review 只接受 CLEAN completion + valid ReviewVerdict + repository state unchanged。
 - structured direct-return Review 不运行普通 prose receipt verifier；
-- ReviewEvidenceResolver 使用 terminal AIMessage 上 runtime-stamped citing-turn ledger 解析 rN；
+- ReviewEvidenceResolver 使用 `SubagentResult.tool_receipts` 的 fail-closed citing-turn ledger snapshot 解析 rN，并持久化为 ledger-backed ReceiptRef；
 - mandatory APPROVE 至少需要一个成功 inspection receipt，防止 zero-inspection approval。
 - BindingStore 横跨 Scheduler loop 与 DeerFlow isolated subagent loop，P1 使用 thread-safe 同步而非 loop-bound asyncio.Lock。
 - DeerFlow SummarizationMiddleware 只压缩 graph state；request-scoped Handoff projection 不进入 summary_text；
@@ -10317,7 +10473,7 @@ Integration PoC Pending
 | POC-H83 | REVIEW Node 修改 Git-visible repo 后 APPROVE | mutation authority violation 优先，review 不通过 |
 | POC-H84 | direct-return Review JSON 含 action-like words | 不运行普通 prose citation verifier，不误报 no_citation_claims |
 | POC-H85 | Review APPROVE 无 basis receipts | REVIEW_GATE_UNVERIFIED |
-| POC-H86 | Review 引用 citing-turn r3，后续 compaction renumber | 通过 terminal AIMessage ledger 解析到原 tool_call_id |
+| POC-H86 | Review 引用 citing-turn r3，后续 compaction renumber | `SubagentResult.tool_receipts` 保留原 citing-turn ledger；解析到同一 ledger index |
 | POC-H87 | Review basis 引用 failed / unknown receipt | evidence_resolved=false，gate unsatisfied |
 | POC-H88 | Review basis 只引用 submit_review_verdict 自身 | 不算 inspection evidence |
 | POC-H89 | valid basis receipt | display rN 转 durable ReceiptRef 后入 ReviewVerdict |
