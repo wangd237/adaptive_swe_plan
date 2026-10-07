@@ -446,12 +446,39 @@ Task-level baseline / Git ChangeSet 用于最终 Repository patch。
 它不是 UI 可选项，而是以下 Runtime 语义的输入：
 
 ```text
-Node-level changed-path attribution
-DIRTY_WRITE_FAILURE detection
-automatic retry eligibility
-WorkspaceRevision advancement
+Node-level observed changed-path attribution
+WorkspaceRevision evidence
 post-node contract/invariant evidence
 ```
+
+但 pinned DeerFlow scanner 明确排除：
+
+```text
+.git
+.venv
+node_modules
+build
+dist
+__pycache__
+.cache
+...
+```
+
+因此：
+
+> **WorkspaceChangeSet 是 bounded filesystem observation，不是整个 sandbox / process environment 的 complete mutation oracle。**
+
+例如：
+
+```text
+bash("pip install ...")
+bash("npm install ...")
+bash("pytest")
+```
+
+可能改变被 scanner 排除的环境/cache/dependency state，而 WorkspaceChangeSet 仍显示“无 observed change”。
+
+所以 `DIRTY_WRITE_FAILURE`、retry eligibility、WorkspaceRevision 不能只看 `WorkspaceChangeResult.has_changes()`。
 
 纯 READ Node 不强制全量 snapshot，因为其可执行 Tool set 已被证明 read-only。
 
@@ -479,6 +506,11 @@ git diff <base_sha>
 P1 对每个 mutating attempt 生成：
 
 ```python
+class MutationEvidence(str, Enum):
+    PROVEN_NONE = "proven_none"
+    OBSERVED = "observed"
+    UNKNOWN = "unknown"
+
 class NodeWorkspaceDelta(BaseModel):
     node_id: str
     execution_id: str
@@ -488,10 +520,14 @@ class NodeWorkspaceDelta(BaseModel):
     after_revision_generation: int
 
     changed_paths: tuple[str, ...]
+    # Complete only within DeerFlow scanner-visible roots/scope.
     changed_paths_complete: bool
 
     has_observed_changes: bool
     attribution_truncated: bool
+
+    mutating_tool_invoked: bool | None
+    mutation_evidence: MutationEvidence
 
     summary: dict
 
@@ -505,6 +541,42 @@ class NodeWorkspaceDelta(BaseModel):
 - `changed_paths` 来自当前 attempt 的 before/after deterministic snapshot comparison；
 - Task-level `RepositoryChangeSet` 仍负责 authoritative final Git patch；
 - NodeHandoff.changed_paths 来自 `NodeWorkspaceDelta`，不从 cumulative baseline Git diff 推断。
+
+`changed_paths_complete` 的语义必须严格限定为：
+
+> **DeerFlow scanner-visible scope 内的 path attribution completeness。**
+
+它不能解释成“整个 sandbox 没有其他变化”。
+
+#### MutationEvidence 判定
+
+P1 额外使用 execution evidence 判断 mutating tool 是否真正执行：
+
+```text
+PROVEN_NONE
+→ 能证明本 attempt 没有任何 WORKSPACE_MUTATING / UNKNOWN tool call 真正执行
+→ 且 scanner snapshot 未截断
+
+OBSERVED
+→ scanner 观察到 mutation path / state change
+
+UNKNOWN
+→ mutating / UNKNOWN tool 已执行但 scanner 未观察到变化
+OR receipt / tool-call evidence 缺失
+OR snapshot truncated / attribution incomplete
+```
+
+特别是：
+
+```text
+bash executed
++ workspace_changes says no changes
+→ UNKNOWN
+```
+
+而不是 `PROVEN_NONE`。
+
+Tool receipt 只证明调用发生；它不能证明 bash 命令无副作用。因此任何实际执行过的通用 `bash` 在没有更强 sandbox transaction evidence 时，至少使 mutation state 进入 `UNKNOWN`。
 
 #### Snapshot Truncation Fail-Safe
 
