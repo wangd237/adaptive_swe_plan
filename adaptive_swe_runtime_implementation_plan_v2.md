@@ -3101,7 +3101,7 @@ SystemMessage:
 Hidden HumanMessage:
   name = aswe_dependency_context
   hide_from_ui = true
-  content = bounded + escaped dependency handoff envelope
+  content = bounded + escaped dependency handoff projection
   provenance:
     content_kind = aswe_dependency_context
     producer_kind = aswe_handoff_context
@@ -3207,6 +3207,137 @@ ASWEHandoffContextMiddleware
 
 这是显式安全契约，不能依赖当前 middleware 顺序“碰巧安全”。
 
+#### 4.17.5.3 EvidenceRef vs Model-Facing Projection
+
+`EvidenceRef` 是 Runtime persistence / trace reference，不是给模型阅读的最终格式。
+
+错误：
+
+```text
+acceptance_verdict = evidence_01HXYZ
+verification_result = evidence_01HABC
+```
+
+下游模型无法从 opaque id 获得任何有用状态。
+
+同样错误：
+
+```text
+resolve every EvidenceRef
+→ dump full patch / full pytest log / full JSON into prompt
+```
+
+这会重新制造 context explosion。
+
+因此 P1 引入 request-scoped：
+
+```python
+class HandoffEvidenceProjection(BaseModel):
+    changed_paths: tuple[str, ...]
+    changed_paths_complete: bool
+
+    receipt_citation_summary: str | None
+    acceptance_summary: str | None
+    verification_summary: str | None
+
+    evidence_refs: tuple[EvidenceRef, ...]
+
+    historical_evidence_kinds: tuple[str, ...] = ()
+```
+
+它不是新的 persistence object，只是：
+
+```text
+NodeHandoff + ExecutionEvidenceStore + current WorkspaceRevision
+        ↓
+deterministic HandoffRenderer
+        ↓
+bounded model-facing projection
+```
+
+#### Projection Rules
+
+1. **Changed paths**
+   - 直接渲染 observed path list；
+   - `changed_paths_complete=false` 时明确标记“observed subset / attribution truncated”。
+
+2. **Receipt citation verdict**
+   - 只渲染：
+     ```text
+     citation_resolved
+     resolved count
+     failed count
+     unknown count
+     no_citation_claims
+     ```
+   - 不把它渲染成 `verified` / `passed`。
+
+3. **Acceptance verdict**
+   - 可以复用 DeerFlow compact semantics：
+     ```text
+     N hold
+     M does not hold
+     K UNVERIFIED
+     ```
+   - 当下游确实需要修复某个 unmet criterion 时，可以额外渲染对应 bounded leaf：
+     ```text
+     criterion
+     family
+     checked
+     holds
+     bounded detail
+     ```
+   - criterion 属于外部/模型数据，即使 verdict 由 Runtime 生成，渲染时仍需 collapse whitespace + neutralize。
+
+4. **Verification result**
+   - 渲染 deterministic status / failing check identifiers / bounded diagnostics；
+   - 完整 stdout/stderr 保留在 EvidenceStore / backend trace，不进入默认 Handoff。
+
+5. **Patch / RepositoryChangeSet**
+   - 默认只给 changed paths + evidence ref；
+   - 不在普通 Handoff 中复制完整 patch；
+   - Reviewer / Repair 若需要具体 diff，通过 Workspace 重新读取当前文件或显式 evidence-resolution tool/path 获取。
+
+#### Revision-Aware Projection
+
+EvidenceRef 已绑定：
+
+```text
+workspace_revision_generation
+workspace_state_fingerprint
+```
+
+Renderer 在 Workspace lock granted 后，对每条 state-dependent evidence 比较当前 revision：
+
+```text
+evidence revision == execution_workspace_revision
+→ CURRENT
+
+evidence revision < execution_workspace_revision
+→ HISTORICAL / STALE
+```
+
+历史 acceptance / verification 可以告诉下游“当时发生过什么”，但不能渲染成：
+
+```text
+current acceptance holds
+```
+
+必须显式：
+
+```text
+historical acceptance at revision N
+→ revalidate if load-bearing
+```
+
+Receipt execution facts本身不会因为 Workspace 后续变化而“没发生过”，但其相邻状态性结论可能过期；因此 receipt ref 可以保持 historical execution evidence，不能升级成 current-state proof。
+
+原则：
+
+> **References are durable; state-dependent conclusions are revision-scoped.**
+
+---
+
 #### 4.17.6 Bounded Handoff
 
 P1 推荐 Runtime config：
@@ -3245,7 +3376,7 @@ Dependency Handoffs
 - source=A
   revision=...
   self_report=...
-  evidence=...
+  evidence_projection=...
 
 - source=B
   revision=...
@@ -6914,6 +7045,8 @@ typed evidence payload
 
 NodeHandoff 使用同一 EvidenceRef，不建设第二套 handoff-only storage。
 
+Model-facing Handoff 不直接 dump EvidenceStore payload，而由 deterministic HandoffRenderer 生成 bounded `HandoffEvidenceProjection`。
+
 ---
 
 ### 13.3 一期事件类型
@@ -7446,6 +7579,7 @@ a-swe-runtime/
 │   ├── normalizer.py
 │   ├── node_boundary.py
 │   ├── handoff.py
+│   ├── handoff_renderer.py
 │   ├── workspace_revision.py
 │   ├── acceptance_compiler.py
 │   └── materializer.py
@@ -8390,6 +8524,9 @@ Source Audit In Progress
 - WorkspaceRevision advancement 由实际/未知 mutation 决定，不由 Node success 决定；
 - acceptance / verification / invariant evidence 绑定 post-attempt revision；
 - failed dirty WRITE 也先产生新的 dirty post revision；
+- EvidenceRef 是 persistence reference，HandoffEvidenceProjection 才是模型消费视图；
+- state-dependent evidence 按 WorkspaceRevision 标记 CURRENT / HISTORICAL；
+- historical acceptance / verification 不得渲染成 current-state proof；
 
 新增 PoC：
 
@@ -8436,6 +8573,11 @@ Source Audit In Progress
 | POC-H38 | WRITE complete 且无 mutation、snapshot complete | pre/post revision 相同 |
 | POC-H39 | AcceptanceVerdict EvidenceRef | revision/fingerprint 指向 post-attempt state |
 | POC-H40 | NodeWorkspaceDelta | 同时记录 before/after generation |
+| POC-H41 | 下游只有 Acceptance EvidenceRef | renderer 输出 compact hold/fail/UNVERIFIED 摘要而非 opaque id |
+| POC-H42 | acceptance evidence revision < current | projection 显式 historical，不声称 current holds |
+| POC-H43 | 完整 pytest log 很大 | 默认 Handoff 只渲染 bounded verification summary + EvidenceRef |
+| POC-H44 | criterion 含换行/伪造 checklist | projection collapse + neutralize，不能伪造 Runtime verdict line |
+| POC-H45 | receipt evidence stale by workspace revision | 保留“调用曾发生”事实，但不升级为 current-state proof |
 
 ---
 
@@ -8529,6 +8671,7 @@ ValidatedWorkPlan
 - NodeHandoff dual-channel schema；
 - Handoff evidence authority；
 - deterministic multi-parent handoff merge；
+- revision-aware HandoffEvidenceProjection / renderer；
 - DAG Materializer；
 - TaskNode；
 - ToolEffect Registry；
