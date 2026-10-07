@@ -4301,27 +4301,53 @@ PROVIDER_ASSEMBLY_MISMATCH
 
 并且不能让模型“先试试看”。
 
-实现上不发明第二套 Agent termination protocol。
+实现上不发明第二套 Agent termination protocol，但也**不抛普通 Exception / model request AdmissionError**。
 
-Pinned DeerFlow 的 `LLMErrorHandlingMiddleware` 已经把：
-
-```python
-AdmissionError
-```
-
-定义为：
+Pinned DeerFlow 的 `LLMErrorHandlingMiddleware` 会捕获内层普通 `Exception`，进入自己的 LLM/provider retry-classification 与 fallback 路径。若 A-SWE 在这里直接 raise：
 
 ```text
-local admission failed before upstream request
-non-retriable
-reason = admission
+Provider policy mismatch
+→ 被包装成 LLM failure
 ```
 
-因此 trusted Node middleware 在缺失 required tool 时：
+Failure taxonomy 会失真。
 
-1. 把 structured mismatch 写入 NodePolicy runtime outcome；
-2. 抛 `deerflow.models.request_admission.AdmissionError`；
-3. 外层 LLMErrorHandling 捕获；
+因此 trusted Node middleware 在 required-tool closure 失效时采用：
+
+```text
+ASWENodeToolPolicyMiddleware
+      ↓
+DO NOT call downstream model handler
+      ↓
+return non-empty synthetic AIMessage / ModelResponse
+      ↓
+additional_kwargs:
+  deerflow_error_fallback = true
+  aswe_policy_failure = true
+  aswe_failure_code = PROVIDER_ASSEMBLY_MISMATCH
+  aswe_node_execution_id = <id>
+```
+
+设计理由：
+
+1. synthetic response 不调用 `handler(request)`，因此 upstream LLM provider 零调用；
+2. response content 必须非空，避免触发 DeerFlow empty-response retry；
+3. DeerFlow `SubagentExecutor._extract_llm_error_fallback()` 已经把 terminal `deerflow_error_fallback=true` AIMessage 映射为 `SubagentStatus.FAILED`；
+4. A-SWE 自有 marker 只用于精确 FailureTaxonomy，不修改 DeerFlow terminal contract；
+5. 普通 DeerFlow LLM fallback 没有 `aswe_policy_failure`，Adapter 不会误分类。
+
+Adapter 在 Result Mapping 时：
+
+```text
+SubagentResult.status == FAILED
+AND terminal AIMessage.aswe_policy_failure == true
+→ map as A-SWE policy / assembly failure
+
+otherwise
+→ preserve ordinary DeerFlow LLM / execution failure
+```
+
+如果未来 DeerFlow 提供正式公开的 typed node-admission failure contract，再评估替换；P1 不依赖不存在的 admission seam。
 4. 不调用 LLM provider；
 5. 不重试；
 6. 生成带 `deerflow_error_fallback=true` 的 terminal AIMessage；
@@ -6608,7 +6634,8 @@ Implementation PoC Pending
 - P1 明确限制为 single-process policy carrier；distributed carrier 后置。
 - required hard Tool dependency 一期必须是 eager；deferred MCP 仅作为 optional enhancement；
 - NodeToolPolicy 在每次 model call 重新验证 required eager tool availability；
-- required-tool mismatch 复用 DeerFlow AdmissionError 路径，在 upstream LLM request 前 fail；
+- required-tool mismatch 使用 synthetic marked ModelResponse short-circuit，且不调用 upstream LLM handler；
+- `deerflow_error_fallback` 负责复用 DeerFlow FAILED terminalization，A-SWE marker 负责精确 failure mapping；
 - AssemblyDescriptor 定位为 attestation/reproducibility evidence，不作为 admission gate。
 - `PREFLIGHT_FEASIBLE` 只是 planning-time 判断；NodeReady 后必须 live revalidate；
 - DeerFlow execution 使用单一 AppConfig / Tool / Extension snapshot，避免 execution 内 config TOCTOU；
@@ -6623,7 +6650,7 @@ Implementation PoC Pending
 | POC-27 | operator tools ∩ A-SWE Node tools | A-SWE 不会扩大 SubagentConfig 权限 |
 | POC-28 | Provider 声明 required tool 但 backend inventory 缺失 | preflight fail，不进入 Team |
 | POC-29 | 安装 A-SWE assembly observer | executor.assembly_descriptor 非空且 fingerprint 可读取 |
-| POC-30 | runtime / skill policy 移除 required eager tool | first model call 前 admission fail；LLM provider 零调用 |
+| POC-30 | runtime policy 在首轮前移除 required eager tool | NodeToolPolicy synthetic short-circuit；LLM provider 零调用；SubagentResult=FAILED |
 | POC-31 | preferred skill enabled 但未 activation | 不误报 skill-used，也不把 Node 判失败 |
 | POC-32 | authorization deny resolved model | direct-executor Adapter 在 LLM 调用前 strict fail，不静默 fallback |
 | POC-33 | ordinary DeerFlow run | A-SWE attestation extension 不改变普通 Agent execution semantics |
@@ -6635,8 +6662,8 @@ Implementation PoC Pending
 | POC-39 | optional bash 未选择 | READ Node 不因 Provider optional declaration 被升级 WRITE |
 | POC-40 | optional bash 被选择 | WorkspaceAccess 自动升级 WRITE 且 fingerprint 改变 |
 | POC-41 | required tool 被标记 deferred MCP | P1 compile-time reject：hard required tool 必须 eager |
-| POC-42 | Skill activation 后收窄掉 required tool | 下一次 model call admission fail，LLM 不再调用 |
-| POC-43 | Node admission mismatch | SubagentResult=FAILED 且 Adapter 映射 structured PROVIDER_ASSEMBLY_MISMATCH |
+| POC-42 | Skill activation 后收窄掉 required tool | 下一次 model call synthetic short-circuit；LLM 不再调用 |
+| POC-43 | Node admission mismatch | terminal AIMessage 带 A-SWE marker；SubagentResult=FAILED；Adapter 精确映射 PROVIDER_ASSEMBLY_MISMATCH |
 | POC-44 | NodeToolPolicy ordinary run store miss | pass-through；普通 DeerFlow 不受影响 |
 | POC-45 | planning 后新增无关 Tool | inventory drift 被记录，但 Node 仍可 PREPARED |
 | POC-46 | planning 后 required Tool 被移除 | prepare_node 返回 BACKEND_PREFLIGHT_STALE，LLM/Workspace 零副作用 |
@@ -6766,7 +6793,8 @@ Executable TaskDAG
 - NodePolicyStore；
 - trusted ASWENodeToolPolicyMiddleware；
 - first-model / every-model required-tool admission gate；
-- DeerFlow AdmissionError → A-SWE structured failure mapping；
+- synthetic policy-failure ModelResponse short-circuit；
+- A-SWE failure marker → structured failure mapping；
 - final model-visible tool filtering；
 - tool-call name-level deny backstop；
 - A-SWE AgentAssemblyObserver extension；
