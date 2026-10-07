@@ -485,6 +485,7 @@ class NodeWorkspaceDelta(BaseModel):
     attempt: int
 
     before_revision_generation: int
+    after_revision_generation: int
 
     changed_paths: tuple[str, ...]
     changed_paths_complete: bool
@@ -2560,6 +2561,11 @@ class EvidenceRef(BaseModel):
     source_execution_id: str
     source_attempt: int
 
+    # Workspace state observed by this evidence. None only for evidence that is
+    # genuinely workspace-independent.
+    workspace_revision_generation: int | None
+    workspace_state_fingerprint: str | None
+
     content_sha256: str
 
 class HandoffEvidence(BaseModel):
@@ -2611,10 +2617,12 @@ WorkspaceRevision.generation
 规则：
 
 - bootstrap 完成后：`generation = 0`；
-- successful WRITE / UNKNOWN-mutating Node 且 observed Workspace state 发生变化：generation + 1；
-- mutating attempt 的 snapshot attribution 若 truncated / unknown：保守 generation + 1，即使没有观察到具体 changed path；
 - READ Node：不递增；
-- failed dirty WRITE：Workspace 进入 dirty failure state，不发布可供正常下游消费的新 successful Handoff；
+- 任意 WRITE / UNKNOWN-mutating **attempt** 只要 observed state 发生变化：generation + 1；
+- mutating attempt 的 snapshot attribution 若 truncated / unknown：保守 generation + 1，即使没有观察到具体 changed path；
+- revision advancement 由 Workspace state transition 决定，**与 Node 最终 success / acceptance 无关**；
+- failed dirty WRITE：先发布新的 dirty WorkspaceRevision，再进入 `DIRTY_WRITE_FAILURE` / fail-closed；不发布正常 success Handoff；
+- acceptance failure 但 Workspace 已改变：revision 保持新的 post-attempt generation，Repair 必须以该 revision 为输入；
 - `repository_state_fingerprint` 来自 Runtime canonical RepositoryChangeSet / state digest，而不是 Agent self-report。
 
 Handoff 创建时绑定：
@@ -2676,6 +2684,47 @@ execute
 - successful mutating WRITE 完成后发布新的 post-execution WorkspaceRevision。
 
 这关闭 handoff/context 与 Workspace state 之间的 TOCTOU。
+
+#### Pre / Post Attempt Revision Semantics
+
+每个 attempt 明确区分：
+
+```text
+execution_workspace_revision
+→ lock granted 后冻结的 pre-execution revision
+
+post_attempt_workspace_revision
+→ execution 后根据 NodeWorkspaceDelta 推导/发布的 revision
+```
+
+READ：
+
+```text
+pre == post
+```
+
+WRITE / UNKNOWN-mutating：
+
+```text
+no proven mutation
+AND attribution complete
+→ post == pre
+
+observed mutation
+OR attribution unknown/truncated
+→ post.generation = pre.generation + 1
+```
+
+Node 的：
+
+- acceptance verdict；
+- repository invariant evidence；
+- verification result；
+- successful NodeHandoff；
+
+都绑定 **post-attempt revision**，因为它们观察的是执行后的 Workspace。
+
+NodeWorkspaceDelta 同时记录 pre / post revision，用于回答“本 attempt 把 Workspace 从哪个状态推进到了哪个状态”。
 
 #### 4.17.3 Evidence Authority
 
@@ -2930,6 +2979,7 @@ class ExecutionEvidenceStore(Protocol):
 - `evidence_id` 由 Store 生成；
 - `content_sha256` 基于 canonical serialized payload；
 - ref 必须绑定 node / execution / attempt；
+- workspace-sensitive evidence 必须同时绑定 observed WorkspaceRevision generation + state fingerprint；
 - get 时验证 ref metadata 与 stored record 一致；
 - retry / repair 不覆盖旧 evidence；
 - 新 attempt 产生新 EvidenceRef；
@@ -3246,6 +3296,8 @@ RepairFeedback
 +
 Current Workspace Revision
 ```
+
+其中 `Current Workspace Revision` 必须等于 failed acceptance / verification 所观察到的 post-attempt revision；Repair 不允许偷偷回到 pre-attempt revision，除非未来实现显式 rollback/checkpoint。
 
 而不是只把 Tester 的自由文本“tests failed because ...”拼进 prompt。
 
@@ -5198,7 +5250,7 @@ Cancelled
 | provider assembly mismatch | fail closed；P1 不自动换 Provider |
 | READ transient failure | RetryPolicy |
 | WRITE failure 且无 workspace change | bounded retry |
-| WRITE failure 且已有 workspace change | fail closed |
+| WRITE failure 且已有/无法排除 workspace change | publish dirty post revision，然后 fail closed |
 | acceptance does-not-hold | repair unmet condition / fail |
 | verification test failure | bounded upstream repair，再 verify |
 | UNVERIFIED | additional deterministic check 或保留 uncertainty |
@@ -6077,27 +6129,37 @@ ExecutionBackend.execute_prepared()
 Runtime Assembly Attestation
    │
    ▼
-Failure Classification
+WRITE / UNKNOWN-MUTATING
+capture post-attempt snapshot
++ compute NodeWorkspaceDelta
    │
-   ├── safe retry
+   ▼
+Publish post_attempt_workspace_revision
+(state-driven, regardless of acceptance)
+   │
+   ▼
+Repository Invariant Check（mutating）
+   │
+   ▼
+Execution / Dirty-State Failure Classification
+   │
+   ├── clean safe retry
    ├── dirty-write fail
-   ├── bounded repair
-   └── continue
+   └── completed path
    │
    ▼
 Completed? Verify Full Self-Report Receipt Citations
    │
    ▼
 Acceptance Check
+(bind to post-attempt revision)
    │
-   ▼
-Repository Invariant Check（WRITE）
-   │
-   ▼
-Publish / Update WorkspaceRevision（WRITE）
+   ├── holds → continue
+   └── fails / unverified → repair policy / fail
    │
    ▼
 Create NodeHandoff
+(bind to post-attempt revision)
    │
    ▼
 Release Workspace Access
@@ -8302,7 +8364,8 @@ Source Audit In Progress
 - WorkspaceRevision 使用 monotonic generation + repository state fingerprint，不能只看 HEAD；
 - historical receipt 不能作为下游自身 execution proof；
 - model-facing handoff 必须 bounded + neutralized；
-- hidden/framework handoff injection 不能依赖 DeerFlow InputSanitizationMiddleware 自动处理；- Handoff projection 使用独立 ASWEHandoffContextMiddleware；
+- hidden/framework handoff injection 不能依赖 DeerFlow InputSanitizationMiddleware 自动处理；
+- Handoff projection 使用独立 ASWEHandoffContextMiddleware；
 - 不复用 operator-owned prompt_overlay 承载 runtime handoff；
 - system channel 只放固定 authority contract，真实 handoff payload 放 hidden HumanMessage；
 - Handoff injected messages 使用 DeerFlow server-owned provenance metadata 显式标记 producer/content kind；
@@ -8324,6 +8387,9 @@ Source Audit In Progress
 - WRITE / UNKNOWN-mutating attempt 的 before/after snapshot 为 mandatory；
 - Node changed_paths 来自 per-attempt NodeWorkspaceDelta，不从 cumulative baseline diff 推断；
 - snapshot attribution truncated 时按 unknown-dirty 处理 retry，并保守推进 revision；
+- WorkspaceRevision advancement 由实际/未知 mutation 决定，不由 Node success 决定；
+- acceptance / verification / invariant evidence 绑定 post-attempt revision；
+- failed dirty WRITE 也先产生新的 dirty post revision；
 
 新增 PoC：
 
@@ -8365,6 +8431,11 @@ Source Audit In Progress
 | POC-H33 | binary/sensitive/large changed file | path mutation 仍记录，diff content 可 unavailable |
 | POC-H34 | Handoff System/Human injection | read_provenance 可识别 aswe_handoff_context producer |
 | POC-H35 | caller 伪造 DeerFlow provenance keys | host sanitization 不允许其伪装为 A-SWE injected context |
+| POC-H36 | WRITE 修改成功但 acceptance fail | WorkspaceRevision 已 +1，Repair 观察新 revision |
+| POC-H37 | WRITE execution fail 且留下 mutation | 发布 dirty post revision 后 fail closed |
+| POC-H38 | WRITE complete 且无 mutation、snapshot complete | pre/post revision 相同 |
+| POC-H39 | AcceptanceVerdict EvidenceRef | revision/fingerprint 指向 post-attempt state |
+| POC-H40 | NodeWorkspaceDelta | 同时记录 before/after generation |
 
 ---
 
