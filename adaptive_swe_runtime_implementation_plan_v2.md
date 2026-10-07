@@ -2695,6 +2695,26 @@ class ReviewDecision(str, Enum):
     REQUEST_CHANGES = "request_changes"
     UNVERIFIED = "unverified"
 
+class ReviewFindingSubmission(BaseModel):
+    severity: Literal["blocker", "major", "minor", "note"]
+    summary: str
+
+    path: str | None = None
+    line: int | None = None
+
+    # Display receipt ids from the ledger visible to this exact model turn.
+    receipt_citations: tuple[str, ...] = ()
+
+class ReviewVerdictSubmission(BaseModel):
+    decision: ReviewDecision
+    summary: str
+
+    # At least one concrete inspection receipt is required for a mandatory
+    # APPROVE decision in P1.
+    review_basis_receipt_citations: tuple[str, ...]
+
+    findings: tuple[ReviewFindingSubmission, ...] = ()
+
 class ReviewFinding(BaseModel):
     severity: Literal["blocker", "major", "minor", "note"]
     summary: str
@@ -2702,15 +2722,19 @@ class ReviewFinding(BaseModel):
     path: str | None = None
     line: int | None = None
 
-    # Reviewer evidence handle / explanation, still semantic model output.
-    evidence: str | None = None
+    resolved_receipts: tuple[ReceiptRef, ...] = ()
+    unresolved_receipt_ids: tuple[str, ...] = ()
 
 class ReviewVerdict(BaseModel):
     decision: ReviewDecision
-
     summary: str
+
+    review_basis_receipts: tuple[ReceiptRef, ...]
     findings: tuple[ReviewFinding, ...] = ()
 
+    evidence_resolved: bool
+
+    # Runtime-owned envelope.
     reviewed_workspace_revision_generation: int
     reviewed_repository_state_fingerprint: str
 
@@ -2754,7 +2778,7 @@ SubagentStatus.FAILED
 submit_review_verdict
 ```
 
-其 args schema 就是结构化 ReviewVerdict payload（Runtime-owned fields 如 execution/revision 由 Tool 实现补齐或覆盖，不能信任模型自填）。
+其 model-facing args schema 是 `ReviewVerdictSubmission`；`ReviewVerdict` 的 execution/revision/ReceiptRef 等 authority fields 由 Runtime 生成，模型根本不拥有这些字段。
 
 Tool 特性：
 
@@ -2806,6 +2830,98 @@ required_infrastructure_tools
 
 A-SWE 只能在 operator / Provider static contract 允许该 execution surface 时使用它；不能借 runtime output tool 绕过 operator deny。
 
+#### Review Evidence Resolution
+
+普通 Subagent self-report 的：
+
+```python
+verify_receipt_citations(result.result, receipts)
+```
+
+不适用于 structured direct-return Review。
+
+原因：
+
+- direct-return `result.result` 是 ToolMessage content，不是普通 assistant prose；
+- 对 JSON / canonical tool output运行 action-claim regex 会产生错误的 `no_citation_claims`；
+- Review submission 的证据引用已经是结构化字段。
+
+Pinned DeerFlow `ToolReceiptMiddleware` 在每次 model call 时：
+
+1. 从当前 messages 提取 receipts；
+2. 按 context budget 渲染真正给模型看到的 ledger；
+3. 把**同一份 rendered receipt snapshot**写入该轮 AIMessage：
+   ```text
+   additional_kwargs[deerflow_tool_receipt_ledger]
+   ```
+
+而 `SubagentResult.ai_messages` 保存 `message.model_dump()`，因此 A-SWE Adapter 可以从**调用 `submit_review_verdict` 的 terminal AIMessage**恢复 exact citing-turn ledger。
+
+解析链：
+
+```text
+terminal AIMessage
+  ├── tool_call = submit_review_verdict
+  ├── tool args = ReviewVerdictSubmission
+  └── runtime-stamped citing-turn receipt ledger
+                ↓
+ReviewEvidenceResolver
+                ↓
+display rN
+→ exact citing-turn ToolReceipt
+→ stable ReceiptRef
+                ↓
+ReviewVerdict
+```
+
+禁止使用：
+
+```text
+post-run re-enumerated receipt list
+```
+
+解析 Review submission 中的 `rN`，因为 compaction 后 display id 可能重新编号。
+
+#### Review Evidence Rules
+
+Mandatory Review P1：
+
+- `APPROVE` 必须至少有一个成功、可解析的 `review_basis_receipt_citation`；
+- basis receipt 不能只是 `submit_review_verdict` 自己；
+- basis 应来自实际 inspection execution，例如 `read_file / grep / bash` 等当前 Reviewer policy 允许的 Tool；
+- basis citation unknown / failed / anchor mismatch → `evidence_resolved=false`；
+- blocker / major finding 若声明 receipt citation，则所有这些 citation 必须解析；
+- finding 的 `path/line` 仍是 model-authored semantic location，不因 receipt resolved 自动变成 deterministic truth；
+- Runtime 将 resolved display ids 转成 durable `ReceiptRef`，不把 `rN` 直接写进持久 ReviewVerdict。
+
+如果：
+
+```text
+decision = APPROVE
+AND evidence_resolved = false
+```
+
+最终不是 APPROVE，而是：
+
+```text
+REVIEW_GATE_UNVERIFIED
+```
+
+这样至少阻止：
+
+```text
+Reviewer 不读任何代码
+→ 直接调用 APPROVE
+```
+
+被当作有效 hard gate。
+
+注意：
+
+> Receipt resolution 只证明 Reviewer 确实执行过被引用的 inspection calls，不证明其语义判断正确。
+
+---
+
 #### Review Gate Outcome
 
 Review Node 只有同时满足：
@@ -2814,6 +2930,7 @@ Review Node 只有同时满足：
 backend status = completed
 AND completeness = CLEAN
 AND valid terminal submit_review_verdict
+AND ReviewVerdict.evidence_resolved = true
 AND RepositoryStateDigest unchanged
 ```
 
@@ -3367,6 +3484,21 @@ verify_receipt_citations(
 Direct `SubagentExecutor` 不执行这一步。
 
 因此 A-SWE Adapter 必须显式回接同一 verifier，和 acceptance checker 一样不能遗漏。
+
+但该规则只适用于：
+
+```text
+ordinary assistant self-report result
+```
+
+对 Runtime-owned structured direct-return output（P1 当前只有 mandatory Review 的 `submit_review_verdict`）：
+
+```text
+skip prose verify_receipt_citations(result.result, ...)
+→ use the output-contract-specific evidence resolver
+```
+
+否则会把 ToolMessage JSON 错当成 self-report prose。
 
 Provider-neutral 映射建议：
 
@@ -4086,6 +4218,7 @@ class HandoffEvidenceProjection(BaseModel):
     receipt_citation_summary: str | None
     acceptance_summary: str | None
     verification_summary: str | None
+    review_summary: str | None
 
     evidence_refs: tuple[EvidenceRef, ...]
 
@@ -4140,7 +4273,13 @@ bounded model-facing projection
    - 渲染 deterministic status / failing check identifiers / bounded diagnostics；
    - 完整 stdout/stderr 保留在 EvidenceStore / backend trace，不进入默认 Handoff。
 
-5. **Patch / RepositoryChangeSet**
+5. **Review verdict**
+   - 只渲染 decision、bounded summary、finding counts / bounded blocking findings；
+   - `evidence_resolved` 明确显示；
+   - ReceiptRef 保持 evidence reference，不把它描述成 semantic proof；
+   - historical ReviewVerdict 按 revision 标记，不作为 current review gate proof。
+
+6. **Patch / RepositoryChangeSet**
    - 默认只给 changed paths + evidence ref；
    - 不在普通 Handoff 中复制完整 patch；
    - Reviewer / Repair 若需要具体 diff，通过 Workspace 重新读取当前文件或显式 evidence-resolution tool/path 获取。
@@ -33626,6 +33765,9 @@ Source Audit In Progress
 - mandatory Review 不解析自由文本 verdict，使用 A-SWE-owned structured direct-return Tool；
 - ReviewDecision 是 semantic evidence，Runtime 拥有 revision/execution envelope；
 - mandatory Review 只接受 CLEAN completion + valid ReviewVerdict + repository state unchanged。
+- structured direct-return Review 不运行普通 prose receipt verifier；
+- ReviewEvidenceResolver 使用 terminal AIMessage 上 runtime-stamped citing-turn ledger 解析 rN；
+- mandatory APPROVE 至少需要一个成功 inspection receipt，防止 zero-inspection approval。
 - BindingStore 横跨 Scheduler loop 与 DeerFlow isolated subagent loop，P1 使用 thread-safe 同步而非 loop-bound asyncio.Lock。
 
 新增 PoC：
@@ -33717,6 +33859,12 @@ Source Audit In Progress
 | POC-H81 | Reviewer verdict 伪造 revision/execution id | Tool/Runtime 覆盖并验证 authoritative envelope |
 | POC-H82 | ordinary DeerFlow run | 不暴露 submit_review_verdict |
 | POC-H83 | REVIEW Node 修改 Git-visible repo 后 APPROVE | mutation authority violation 优先，review 不通过 |
+| POC-H84 | direct-return Review JSON 含 action-like words | 不运行普通 prose citation verifier，不误报 no_citation_claims |
+| POC-H85 | Review APPROVE 无 basis receipts | REVIEW_GATE_UNVERIFIED |
+| POC-H86 | Review 引用 citing-turn r3，后续 compaction renumber | 通过 terminal AIMessage ledger 解析到原 tool_call_id |
+| POC-H87 | Review basis 引用 failed / unknown receipt | evidence_resolved=false，gate unsatisfied |
+| POC-H88 | Review basis 只引用 submit_review_verdict 自身 | 不算 inspection evidence |
+| POC-H89 | valid basis receipt | display rN 转 durable ReceiptRef 后入 ReviewVerdict |
 
 ---
 
@@ -33897,6 +34045,7 @@ Executable TaskDAG
 - Test Execution；
 - Regression Test；
 - Reviewer + structured `submit_review_verdict` direct-return gate；
+- citing-turn ReviewEvidenceResolver；
 - Git-aware task-level Repository ChangeSet；
 - per-attempt NodeWorkspaceDelta；
 - DeerFlow Workspace ChangeSet；
@@ -34080,6 +34229,7 @@ Coder            exclusive WRITE
 40. 为什么 Tester 可以获得 WRITE lock，却仍然不能修改 Git-visible Repository patch？
 41. 为什么 DeerFlow `completed + stop_reason` 不能直接映射为 A-SWE Node success？
 42. 为什么 mandatory Review 不能只解析 Reviewer 自由文本，而要用 structured direct-return verdict？
+43. 为什么 Review direct-return verdict 不能复用普通 self-report receipt verifier？
 
 ### 21.4 代码掌握边界
 
