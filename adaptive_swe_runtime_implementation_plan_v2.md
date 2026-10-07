@@ -2424,17 +2424,38 @@ class WorkspaceRevision(BaseModel):
     repository_state_fingerprint: str
     dirty: bool
 
+class ReceiptRef(BaseModel):
+    source_execution_id: str
+    receipt_id: str
+    tool_name: str | None = None
+
+class EvidenceRef(BaseModel):
+    evidence_id: str
+    kind: Literal[
+        "repository_changeset",
+        "workspace_changeset",
+        "acceptance_verdict",
+        "verification_result",
+        "repository_invariant",
+    ]
+
+    source_node_id: str
+    source_execution_id: str
+    source_attempt: int
+
+    content_sha256: str
+
 class HandoffEvidence(BaseModel):
-    receipt_ids: tuple[str, ...] = ()
+    receipt_refs: tuple[ReceiptRef, ...] = ()
 
     changed_paths: tuple[str, ...] = ()
     untracked_paths: tuple[str, ...] = ()
 
-    repository_changeset_id: str | None = None
-    workspace_changeset_id: str | None = None
+    repository_changeset: EvidenceRef | None = None
+    workspace_changeset: EvidenceRef | None = None
 
-    acceptance_verdict_id: str | None = None
-    verification_result_id: str | None = None
+    acceptance_verdict: EvidenceRef | None = None
+    verification_result: EvidenceRef | None = None
 
 class NodeHandoff(BaseModel):
     source_node_id: str
@@ -2501,7 +2522,7 @@ Revision mismatch 本身不是自动失败；它是 staleness signal。
 | Field | Authority |
 |---|---|
 | `self_report` | model-authored / untrusted |
-| `receipt_ids` | DeerFlow execution evidence reference |
+| `receipt_refs` | DeerFlow execution-scoped evidence reference |
 | `changed_paths` | Git / Workspace deterministic evidence |
 | `untracked_paths` | Git-aware Runtime evidence |
 | acceptance verdict | deterministic checker output |
@@ -2526,18 +2547,131 @@ Agent 的路径声明若与 Runtime evidence 不一致，只能进入 warning / 
 
 #### 4.17.4 Receipt 继承边界
 
-上游 receipt id 是历史证据引用，不是下游执行证据。
+上游 receipt 是历史证据引用，不是下游执行证据。
+
+DeerFlow receipt id（例如 `r3`）是 execution-local identifier。不同 Node execution 都可能产生：
+
+```text
+r1
+r2
+r3
+```
+
+因此 Handoff 禁止保存裸：
+
+```text
+receipt_ids = ["r3"]
+```
+
+必须使用：
+
+```text
+ReceiptRef(
+  source_execution_id=...,
+  receipt_id="r3",
+  tool_name="write_file"
+)
+```
 
 下游 prompt 必须明确：
 
 ```text
-[rN] from dependency handoff
+r3 from execution A
+≠ r3 from execution B
 ≠ your own tool execution
 ```
 
 不得让 Node B 引用 Node A 的 receipt 来证明“Node B 已执行该动作”。
 
 这一点与 DeerFlow `ParentContextSnapshot` 的历史 receipt 边界保持一致。
+
+#### 4.17.4.1 Execution Evidence Store
+
+只在 Handoff 中写：
+
+```text
+repository_changeset_id
+acceptance_verdict_id
+verification_result_id
+```
+
+但没有 resolver / owner，是无效设计。
+
+P1 新增 provider-neutral：
+
+```python
+class ExecutionEvidenceStore(Protocol):
+    def put(
+        self,
+        *,
+        task_id: str,
+        node_id: str,
+        execution_id: str,
+        attempt: int,
+        kind: str,
+        payload: BaseModel | dict,
+    ) -> EvidenceRef:
+        ...
+
+    def get(self, ref: EvidenceRef) -> BaseModel | dict:
+        ...
+```
+
+职责：
+
+- evidence object immutable；
+- `evidence_id` 由 Store 生成；
+- `content_sha256` 基于 canonical serialized payload；
+- ref 必须绑定 node / execution / attempt；
+- get 时验证 ref metadata 与 stored record 一致；
+- retry / repair 不覆盖旧 evidence；
+- 新 attempt 产生新 EvidenceRef；
+- Trace UI / Handoff renderer 通过 Store resolve；
+- Handoff 只携带 bounded facts + immutable refs，不复制大 patch / test log。
+
+P1 默认实现建议使用 task-runtime 本地文件持久化，而不是只存在 Python dict：
+
+```text
+<runtime_data_dir>/
+  tasks/<task_id>/
+    events.jsonl
+    evidence/
+      <evidence_id>.json
+```
+
+它位于 Repository Workspace 之外，避免：
+
+- Agent 修改 Trace；
+- Evidence 文件污染 Git ChangeSet；
+- cleanup Workspace 时丢失 Runtime Trace。
+
+一期只要求 single-process writer；不承诺 distributed transactional store。
+
+#### Attempt Ownership
+
+Evidence 是 attempt-scoped：
+
+```text
+node=implement
+attempt=1 → evidence A
+attempt=2 → evidence B
+```
+
+若 attempt 2 成为 terminal accepted attempt：
+
+- NodeHandoff 只能引用 attempt 2 的 terminal evidence；
+- attempt 1 保留在 Trace 中用于调试；
+- attempt 1 receipt / changeset 不自动合并到 attempt 2；
+- RepairFeedback 可以显式引用产生失败反馈的 verification attempt。
+
+禁止：
+
+```text
+retry succeeded
+→ reuse old acceptance_verdict_id
+```
+
+这可避免 stale / ghost evidence。
 
 #### 4.17.5 Handoff Sanitization
 
@@ -2735,8 +2869,8 @@ class RepairFeedback(BaseModel):
     observed_workspace_revision: WorkspaceRevision
 
     deterministic_failures: tuple[str, ...]
-    verification_result_id: str | None
-    receipt_ids: tuple[str, ...]
+    verification_result: EvidenceRef | None
+    receipt_refs: tuple[ReceiptRef, ...]
 
     verifier_report: str | None  # untrusted if model-authored
 ```
@@ -2762,7 +2896,7 @@ Handoff fingerprint 至少覆盖：
 ```text
 source node / execution / attempt
 observed workspace revision
-runtime evidence refs
+runtime evidence refs + receipt execution ownership
 bounded self-report
 warnings
 ```
@@ -6314,6 +6448,34 @@ class RuntimeEvent(BaseModel):
     payload: dict
 ```
 
+### 13.2.1 Execution Evidence Store Ownership
+
+`RuntimeEvent` 与 immutable evidence object 分离：
+
+```text
+RuntimeEvent
+→ timeline / decision / state transition
+
+ExecutionEvidenceStore
+→ changeset / acceptance / verification / invariant payload
+```
+
+事件可以保存 EvidenceRef，但不把大 Patch、完整验证输出重复塞进 event payload。
+
+P1 Trace 页面：
+
+```text
+event
+  ↓ evidence_ref
+ExecutionEvidenceStore
+  ↓
+typed evidence payload
+```
+
+NodeHandoff 使用同一 EvidenceRef，不建设第二套 handoff-only storage。
+
+---
+
 ### 13.3 一期事件类型
 
 至少记录：
@@ -6865,6 +7027,7 @@ a-swe-runtime/
 ├── observability/
 │   ├── events.py
 │   ├── event_bus.py
+│   ├── evidence_store.py
 │   ├── trace_store.py
 │   └── metrics.py
 │
@@ -7746,6 +7909,10 @@ Source Audit In Progress
 - 多 parent handoff deterministic merge，保留 source provenance；
 - repair feedback 使用独立 typed contract；
 - Handoff fingerprint 与 Workspace state fingerprint 分离。
+- DeerFlow receipt 必须 execution-scoped，不保存裸 rN；
+- changeset / acceptance / verification 由 ExecutionEvidenceStore 持有；
+- EvidenceRef immutable 且 attempt-scoped；
+- retry / repair 不覆盖旧 attempt evidence；
 
 新增 PoC：
 
@@ -7766,6 +7933,11 @@ Source Audit In Progress
 | POC-H13 | operator prompt_overlay 已配置 | A-SWE handoff 不修改 overlay 内容/顺序 |
 | POC-H14 | handoff 中含 `<system>` / fake framework tag | renderer neutralize，不能逃逸到 authority channel |
 | POC-H15 | 多轮 model call | handoff request-scoped 重投影，不写入 graph state/不重复累积 |
+| POC-H16 | 两个 Node 都有 r3 receipt | ReceiptRef 通过 source_execution_id 消除歧义 |
+| POC-H17 | Node retry attempt 2 成功 | Handoff 只引用 terminal attempt 2 evidence |
+| POC-H18 | old attempt evidence | Trace 可查，但不自动进入新 Handoff |
+| POC-H19 | Runtime restart 后读 Demo trace | file-backed EvidenceRef 仍可 resolve |
+| POC-H20 | Agent 修改 workspace | 无法修改 workspace 外 Runtime evidence store |
 
 ---
 
@@ -7924,6 +8096,8 @@ Executable TaskDAG
 - Trace Store；
 - Decision Timeline；
 - Node Execution Evidence；
+- ExecutionEvidenceStore；
+- attempt-scoped EvidenceRef；
 - backend trace correlation；
 - Metrics；
 - 简单 Trace Viewer。
