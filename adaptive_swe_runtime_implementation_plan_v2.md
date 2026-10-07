@@ -3684,60 +3684,222 @@ Planner dependency 先做：
 ```text
 existence validation
 cycle detection
+phase consistency
 transitive sanity check
-side-effect normalization
 ```
 
-Workspace Mutex 只能保证“不会同时执行”，不能保证“谁先执行”。
+Workspace Mutex 只能回答：
 
-因此所有 unordered conflict pair 必须在 Materialization 阶段获得 deterministic order。
+> **两个 Node 能不能同时执行？**
 
-#### unordered WRITE / WRITE
+它不能回答：
+
+> **哪个 Node 应该先观察 Repository 状态？**
+
+因此 DAG Materializer 先依据 `WorkKind` 冻结语义阶段，再用 `WorkspaceAccess` 解决同阶段或未显式排序的资源冲突。
+
+#### 9.4.1 WorkKind Phase Order
+
+P1 定义语义偏序：
 
 ```text
-WRITE A
+DISCOVERY
+    ↓
+IMPLEMENTATION
+    ↓
+VERIFICATION
+    ↓
+REVIEW
+```
+
+这不是要求所有任务都必须包含四阶段，而是：
+
+> 当两个节点共享同一任务状态、存在潜在 workspace interaction 且没有用户/Planner 明确 dependency 时，Runtime 不得生成违背这一语义方向的顺序。
+
+典型：
+
+```text
+Explorer READ
+→ Coder WRITE
+
+Coder WRITE
+→ Tester WRITE/exclusive
+
+Tester WRITE/exclusive
+→ Reviewer READ
+```
+
+注意：
+
+```text
+WorkspaceAccess(Tester) = WRITE
+WorkspaceAccess(Reviewer) = READ
+```
+
+并不会推出：
+
+```text
+Reviewer → Tester
+```
+
+因为语义顺序由 WorkKind 决定。
+
+#### 9.4.2 Explicit Dependency Validation
+
+Planner 显式 dependency 优先保留，但必须通过 phase consistency。
+
+例如：
+
+```text
+REVIEW → IMPLEMENTATION
+```
+
+若 REVIEW 的语义是最终修改后审查，则属于：
+
+```text
+PHASE_ORDER_CONTRADICTION
+```
+
+进入 bounded replan，而不是 Runtime 静默反转 Edge。
+
+同理：
+
+```text
+VERIFICATION → IMPLEMENTATION
+```
+
+对独立 post-change verification 是非法方向。
+
+若 Planner 真正想表达：
+
+> “先检查现有 tests，再决定怎么改”
+
+则前一个 WorkItem 应标为：
+
+```text
+DISCOVERY
+```
+
+而不是 VERIFICATION。
+
+#### 9.4.3 Cross-Phase Missing Edges
+
+若两个相关 Node phase 有明确偏序但 Planner 漏边：
+
+```text
+DISCOVERY + IMPLEMENTATION
+→ add DISCOVERY → IMPLEMENTATION
+
+IMPLEMENTATION + VERIFICATION
+→ add IMPLEMENTATION → VERIFICATION
+
+VERIFICATION + REVIEW
+→ add VERIFICATION → REVIEW
+```
+
+这种 Edge 注入是 monotonic ordering repair：
+
+- 不改变 objective；
+- 不删除 WorkItem；
+- 不扩大权限；
+- 只阻止语义阶段倒序或错误并行。
+
+所有 injected edges 必须进入：
+
+```text
+PlanRepair log
+```
+
+#### 9.4.4 Same-Phase Workspace Conflict
+
+当 WorkKind 相同、Planner 未显式排序，但 WorkspaceAccess 冲突：
+
+##### WRITE / WRITE
+
+```text
+Node A
   ↓
-WRITE B
+Node B
 ```
 
 按 validated planner ordinal 等稳定顺序串行。
 
-#### unordered READ / WRITE
+##### READ / WRITE
 
-若只靠 lock：
-
-```text
-READ first  → 看到 mutation 前状态
-WRITE first → 看到 mutation 后状态
-```
-
-会形成语义不确定性。
-
-一期默认：
+不再采用全局：
 
 ```text
-READ
- ↓
-WRITE
+READ → WRITE
 ```
 
-即独立 read-only exploration 优先基于当前稳定状态完成。
+规则。
 
-如果 READ 本来就应该观察 mutation 后状态，Planner 必须显式生成：
+同一 phase 中使用稳定 planner ordinal：
 
 ```text
-WRITE → READ
+earlier ordinal
+      ↓
+later ordinal
 ```
 
-依赖。
+因为一旦二者都属于同一语义阶段，Runtime 没有足够 authority 根据 READ/WRITE 猜测业务数据依赖。
+
+若真实语义需要固定顺序，Planner 必须显式依赖，或由 phase/gate rule 推导。
+
+#### 9.4.5 READ / READ
+
+无 dependency 且均为：
+
+```text
+WorkspaceAccess.READ
+```
+
+时可以并行。
+
+#### 9.4.6 WorkKind 与 Access Validation
+
+典型 consistency：
+
+| WorkKind | 允许的物理 Access | 说明 |
+|---|---|---|
+| DISCOVERY | READ 为主 | 若编译成 WRITE，需明确 ToolEffect 原因并产生 warning |
+| IMPLEMENTATION | READ / WRITE | 通常 WRITE |
+| VERIFICATION | READ / WRITE | bash testing 常被物理编译成 WRITE |
+| REVIEW | READ 为主 | P1 不允许 Reviewer 拥有 business mutation capability |
+
+因此：
+
+> **WorkKind 是语义 phase；WorkspaceAccess 是并发资源 class。二者都进入 DAG Materialization，但职责不能混用。**
+
+#### 9.4.7 Ordering Algorithm
+
+P1 Materializer：
+
+```text
+1. preserve validated explicit edges
+2. reject explicit phase inversion
+3. inject mandatory gate edges
+4. add missing cross-phase edges when nodes are workspace-related
+5. recompute acyclic
+6. for remaining unordered conflicting same-phase pairs:
+      stable ordinal serialization
+7. recompute transitive reduction / canonical edge ordering
+8. emit PlanRepair log
+```
+
+其中“workspace-related”一期可保守定义为：
+
+> 同一个 WorkspaceSession 中、至少一个节点不是 pure READ-independent branch。
+
+不做复杂 file-level dependency inference。
 
 原则：
 
-> **Workspace lock 负责运行时互斥；DAG normalization 负责确定性语义顺序。**
+> **Semantic phase determines direction; Workspace policy determines concurrency.**
 
 ### 9.5 READ Parallelism
 
-只有 unordered READ / READ 允许真实并行：
+只有 dependency-free 且语义 phase 允许并行的 READ / READ 才允许真实并行：
 
 ```text
 Inspect API ─┐
@@ -6663,6 +6825,11 @@ Plan Compiler Rules Audit In Progress
 - execution-time arbitrary DAG mutation 不属于 MVP；
 - Plan validation 分为 Semantic 与 Execution 两阶段；
 - unordered READ / WRITE 同样需要 deterministic dependency normalization；
+- 旧的全局 READ→WRITE 默认顺序被废弃；
+- WorkKind 与 WorkspaceAccess 分离；
+- DAG ordering 优先遵守 DISCOVERY→IMPLEMENTATION→VERIFICATION→REVIEW 语义 phase；
+- Reviewer READ 不得因为 access class 被错误排到 Tester/Writer 前；
+- same-phase conflict 才使用 stable planner ordinal 做保守串行；
 - Retry、Repair、Replan、Fail-Closed 必须分离；
 - DeerFlow workspace snapshot 不是 transactional rollback；
 - dirty WRITE failure 一期禁止自动 retry；
@@ -6676,14 +6843,27 @@ Plan Compiler Rules Audit In Progress
 - TaskSpec 与 authoritative TaskContract 分离；
 - TaskContract / Constraint Compiler 进入下一轮 P0-4 审计。
 
+P0-3 新增 deterministic compiler PoC：
+
+| PoC | 测试内容 | 必须验证 |
+|---|---|---|
+| POC-P3-01 | Coder WRITE + Tester bash WRITE | IMPLEMENTATION → VERIFICATION |
+| POC-P3-02 | Tester WRITE + Reviewer READ | VERIFICATION → REVIEW，而不是 READ → WRITE |
+| POC-P3-03 | Explorer READ + Coder WRITE | DISCOVERY → IMPLEMENTATION |
+| POC-P3-04 | 两个同 phase WRITE 且无 edge | stable ordinal serialization |
+| POC-P3-05 | Planner 显式 REVIEW → IMPLEMENTATION | PHASE_ORDER_CONTRADICTION |
+| POC-P3-06 | 两个独立 DISCOVERY READ | 保持并行 |
+| POC-P3-07 | mandatory verification/review 缺失 | Runtime 注入 reserved gate nodes |
+| POC-P3-08 | Planner 使用 __aswe_ id | hard reject |
+
 下一步继续审计：
 
 ```text
-PlanValidator
+Capability Authority
 +
-PlanNormalizer
+Coverage Validation
 +
-DAG Materializer
+Runtime Gate Compilation
 ```
 
 的 deterministic rule set、repair boundary 与 bounded replan policy。
