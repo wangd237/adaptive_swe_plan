@@ -3195,22 +3195,10 @@ class WorkspaceRevision(BaseModel):
     repository_state_fingerprint: str
     dirty: bool
 
-class ReceiptRef(BaseModel):
-    source_execution_id: str
-
-    # Stable execution identity.
-    tool_call_id: str
-    tool_name: str
-
-    args_sha256: str
-    output_sha256: str
-
-    # Model-facing display/citation label only; not a durable primary key.
-    display_receipt_id: str | None = None
-
 class EvidenceRef(BaseModel):
     evidence_id: str
     kind: Literal[
+        "tool_receipt_ledger",
         "repository_changeset",
         "workspace_changeset",
         "report_receipt_verdict",
@@ -3229,7 +3217,23 @@ class EvidenceRef(BaseModel):
     workspace_revision_generation: int | None
     workspace_state_fingerprint: str | None
 
+    # Full SHA-256 over A-SWE canonical serialized evidence payload.
     content_sha256: str
+
+class ReceiptRef(BaseModel):
+    source_execution_id: str
+
+    # Durable authoritative locator.
+    ledger_evidence: EvidenceRef
+    ledger_index: int
+
+    # Copied bounded facts for rendering/diagnostics only.
+    display_receipt_id: str | None
+    tool_call_id: str | None
+    tool_name: str
+
+    args_freshness_stamp: str | None
+    output_freshness_stamp: str | None
 
 class HandoffEvidence(BaseModel):
     receipt_refs: tuple[ReceiptRef, ...] = ()
@@ -3517,9 +3521,15 @@ does not validate claim correctness
 必须使用完整 `SubagentResult.result`：
 
 ```text
+harvest exact DeerFlow receipt ledger
+        ↓
+persist ToolReceiptLedgerEvidence
+        ↓
 full untruncated SubagentResult.result
         ↓
-verify_receipt_citations()
+verify_receipt_citations() against that ledger
+        ↓
+map resolved display ids → ledger-backed ReceiptRefs
         ↓
 store ReportReceiptVerdict EvidenceRef
         ↓
@@ -3547,74 +3557,143 @@ truncate Handoff report first
 
 #### 4.17.4 Receipt 继承边界
 
-上游 receipt 是历史证据引用，不是下游执行证据。
+上游 receipt 是历史 execution evidence，不是下游自身执行证据。
 
-DeerFlow receipt display id（例如 `r3`）既是 execution-local，又可能在 history compaction 后重新编号。
+Pinned DeerFlow 的 receipt 有四条必须保留的边界：
 
-Pinned DeerFlow `tool_receipt.py` 明确规定：
+1. display id `rN` 是 positional label，compaction / summarization 后可能重新编号；
+2. `tool_call_id` 是 provider/runtime correlation field，但 receipt structural validation 允许空字符串，因此不能提升成跨持久化层全局主键；
+3. `args_sha256 / output_sha256` 实际是 `sha256(...).hexdigest()[:16]` 的短值；
+4. DeerFlow 源码明确把 `output_sha256` 描述为 freshness stamp，而不是 persisted-message 可重新验证的 durable fingerprint。
 
-```text
-rN
-→ positional display id
-→ may renumber after summarization / compaction
-```
-
-Completed SubagentResult 会优先 harvest citing-turn ledger snapshot，避免把终态 compact 后的 `rN` 重新解释为另一条调用；但 A-SWE 仍不能把 `rN` 当 durable evidence key。
-
-因此 Handoff 禁止保存裸：
-
-```text
-receipt_ids = ["r3"]
-```
-
-也不把：
-
-```text
-(source_execution_id, r3)
-```
-
-视为长期稳定主键。
-
-ReceiptRef 使用：
+因此禁止把：
 
 ```text
 source_execution_id
-+
-tool_call_id
-+
-tool_name
-+
-args_sha256
-+
-output_sha256
++ tool_call_id
++ args_sha256
++ output_sha256
 ```
 
-作为稳定 execution fact identity；`display_receipt_id` 仅用于重现模型当时看到的 citation label。
+描述成 cryptographically strong / globally unique receipt identity。
 
-例如：
+##### Receipt Ledger 作为 Durable Evidence Authority
+
+A-SWE 在 Node terminal evidence finalization 时，把 DeerFlow harvested receipt ledger 映射为 provider-neutral：
 
 ```python
-ReceiptRef(
-    source_execution_id="exec-123",
-    tool_call_id="call_abc",
-    tool_name="write_file",
-    args_sha256="...",
-    output_sha256="...",
-    display_receipt_id="r3",
-)
+class ToolReceiptLedgerEvidence(BaseModel):
+    source_execution_id: str
+    source_node_id: str
+    source_attempt: int
+
+    # "citing_turn" when DeerFlow recovered the exact ledger visible to the
+    # terminal citing AIMessage; otherwise "terminal_harvest".
+    ledger_source: Literal["citing_turn", "terminal_harvest"]
+
+    receipts: tuple[dict, ...]
 ```
+
+并首先写入：
+
+```text
+ExecutionEvidenceStore
+→ EvidenceRef(kind="tool_receipt_ledger")
+```
+
+该 ledger artifact：
+
+- attempt-scoped；
+- immutable；
+- 整体 payload 由 A-SWE EvidenceStore 使用**完整 SHA-256**做 integrity hash；
+- 保留 DeerFlow harvested ledger 的原始顺序；
+- 保留每条 receipt 的：
+  - display `id`；
+  - `tool_call_id`；
+  - `tool_name`；
+  - `status`；
+  - short `args_sha256`；
+  - short `output_sha256`；
+  - `output_bytes`；
+  - `created_at`。
+
+单条 durable receipt reference 使用：
+
+```python
+class ReceiptRef(BaseModel):
+    source_execution_id: str
+
+    ledger_evidence: EvidenceRef
+    ledger_index: int
+
+    display_receipt_id: str | None
+    tool_call_id: str | None
+    tool_name: str
+
+    args_freshness_stamp: str | None
+    output_freshness_stamp: str | None
+```
+
+authoritative locator 是：
+
+```text
+ledger_evidence
++
+ledger_index
+```
+
+`source_execution_id` 只承担 ownership consistency check，不单独构成 receipt address。
+
+##### ReceiptRef Resolve Contract
+
+Resolver 必须：
+
+1. 通过 EvidenceStore resolve `ledger_evidence`；
+2. 验证 artifact full SHA-256；
+3. 验证 ledger metadata 属于 `source_execution_id`；
+4. 验证 `ledger_index` 合法；
+5. 读取该 index 的 canonical receipt；
+6. 对 ReceiptRef 中复制的 `tool_name / tool_call_id / freshness stamps / display id` 做 consistency check；
+7. 任一不一致返回 typed evidence-integrity failure，不能继续作为 Handoff / Review evidence。
+
+这样即使：
+
+- provider `tool_call_id=""`；
+- 两次 execution 复用同一 provider call id；
+- `r3` 在后续 compaction 中重新编号；
+- short hash 发生理论碰撞；
+
+也不会改变已经持久化 ledger 中该 receipt 的 durable address。
+
+##### DeerFlow Receipt 字段的真实语义
+
+```text
+display_receipt_id
+→ 重现模型当时看到的 citation label
+
+tool_call_id
+→ execution/provider correlation hint
+
+args/output short hashes
+→ DeerFlow freshness / diagnostic stamps
+
+EvidenceRef.content_sha256
+→ A-SWE immutable evidence artifact integrity hash
+```
+
+这些语义禁止混用。
 
 下游 prompt 必须明确：
 
 ```text
-[r3] is historical display metadata
-not a durable global id
-not your own execution proof
+[rN] from dependency execution
+≠ durable global id
+≠ your own tool execution
 ```
 
-不得让 Node B 引用 Node A 的 receipt 来证明“Node B 已执行该动作”。
+不得让 Node B 引用 Node A receipt 来证明“Node B 已执行该动作”。
 
-这一点与 DeerFlow `ParentContextSnapshot` 的历史 receipt 边界保持一致。
+这一点与 DeerFlow `ParentContextSnapshot` 的 historical receipt boundary 保持一致。
 
 #### 4.17.4.1 Execution Evidence Store
 
@@ -3813,6 +3892,39 @@ args_sha256 / output_sha256
 - final evidence file 不允许 silent overwrite。
 
 P1 不要求跨多个 evidence objects 的原子事务；一个 attempt 的多个 EvidenceRef 通过 terminal NodeExecutionRecord / Trace 关联。
+
+#### Receipt Evidence Finalization Ordering
+
+Receipt ledger 是其他 receipt-derived evidence 的父 artifact，因此 attempt terminalization 必须遵守：
+
+```text
+Subagent terminal result
+      ↓
+harvest / recover DeerFlow receipt ledger
+      ↓
+persist ToolReceiptLedgerEvidence
+      ↓
+obtain ledger EvidenceRef
+      ↓
+build ReceiptRefs against ledger index
+      ↓
+report receipt verdict / ReviewVerdict / Handoff evidence
+```
+
+如果 receipt ledger 应该存在但 ledger persistence 失败：
+
+- 不允许创建悬空 ReceiptRef；
+- 不允许继续发布“已验证 citation”的 verdict；
+- attempt 进入 typed `EVIDENCE_FINALIZATION_FAILURE`；
+- 不生成 normal success Handoff。
+
+P1 不要求 ledger + child evidence 多对象事务，但要求：
+
+> **parent evidence must exist before child references are published.**
+
+若后续 child evidence 写入失败，已发布 ledger artifact可以保留为 orphan-but-valid trace evidence；Node logical success 不得在 evidence finalization 未完成时提前发布。
+
+---
 
 #### Attempt Ownership
 
@@ -6318,6 +6430,7 @@ PlanInvalidated
 PolicyViolation
 RepositoryInvariantFailure
 RepositoryMutationAuthorityViolation
+EvidenceFinalizationFailure
 Cancelled
 ```
 
@@ -9913,7 +10026,7 @@ Integration PoC Pending
 - repair feedback 使用独立 typed contract；
 - Handoff fingerprint 与 Workspace state fingerprint 分离。
 - DeerFlow receipt 必须 execution-scoped，不保存裸 rN；
-- `rN` 是可重编号 display id；durable ReceiptRef 使用 immutable receipt-ledger EvidenceRef + ledger index；tool_call_id / short hashes 仅作一致性字段；
+- `rN` 是可重编号 display id；durable ReceiptRef 使用 immutable receipt-ledger EvidenceRef + ledger index；tool_call_id / short hashes 只作 correlation/freshness consistency 字段；
 - changeset / acceptance / verification 由 ExecutionEvidenceStore 持有；
 - EvidenceRef immutable 且 attempt-scoped；
 - retry / repair 不覆盖旧 attempt evidence；
@@ -9981,6 +10094,10 @@ Integration PoC Pending
 | POC-H15 | 多轮 model call | handoff request-scoped 重投影，不写入 graph state/不重复累积 |
 | POC-H16 | 两个 Node 都有 r3 receipt | ReceiptRef 通过 receipt-ledger EvidenceRef + ledger_index 消除歧义 |
 | POC-H16A | 同一 execution compaction 后 receipt renumber | durable ref 仍由 immutable receipt ledger + ledger_index 解析，display rN 不作主键 |
+| POC-H16B | receipt tool_call_id 为空 | ReceiptRef 仍通过 ledger EvidenceRef + ledger_index 稳定解析 |
+| POC-H16C | 两个 execution 复用同一 tool_call_id | execution-owned ledger artifact 隔离，无跨 execution 歧义 |
+| POC-H16D | receipt short hash 相同 | short hash 不作 durable identity；EvidenceStore full SHA-256 保护 ledger integrity |
+| POC-H16E | ledger persistence failure | 不发布 child ReceiptRef / success Handoff，EVIDENCE_FINALIZATION_FAILURE |
 | POC-H17 | Node retry attempt 2 成功 | Handoff 只引用 terminal attempt 2 evidence |
 | POC-H18 | old attempt evidence | Trace 可查，但不自动进入新 Handoff |
 | POC-H19 | Runtime restart 后读 Demo trace | file-backed EvidenceRef 仍可 resolve |
@@ -10281,6 +10398,7 @@ Executable TaskDAG
 - Decision Timeline；
 - Node Execution Evidence；
 - ExecutionEvidenceStore；
+- ToolReceiptLedgerEvidence / ledger-backed ReceiptRef；
 - attempt-scoped EvidenceRef；
 - backend trace correlation；
 - Metrics；
