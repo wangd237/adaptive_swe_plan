@@ -2367,7 +2367,10 @@ Provider 对自己支持的每个 Capability 声明实现契约：
 class CapabilityBinding(BaseModel):
     capability_id: str
 
+    # P1: hard dependencies must be eagerly model-callable
     required_tools: tuple[str, ...] = ()
+
+    # optional resources may include deferred MCP tools
     optional_tools: tuple[str, ...] = ()
 
     preferred_skills: tuple[str, ...] = ()
@@ -2489,6 +2492,78 @@ optional = bash
 ```
 
 这保持 least privilege，也避免“optional bash”把本可并行 READ Node 无意义升级成 WRITE。
+
+### 5.4.3 Required Tool Delivery Boundary
+
+Pinned DeerFlow 的 deferred tool 机制具有明确边界：
+
+```text
+tool_search.enabled
+AND candidate tool is MCP
+→ deferred
+
+ordinary built-in / configured non-MCP tool
+→ eager
+```
+
+DeerFlow `build_deferred_tool_setup()` 只对：
+
+```python
+is_mcp_tool(tool)
+```
+
+返回 true 的 candidate 建 DeferredToolCatalog。
+
+因此 P1 冻结：
+
+> **CapabilityBinding.required_tools 只允许 EAGER hard dependency。**
+
+一期 core SWE capability：
+
+```text
+repo_exploration
+code_search
+code_modification
+test_generation
+regression_testing
+code_review
+```
+
+应尽量只依赖 DeerFlow eager built-ins。
+
+MCP tools 在 P1 只能作为：
+
+```text
+optional_tools
+```
+
+被 ToolSelectionPolicy 选择后：
+
+```text
+selected optional MCP tool
+      ↓
+SubagentConfig static selection
+      ↓
+DeferredToolCatalog
+      ↓
+tool_search infrastructure helper
+      ↓
+runtime promotion
+```
+
+因此第一模型调用的 hard feasibility 不需要把“当前不可见但未来可能 promotion”误判为 required-tool missing。
+
+未来如果业务确实需要：
+
+> **某个 MCP tool 是完成 Node 的硬条件**
+
+再引入：
+
+```text
+ToolRequirement.delivery = EAGER | DEFERRED_OK
+```
+
+并定义 catalog-level attestation；不在 MVP 预先建设。
 
 ### 5.5 Capability / Tool Side-Effect Authority
 
@@ -2707,12 +2782,18 @@ DeerFlow 的实际 Tool catalog 来自：
 因此 DeerFlow Adapter 需要给 Core 提供 provider-neutral inventory snapshot：
 
 ```python
+class BackendToolInfo(BaseModel):
+    name: str
+    source: str
+    delivery: Literal["eager", "deferred"]
+    provenance: str | None = None
+
 class BackendInventorySnapshot(BaseModel):
     backend_id: str
     captured_at: datetime
 
     candidate_agent_types: frozenset[str]
-    candidate_tool_names: frozenset[str]
+    candidate_tools: dict[str, BackendToolInfo]
     candidate_skill_names: frozenset[str]
     configured_model_names: frozenset[str]
 
@@ -2724,7 +2805,16 @@ class BackendInventorySnapshot(BaseModel):
 
 注意命名：
 
-> **candidate_tool_names，而不是 actual_bound_tools。**
+> **candidate_tools，而不是 actual_bound_tools。**
+
+Inventory 中的 `delivery` 用于区分当前 deployment 下的：
+
+```text
+eager tool
+deferred MCP tool
+```
+
+但它仍然只是 planning-time snapshot，不是 runtime assembly proof。
 
 Inventory 只能回答：
 
@@ -2778,7 +2868,7 @@ Declared Capability
 每个 Candidate AgentProvider 至少检查：
 
 1. required capability 是否都有 CapabilityBinding；
-2. binding.required_tools 是否存在于 backend candidate inventory；
+2. binding.required_tools 是否存在于 backend candidate inventory 且 delivery == eager；
 3. operator SubagentConfig 静态 allow / deny 是否允许这些 required tools；
 4. Sandbox / backend 是否支持 required execution primitive；
 5. TaskContract 是否禁止该 Tool / effect；
@@ -3655,7 +3745,25 @@ AssemblyAttestation
 
 即：
 
-> **Attestation 可以让 A-SWE 拒绝一个“不符合编译契约”的 Node 结果，但不能替代真正的执行前权限控制。**
+> **Attestation 是 post-build / reproducibility evidence；真正阻止无效 Node 进入第一轮 LLM 的是 ASWENodeToolPolicyMiddleware 的 model-call admission gate。**
+
+因此职责冻结为：
+
+```text
+BackendInventory
+→ planning-time preflight
+
+NodeToolPolicy first-model gate
+→ runtime execution admission
+
+DeerFlow AssemblyDescriptor
+→ post-build attestation / reproducibility
+
+ContractGuardrail
+→ argument-sensitive action enforcement
+```
+
+不要让 AssemblyDescriptor 承担它当前 API 无法承担的 pre-execution control responsibility。
 
 ### 9.13 Node-Scoped Least Privilege
 
@@ -3856,12 +3964,28 @@ runtime.context["run_id"]
 生命周期：
 
 ```text
-register policy
+register immutable policy
+      ↓
+attach mutable runtime outcome
       ↓
 execute node
       ↓
-finally remove policy
+Adapter reads terminal outcome
+      ↓
+finally remove binding
 ```
+
+建议：
+
+```python
+class NodePolicyRuntimeOutcome:
+    admission_checked: bool
+    admission_failure: str | None
+    missing_required_tools: tuple[str, ...]
+    denied_tool_calls: list[dict]
+```
+
+Policy 本身 immutable；runtime outcome 单独存放，不允许 middleware 原地改写 compiled policy。
 
 要求：
 
@@ -3880,16 +4004,126 @@ finally remove policy
 
 ##### Middleware Enforcement
 
+Pinned middleware order 采用：
+
+> **first in list = outermost**
+
+而 DeerFlow 在 Subagent chain 中先加入：
+
+```text
+SkillToolPolicyMiddleware
+DeferredToolFilterMiddleware
+...
+configured extensions.middlewares
+```
+
+因此 `ASWENodeToolPolicyMiddleware` 作为 configured middleware 位于这些 schema filter 的内侧。
+
+它在每一次 model call 看到的 `request.tools` 已经经过：
+
+- active-skill tool policy；
+- deferred MCP schema hiding；
+- 前序 authorization / assembly filtering；
+- middleware-declared tool folding。
+
+随后 A-SWE 再执行自己的 final Node policy。
+
 在 model-call boundary：
 
 ```text
-request.tools
-∩
-(Node allowed business tools
- + allowed framework infrastructure tools)
-      ↓
-model-visible tool schemas
+current request.tools
+        │
+        ├─ verify eager required tools present
+        │
+        └─ intersect:
+           Node allowed business tools
+           +
+           allowed framework infrastructure tools
+        ↓
+final model-visible tool schemas
 ```
+
+###### First-Model Admission Gate
+
+第一次 model call 前：
+
+```text
+required eager tools
+      ⊆
+current request.tools
+```
+
+必须成立。
+
+否则：
+
+```text
+PROVIDER_ASSEMBLY_MISMATCH
+```
+
+并且不能让模型“先试试看”。
+
+实现上不发明第二套 Agent termination protocol。
+
+Pinned DeerFlow 的 `LLMErrorHandlingMiddleware` 已经把：
+
+```python
+AdmissionError
+```
+
+定义为：
+
+```text
+local admission failed before upstream request
+non-retriable
+reason = admission
+```
+
+因此 trusted Node middleware 在缺失 required tool 时：
+
+1. 把 structured mismatch 写入 NodePolicy runtime outcome；
+2. 抛 `deerflow.models.request_admission.AdmissionError`；
+3. 外层 LLMErrorHandling 捕获；
+4. 不调用 LLM provider；
+5. 不重试；
+6. 生成带 `deerflow_error_fallback=true` 的 terminal AIMessage；
+7. `SubagentExecutor` 现有 `_extract_llm_error_fallback` 将结果映射为 FAILED；
+8. Adapter 从 NodePolicy runtime outcome 映射成 A-SWE 的 `PROVIDER_ASSEMBLY_MISMATCH`。
+
+这条 DeerFlow internal exception 只能存在于：
+
+```text
+integrations/deerflow/
+```
+
+Anti-Corruption Layer 内，并通过 pinned compatibility test 保护。
+
+Core 只看：
+
+```text
+NodeAdmissionFailure
+reason = PROVIDER_ASSEMBLY_MISMATCH
+```
+
+###### Revalidation on Every Model Turn
+
+required tool availability 不只首轮检查。
+
+Skill activation / authorization state可能在后续模型轮次继续收窄 Tool view。
+
+所以每次 model call 都重新验证：
+
+```text
+required eager tools ⊆ current request.tools
+```
+
+若中途不再成立：
+
+```text
+fail before next provider call
+```
+
+避免 Agent 在失去必要执行能力后继续消耗模型 token 并产生虚假完成报告。
 
 在 tool-call boundary：
 
@@ -5334,6 +5568,7 @@ a-swe-runtime/
 │       ├── preflight.py
 │       ├── model_auth.py
 │       ├── node_policy_store.py
+│       ├── node_policy_outcome.py
 │       ├── node_tool_policy.py
 │       ├── config_mapper.py
 │       ├── assembly_attestation.py
@@ -6095,6 +6330,10 @@ Implementation PoC Pending
 - strict Node tool visibility 使用 trusted `extensions.middlewares` + ASWENodeToolPolicyMiddleware；
 - NodePolicyStore 用 unique A-SWE run_id 做进程内短生命周期 correlation；
 - P1 明确限制为 single-process policy carrier；distributed carrier 后置。
+- required hard Tool dependency 一期必须是 eager；deferred MCP 仅作为 optional enhancement；
+- NodeToolPolicy 在每次 model call 重新验证 required eager tool availability；
+- required-tool mismatch 复用 DeerFlow AdmissionError 路径，在 upstream LLM request 前 fail；
+- AssemblyDescriptor 定位为 attestation/reproducibility evidence，不作为 admission gate。
 
 新增 PoC：
 
@@ -6103,9 +6342,9 @@ Implementation PoC Pending
 | POC-27 | operator tools ∩ A-SWE Node tools | A-SWE 不会扩大 SubagentConfig 权限 |
 | POC-28 | Provider 声明 required tool 但 backend inventory 缺失 | preflight fail，不进入 Team |
 | POC-29 | 安装 A-SWE assembly observer | executor.assembly_descriptor 非空且 fingerprint 可读取 |
-| POC-30 | runtime authorization 移除 required tool | assembly mismatch 被 A-SWE 检出 |
+| POC-30 | runtime / skill policy 移除 required eager tool | first model call 前 admission fail；LLM provider 零调用 |
 | POC-31 | preferred skill enabled 但未 activation | 不误报 skill-used，也不把 Node 判失败 |
-| POC-32 | authorization deny resolved model | direct-executor Adapter 在 LLM 调用前按 DeerFlow policy fail/fallback |
+| POC-32 | authorization deny resolved model | direct-executor Adapter 在 LLM 调用前 strict fail，不静默 fallback |
 | POC-33 | ordinary DeerFlow run | A-SWE attestation extension 不改变普通 Agent execution semantics |
 | POC-34 | middleware-declared tool 不在 Node allowlist | model-visible schema 被 ASWENodeToolPolicyMiddleware 移除 |
 | POC-35 | unauthorized tool call 绕过 model visibility | tool-call boundary 再次 deny |
@@ -6114,6 +6353,10 @@ Implementation PoC Pending
 | POC-38 | Node cancellation / timeout | NodePolicyStore entry 一定 cleanup |
 | POC-39 | optional bash 未选择 | READ Node 不因 Provider optional declaration 被升级 WRITE |
 | POC-40 | optional bash 被选择 | WorkspaceAccess 自动升级 WRITE 且 fingerprint 改变 |
+| POC-41 | required tool 被标记 deferred MCP | P1 compile-time reject：hard required tool 必须 eager |
+| POC-42 | Skill activation 后收窄掉 required tool | 下一次 model call admission fail，LLM 不再调用 |
+| POC-43 | Node admission mismatch | SubagentResult=FAILED 且 Adapter 映射 structured PROVIDER_ASSEMBLY_MISMATCH |
+| POC-44 | NodeToolPolicy ordinary run store miss | pass-through；普通 DeerFlow 不受影响 |
 
 ---
 
@@ -6231,6 +6474,8 @@ Executable TaskDAG
 - identity-aware Tool / Model authorization preflight；
 - NodePolicyStore；
 - trusted ASWENodeToolPolicyMiddleware；
+- first-model / every-model required-tool admission gate；
+- DeerFlow AdmissionError → A-SWE structured failure mapping；
 - final model-visible tool filtering；
 - tool-call name-level deny backstop；
 - A-SWE AgentAssemblyObserver extension；
