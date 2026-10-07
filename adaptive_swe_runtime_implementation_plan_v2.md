@@ -3234,6 +3234,8 @@ ASWEHandoffContextMiddleware
 
 这是显式安全契约，不能依赖当前 middleware 顺序“碰巧安全”。
 
+Pinned DeerFlow 当前把 `DurableContextMiddleware` 放在 subagent summarization 之前，专门用于 compaction 后 request-level context 恢复。A-SWE 必须以 integration test 固定同类行为；未来 DeerFlow 升级若 middleware ordering 改变，P0.5 compatibility suite 必须先失败，而不是静默丢失 dependency context。
+
 #### 4.17.5.3 EvidenceRef vs Model-Facing Projection
 
 `EvidenceRef` 是 Runtime persistence / trace reference，不是给模型阅读的最终格式。
@@ -3408,7 +3410,7 @@ Dependency Handoffs
 - source=B
   revision=...
   self_report=...
-  evidence=...
+  evidence_projection=...
 ```
 
 排序使用 DAG dependency canonical order。
@@ -8874,6 +8876,9 @@ Source Audit In Progress
 | POC-H57 | cancellation / timeout | finally 删除 execution binding，无 store leak |
 | POC-H58 | Scheduler loop 写 binding、isolated subagent loop 读 | 无 cross-loop lock error / context 串线 |
 | POC-H59 | 并发 middleware outcome update | snapshot consistency，锁内无 await/I/O |
+| POC-H60 | 强制触发 subagent summarization | 每次 model request 仍有且只有一份 A-SWE dependency projection |
+| POC-H61 | summarization 后检查 child graph state | Handoff projection 未持久写入 messages state |
+| POC-H62 | SystemMessageCoalescing | A-SWE authority note 与 DeerFlow system blocks 合并后仍保持单一 leading system message |
 
 ---
 
