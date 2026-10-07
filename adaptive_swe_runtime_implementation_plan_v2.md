@@ -2515,6 +2515,47 @@ handoff revision < current revision
 
 Revision mismatch 本身不是自动失败；它是 staleness signal。
 
+#### Workspace-Lock TOCTOU Boundary
+
+Handoff staleness 不能在 Workspace lock 之前最终判定。
+
+错误：
+
+```text
+assemble handoff at revision 2
+      ↓
+wait for WRITE lock
+      ↓
+another node changes workspace to revision 3
+      ↓
+execute with stale "current" classification
+```
+
+P1 正确顺序：
+
+```text
+prepare backend
+      ↓
+acquire READ/WRITE workspace access
+      ↓
+freeze execution_workspace_revision
+      ↓
+resolve / render dependency handoffs
+      ↓
+execute
+```
+
+其中：
+
+- dependency ref selection 可以提前；
+- evidence resolve / staleness classification 必须在 lock granted 后重新完成；
+- READ lock 持有期间不允许 WRITE，因此 revision 对该 READ execution 稳定；
+- WRITE lock 持有期间无其他 Node 修改共享 Workspace；
+- `execution_workspace_revision` 是本 attempt 的 pre-execution revision；
+- successful mutating WRITE 完成后发布新的 post-execution WorkspaceRevision。
+
+这关闭 handoff/context 与 Workspace state 之间的 TOCTOU。
+
 #### 4.17.3 Evidence Authority
 
 字段 authority 冻结：
@@ -4807,6 +4848,7 @@ Scheduler 不负责 Task decomposition。
 - acceptance gate；
 - Repository invariant gate；
 - handoff routing；
+- post-lock handoff revision revalidation；
 - result aggregation。
 
 ### 9.8 Failure Taxonomy
@@ -5674,18 +5716,28 @@ A-SWE Plan Fingerprint
 NodeReady
    │
    ▼
-Dependency Handoff Assemble
+Resolve Dependency Handoff Refs
    │
    ▼
 ExecutionBackend.prepare_node()
    │
    ├── live backend revalidation
    ├── monotonic runtime narrowing
-   ├── snapshot pinning
+   ├── backend snapshot pinning
    └── stale preflight → fail before workspace lock
    │
    ▼
-WorkspaceAccessCheck
+Acquire WorkspaceAccess
+   │
+   ▼
+Freeze execution_workspace_revision
+   │
+   ▼
+Resolve / Render Dependency Handoffs
+against frozen revision
+   │
+   ├── mark historical/stale handoffs
+   └── bind immutable handoff projection
    │
    ▼
 WRITE? capture pre-attempt snapshot
@@ -7913,6 +7965,8 @@ Source Audit In Progress
 - changeset / acceptance / verification 由 ExecutionEvidenceStore 持有；
 - EvidenceRef immutable 且 attempt-scoped；
 - retry / repair 不覆盖旧 attempt evidence；
+- Handoff staleness final classification 必须发生在 Workspace lock granted 之后；
+- 每个 Node attempt 冻结 pre-execution WorkspaceRevision；
 
 新增 PoC：
 
@@ -7938,6 +7992,9 @@ Source Audit In Progress
 | POC-H18 | old attempt evidence | Trace 可查，但不自动进入新 Handoff |
 | POC-H19 | Runtime restart 后读 Demo trace | file-backed EvidenceRef 仍可 resolve |
 | POC-H20 | Agent 修改 workspace | 无法修改 workspace 外 Runtime evidence store |
+| POC-H21 | Node 等待 WRITE lock 期间 revision 改变 | lock granted 后重新分类 handoff staleness |
+| POC-H22 | 两个并行 READ Node | shared READ lock 下 execution_workspace_revision 保持一致 |
+| POC-H23 | WRITE Node 执行 | pre revision 冻结，成功 mutation 后只发布一个新 post revision |
 
 ---
 
