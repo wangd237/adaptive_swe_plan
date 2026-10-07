@@ -3375,6 +3375,105 @@ SystemMessage(content=serialized NodeHandoff)
 
 SystemMessage 只能包含静态 A-SWE authority rules，不能携带上游自由文本。
 
+#### Handoff Carrier Decision
+
+P1 明确比较并拒绝两个更省事但语义较差的载体。
+
+**不使用 `SubagentExecutor.context_snapshot` 承载 A-SWE Handoff。**
+
+Pinned DeerFlow `ParentContextSnapshot` 的语义是：
+
+```text
+parent conversation history snapshot
+```
+
+它会：
+
+- 在 child initial state 中插入 `HumanMessage(name="parent_context_snapshot")`；
+- 配套固定 `SNAPSHOT_SYSTEM_NOTE`；
+- 进入 child message state，并可能参与后续 compaction；
+- 表达的是“父对话历史”，不是 A-SWE DAG dependency evidence contract。
+
+A-SWE Handoff 则需要：
+
+```text
+source node / execution / attempt
+workspace revision
+runtime evidence refs
+bounded model self-report
+staleness classification
+```
+
+把它伪装成 ParentContextSnapshot 会混淆 provenance 与生命周期，也会让 dependency context 被 child summarization 改写后失去 request-scoped deterministic projection 语义。
+
+因此：
+
+> `context_snapshot` 保留给 DeerFlow 原生 parent-conversation snapshot；A-SWE 不复用它作为 DAG Handoff carrier。
+
+**也不把完整 Handoff 直接拼进当前 task HumanMessage。**
+
+虽然 task HumanMessage 会经过 `InputSanitizationMiddleware`，但这样会把：
+
+```text
+current node objective
+historical dependency data
+runtime-authored evidence metadata
+```
+
+压进同一个 user-like data channel，导致：
+
+- 无独立 message provenance；
+- 不能独立 cap / render dependency section；
+- authority contract 只能混入 task prose；
+- 多轮 tool loop 中无法从 immutable execution binding 重新投影；
+- Trace 无法区分“当前任务输入”与“历史依赖上下文”。
+
+所以 P1 固定：
+
+```text
+Current task objective
+→ SubagentExecutor task HumanMessage
+
+Dependency Handoff
+→ ASWEHandoffContextMiddleware
+→ request-scoped hidden HumanMessage
+
+Dependency authority rules
+→ same middleware
+→ static SystemMessage
+```
+
+这不是为了增加 Agent 层，而是为了保持：
+
+> **task input、historical dependency data、framework authority 三个信任域彼此独立。**
+
+#### Request-Scoped Projection Invariant
+
+`ASWEHandoffContextMiddleware` 必须只修改当前 `ModelRequest`：
+
+```text
+request.override(messages=...)
+```
+
+禁止通过：
+
+```text
+state["messages"].append(...)
+Command(update={"messages": ...})
+```
+
+持久化 Handoff projection。
+
+因此它具有：
+
+- 每个 model call 从 immutable NodeExecutionBinding 重新渲染；
+- 不进入 checkpoint / child state；
+- 不被 summarization 当作普通历史压缩；
+- 不成为本 Node 的 receipt / tool-history ownership；
+- SystemMessageCoalescing 仍能在 provider boundary 合并其静态 authority message。
+
+若 future DeerFlow middleware ordering 或 ModelRequest contract 改变，这条 invariant 必须由 P0.5 integration test 首先暴露。
+
 #### 4.17.5.1.1 Message Provenance Contract
 
 Pinned DeerFlow extension API 提供：
@@ -8986,6 +9085,9 @@ Implementation PoC Pending
 | POC-55 | WRITE Node 在任何 mutating tool 前失败 | mutation_evidence=PROVEN_NONE，可按 RetryPolicy 重试 |
 | POC-56 | failed bash Node 且 scanner 显示 no changes | 不自动 retry；按 DIRTY_WRITE_FAILURE / UNKNOWN mutation fail closed |
 | POC-57 | snapshot truncated 且无 observed changed path | changed_paths_complete=false；mutation_evidence=UNKNOWN；revision 推进 |
+| POC-58 | Handoff via ParentContextSnapshot | 禁止作为 A-SWE 实现路径；compat test 确认正式路径不依赖该 carrier |
+| POC-59 | 多轮 Node tool loop + summarization | request-scoped Handoff 每轮仍存在，但不进入 child state / compaction |
+| POC-60 | task objective 与 dependency handoff 同时存在 | 两者为独立 HumanMessage provenance / trust domain |
 
 ---
 
