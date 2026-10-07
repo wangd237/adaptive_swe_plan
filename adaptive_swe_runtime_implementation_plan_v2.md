@@ -2900,6 +2900,25 @@ class ReviewDecision(str, Enum):
     REQUEST_CHANGES = "request_changes"
     UNVERIFIED = "unverified"
 
+class ReviewFindingSubmission(BaseModel):
+    severity: Literal["blocker", "major", "minor", "note"]
+    summary: str
+
+    path: str | None = None
+    line: int | None = None
+
+    # Display receipt ids from the exact ledger visible to the final model turn.
+    receipt_citations: tuple[str, ...] = ()
+
+class ReviewVerdictSubmission(BaseModel):
+    decision: ReviewDecision
+    summary: str
+
+    # Mandatory APPROVE must cite at least one concrete inspection receipt.
+    review_basis_receipt_citations: tuple[str, ...]
+
+    findings: tuple[ReviewFindingSubmission, ...] = ()
+
 class ReviewFinding(BaseModel):
     severity: Literal["blocker", "major", "minor", "note"]
     summary: str
@@ -2907,15 +2926,19 @@ class ReviewFinding(BaseModel):
     path: str | None = None
     line: int | None = None
 
-    # Reviewer evidence handle / explanation, still semantic model output.
-    evidence: str | None = None
+    resolved_receipts: tuple[ReceiptRef, ...] = ()
+    unresolved_receipt_ids: tuple[str, ...] = ()
 
 class ReviewVerdict(BaseModel):
     decision: ReviewDecision
-
     summary: str
+
+    review_basis_receipts: tuple[ReceiptRef, ...]
     findings: tuple[ReviewFinding, ...] = ()
 
+    evidence_resolved: bool
+
+    # Runtime-owned state/execution envelope.
     reviewed_workspace_revision_generation: int
     reviewed_repository_state_fingerprint: str
 
@@ -2959,7 +2982,7 @@ SubagentStatus.FAILED
 submit_review_verdict
 ```
 
-其 args schema 就是结构化 ReviewVerdict payload（Runtime-owned fields 如 execution/revision 由 Tool 实现补齐或覆盖，不能信任模型自填）。
+其 model-facing args schema 是 `ReviewVerdictSubmission`。`ReviewVerdict` 中的 ReceiptRef、execution、attempt、revision、repository fingerprint 等 authority fields 全部由 Runtime 生成，模型根本不拥有这些字段。
 
 Tool 特性：
 
