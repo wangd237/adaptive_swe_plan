@@ -788,6 +788,7 @@ class ExecutionBackend(Protocol):
         invocation: NodeExecutionInvocation,
         workspace: WorkspaceSession,
     ) -> NodeExecutionResult:
+        """Return only after backend execution is quiescent."""
         ...
 
     async def cancel_node(
@@ -892,6 +893,189 @@ NodeExecutionResult
 - acceptance criteria。
 
 Adapter 可以持有一个进程级 `SubagentRuntime` / shared execution capacity，并将同一容量控制器传入不同节点执行，避免 A-SWE 自己重新实现底层并发 admission control。
+
+#### 3.4.1 Backend Terminal Status ≠ Execution Quiescence
+
+Pinned DeerFlow 的 `SubagentResult.status.is_terminal` 只表示：
+
+> **结果对象已经发生 terminal state transition。**
+
+它不保证 executor 已经完成所有 unwind / cleanup。
+
+正常 completed / failed 路径中，源码顺序是：
+
+```text
+result.try_set_terminal(...)
+        ↓
+result.status becomes terminal
+        ↓
+executor finally
+        ├── publish final token snapshot
+        ├── release sandbox execution lease
+        └── notify extension task stop
+        ↓
+_aexecute returns
+```
+
+因此：
+
+```text
+poll result.status == terminal
+```
+
+不能作为 Scheduler 释放 WorkspaceAccess 的条件。
+
+否则可能出现：
+
+```text
+Node A status = COMPLETED
+        ↓
+A-SWE releases WRITE lock
+        ↓
+Node B starts
+        │
+        └──── overlaps Node A stream / sandbox cleanup tail
+```
+
+这违反 A-SWE 的 Workspace serialization contract。
+
+同样不能假设 public `SubagentExecutor.execute()` 在所有路径都代表 quiescence：
+
+- 正常路径：`Future.result()` 返回时 child coroutine 已完成；
+- timeout 路径：`Future.result(timeout=...)` 超时后会 request cancellation 并抛出，外层 `execute()` 可以先形成 FAILED result，而 isolated-loop cancellation cleanup 仍在继续。
+
+因此 P1 冻结：
+
+> **NodeExecutionResult 只能在 backend execution quiescent 后返回给 Scheduler。**
+
+Quiescent 的最低定义：
+
+```text
+agent stream closed
+AND child execution coroutine returned
+AND sandbox execution lease release path completed
+AND capacity slot unwind completed
+AND no executor-owned tool body may continue after terminalization
+```
+
+Extension notification failure可以记录 warning；它不能让已完成的 sandbox/tool cleanup重新变成 running。
+
+#### 3.4.2 DeerFlow Awaitable-Completion Compatibility Seam
+
+Pinned DeerFlow 当前公开 execution APIs：
+
+```text
+SubagentExecutor.execute()
+SubagentExecutor.execute_async()
+get_background_task_result()
+request_cancel_background_task()
+cleanup_background_task()
+```
+
+没有公开：
+
+```text
+await execution until underlying background Future is done
+```
+
+而 `execute_async()` 内部已经：
+
+- 在 persistent isolated subagent loop 上运行；
+- 复用正确的 copied ContextVar / callback boundary；
+- 复用 `asyncio.wait_for(... timeout_seconds)`；
+- 复用 cancellation / timeout terminalization；
+- 复用 process-wide capacity；
+- 复用 sandbox lease lifecycle。
+
+所以 A-SWE 不重新实现执行器，而是在 pinned DeerFlow compatibility fork / patch 中增加一个**极薄 public join seam**，语义建议为：
+
+```python
+async def wait_background_task_completion(
+    execution_id: str,
+) -> SubagentResult:
+    ...
+```
+
+它只能封装 DeerFlow 自己的 background execution registry / Future，职责是：
+
+1. 找到 server-owned background execution；
+2. 若 underlying Future 仍存在，等待其真正 done；
+3. 不通过 `result.status.is_terminal` 提前返回；
+4. Future 已被 done-callback 移除时，只能在能够证明该 Future 已完成的 registry 状态下返回 terminal result；
+5. 不重新执行 task；
+6. 不修改 first-terminal-wins payload；
+7. cancellation 时不丢失 child cleanup；
+8. wait 完成后才允许 caller 调用 `cleanup_background_task()`。
+
+A-SWE Adapter 使用：
+
+```text
+backend execution id
+      =
+SubagentExecutor.execute_async(
+    task,
+    task_id=<A-SWE execution id>,
+)
+        ↓
+await wait_background_task_completion(
+    backend execution id
+)
+        ↓
+map SubagentResult
+        ↓
+NodeExecutionResult
+```
+
+A-SWE 自己的 `execution_id` 与 DeerFlow background execution id 分离：
+
+```text
+A-SWE execution_id
+→ stable control-plane attempt identity
+
+DeerFlow background_execution_id
+→ execution-plane ownership / polling / cancellation key
+```
+
+二者必须写入 Adapter execution-handle mapping，不能把 provider/external task id 当 background registry key。
+
+如果不愿修改上游 DeerFlow：
+
+> P0.5 可以临时验证 private Future join 的可行性，但 P1 production implementation 不允许 Core/Adapter 长期读取 `_background_futures` 或调用 private `_aexecute()`。
+
+最小 fork patch 比长期依赖 private internals 更稳定，也更容易写 compatibility test。
+
+#### 3.4.3 Cancellation Contract
+
+`ExecutionBackend.cancel_node(execution_id)` 的完成语义不是：
+
+```text
+cancellation signal sent
+```
+
+而是：
+
+```text
+cancellation requested
+        ↓
+backend execution reaches quiescence
+        ↓
+cancel_node() returns
+```
+
+所以 Adapter：
+
+1. 通过 execution-handle mapping 找到 DeerFlow background_execution_id；
+2. 调用 `request_cancel_background_task(...)`；
+3. await `wait_background_task_completion(...)`；
+4. 完成 terminal evidence mapping；
+5. 最后清理 background registry / NodeExecutionBinding；
+6. Scheduler 才能释放 Workspace lock。
+
+这一约束尤其重要，因为 DeerFlow cooperative cancellation 只在 stream iteration boundary 检测；长 tool call 可能在收到 cancel 后仍需要时间才能完成/drain。
+
+原则：
+
+> **Cancellation acknowledgement is not quiescence. Quiescence is the workspace-lock release boundary.**
 
 ### 3.5 NodeExecutionResult
 
@@ -7485,6 +7669,9 @@ Create NodeHandoff only for logically accepted attempt
 (bind to post-attempt revision)
    │
    ▼
+Verify Backend Execution Quiescent
+   │
+   ▼
 Release Workspace Access
 ```
 
@@ -9879,6 +10066,15 @@ Integration PoC Pending
 Source Audit In Progress
 ```
 
+已确认的第一条边界：
+
+- DeerFlow `SubagentResult.status.is_terminal` 早于 executor `finally` cleanup 完成；
+- A-SWE Scheduler 禁止以 polling terminal status 直接释放 Workspace lock；
+- public `execute()` 的 timeout 路径也不能统一视为 quiescent return；
+- P1 采用 `execute_async + public awaitable completion/join seam`；
+- `execute_prepared()` 对 Core 承诺 return == backend quiescent；
+- `cancel_node()` 对 Core 承诺 return == cancelled execution quiescent，而不是 signal-only。
+
 审计目标：
 
 ```text
@@ -9909,6 +10105,19 @@ Final Node logical state
 - cancellation 是否能保证 binding / workspace lease / scheduler state 最终一致。
 
 ---
+
+P0-7 新增 PoC：
+
+| PoC | 测试内容 | 必须验证 |
+|---|---|---|
+| POC-R01 | normal execution result 先 terminal、finally 延迟 | Workspace lock 直到 join/quiescence 后才释放 |
+| POC-R02 | execute_async + completion join | returned NodeExecutionResult 时 underlying Future 已 done |
+| POC-R03 | cancel 长运行 tool | cancel_node 不在 signal 时返回；等待 tool/stream cleanup 后返回 |
+| POC-R04 | timeout execution | TIMED_OUT/FAILED mapping 之后无 executor-owned late workspace mutation |
+| POC-R05 | terminal background result + delayed sandbox release | 下一个 WRITE Node 不提前启动 |
+| POC-R06 | A-SWE execution_id 与 DeerFlow background id | 显式 mapping；provider/external id 不作为 registry ownership key |
+| POC-R07 | background registry cleanup | 只在 completion join 后 cleanup，不删除仍 unwind 的 Future ownership |
+
 
 ### Phase 1：Adaptive SWE Runtime MVP
 
