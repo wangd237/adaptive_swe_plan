@@ -2019,14 +2019,15 @@ DAG Node 是：
 | 情况 | 是否拆成独立 Node |
 |---|---:|
 | 可以真正并行 | 是 |
-| 需要不同 specialist provider | 是 |
+| 语义上属于明显不同的 specialization / responsibility | 是 |
 | READ → WRITE side-effect boundary | 候选边界，不强制 |
 | WRITE → verification boundary | 是 |
 | mandatory Review gate | 是 |
 | 有独立 acceptance condition | 是 |
-| 强依赖且需要同一上下文连续推理 | 否 |
-| 同一 Provider 连续完成更便宜 | 否 |
-| 拆分会重复 Repository discovery | 否 |
+| 强依赖且属于同一 bounded objective | 否 |
+| 拆分会重复 Repository discovery 且无独立验证收益 | 否 |
+| 仅因为“未来可能由不同 Provider 执行” | 否 |
+| 仅因为“未来可能由同一 Provider 执行” | 否 |
 
 例如：
 
@@ -2049,11 +2050,11 @@ Diagnose DB connection leak
 READ → WRITE 也不是绝对拆分边界。若：
 
 - 语义强依赖；
-- 同一 Provider 能覆盖 diagnosis + modification；
+- diagnosis + modification 本身构成一个 bounded objective；
 - 拆分会导致重复 Repository discovery；
-- 没有明显 parallel / specialist benefit；
+- 没有独立 verification / parallelism / specialization benefit；
 
-则可以编译成一个：
+则可以在 Provider Resolution 之前就编译成一个：
 
 ```text
 Diagnose and Implement
@@ -2065,6 +2066,36 @@ workspace_access = WRITE
 因此 NodeBoundaryPolicy 的目标不是“尽量多拆”，而是：
 
 > **在 specialization / parallelism / verification benefit 与 handoff / duplicate discovery / coordination cost 之间选择最小合理 work package。**
+
+#### Provider-Neutral Boundary Invariant
+
+SemanticPlanner / SemanticPlanValidator 不读取 Agent roster，因此 NodeBoundaryPolicy 不允许使用：
+
+```text
+same provider
+different provider
+provider can cover both
+```
+
+作为 WorkItem 拆分 / 合并依据。
+
+正确顺序：
+
+```text
+Task semantics
+      ↓
+bounded WorkItems
+      ↓
+Semantic validation
+      ↓
+Provider Resolution
+      ↓
+Provider assignment
+```
+
+Provider Assignment 只能给既有 WorkItem 分配 execution carrier；不能为了减少 Provider 数量重新合并 WorkItem，也不能为了制造 Multi-Agent 再拆 WorkItem。
+
+P1 不做 provider-aware post-resolution work-item coalescing。若未来引入，只能作为独立、可验证的 topology optimization pass。
 
 #### Runtime-Owned Verification / Review Gates
 
@@ -2240,7 +2271,7 @@ Planner 不允许创建 `__aswe_` 前缀 ID。
 多个强依赖 READ items 可以合并
 重复 Repository discovery
 过度细粒度 decomposition
-same-provider handoff overhead
+cross-node handoff overhead
 ```
 
 一期先记录 Trace Warning；只有语义单调、安全的 normalization 才自动应用。
@@ -3369,7 +3400,7 @@ parallelism
 
 Multi-Agent 不是默认选择。
 
-> **能够由一个 Provider 覆盖全部 WorkItem 的任务，不应为了“Multi-Agent”强行创建多个 Agent。**
+> **若一个 Provider 对多个既有 WorkItem 都是可行 execution carrier，Team roster 可以只包含这一个 Provider；但这不合并 WorkItem，也不表示共享 Agent session。**
 
 ### 7.3 TeamSpec 只保存 Roster
 
@@ -3554,9 +3585,9 @@ risk == high
 Provider Count
 ```
 
-只计算一次。
+在 Team roster 中只计算一次。
 
-但每个 Node 仍独立生成：
+但每个 WorkItem / Node 仍是独立 execution assignment，并独立生成：
 
 ```text
 NodeExecutionPolicy
@@ -3566,9 +3597,39 @@ NodeExecutionPolicy
 
 ```text
 same Provider
+≠ same Node
 ≠ same tool allowlist
 ≠ same workspace access
+≠ same Agent session
+≠ implicit context continuity
 ```
+
+Pinned DeerFlow native subagent 是 one-shot execution：
+
+- child graph 使用 `checkpointer=False`；
+- 不继承 parent conversation history；
+- 每次 invocation 构建 fresh child state；
+- subagent 自身不会替下一个 Node 保留隐藏 reasoning / conversation context。
+
+跨 Node 连续性只能来自：
+
+```text
+explicit NodeHandoff
++
+shared Workspace artifacts
++
+deterministic execution evidence
+```
+
+因此 Provider reuse 只表示：
+
+> **复用同一个 execution implementation / role contract。**
+
+它不表示：
+
+> **复用一个持续存在的 Agent 实例。**
+
+Team Selection 中的 `Provider Count` 是 roster complexity 指标，不是 LLM invocation count，也不是 handoff count。
 
 例如同一个 Coder：
 
@@ -6951,6 +7012,11 @@ Implementation PoC Pending
 - fingerprint drift 本身不是 failure，重新验证 requirement 失败才是 `BACKEND_PREFLIGHT_STALE`；
 - runtime 只允许 monotonic narrowing，不允许隐式扩权或 Provider rebinding；
 - authorization 保持 live gate，不伪造 frozen policy snapshot。
+- DeerFlow native Subagent 是 one-shot / no-checkpoint execution；
+- Provider reuse 不等于 Agent session reuse；
+- Semantic NodeBoundaryPolicy 必须 provider-neutral；
+- Provider Assignment 不允许反向合并 / 拆分 WorkItem；
+- cross-node context 只通过 explicit NodeHandoff / shared Workspace evidence 传递。
 
 新增 PoC：
 
@@ -6980,6 +7046,9 @@ Implementation PoC Pending
 | POC-48 | prepare 后 config 热更新 | execute_prepared 仍使用 prepare 阶段 pinned AppConfig snapshot |
 | POC-49 | live authorization 在 execution 中改变 | runtime auth gate 生效，不依赖 stale planning verdict |
 | POC-50 | Provider stale 但另一个 Provider 可用 | P1 不隐式切换，显式 fail/replan |
+| POC-51 | 同一 Coder Provider 顺序执行两个 Node | 第二个 Node 不自动继承第一个模型上下文 |
+| POC-52 | Node B 依赖 Node A | 只有显式 NodeHandoff / Workspace evidence 进入 B |
+| POC-53 | 单 Provider 覆盖全部 WorkItem | TeamSpec 单成员，但 DAG Node 数与语义边界保持不变 |
 
 ---
 
