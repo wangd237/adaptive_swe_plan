@@ -610,8 +610,9 @@ P1 规则：
 - `changed_paths_complete = false`；
 - Handoff 只能把 observed paths 标成“observed changed paths”，不能声称完整；
 - 添加 warning `WORKSPACE_DELTA_TRUNCATED`；
-- failed WRITE attempt 禁止自动 retry，因为不能证明 workspace 未改变；
-- successful WRITE / UNKNOWN-mutating attempt 即使没有 observed path change，只要 attribution truncated，就保守推进 WorkspaceRevision；
+- snapshot truncated → `mutation_evidence = UNKNOWN`；
+- failed WRITE / UNKNOWN-mutating attempt 只有 `mutation_evidence == PROVEN_NONE` 才允许进入自动 retry 候选；
+- successful WRITE / UNKNOWN-mutating attempt 只要 `mutation_evidence != PROVEN_NONE`，就保守推进 WorkspaceRevision；
 - Runtime 不因 diff content unavailable（binary / sensitive / large）丢弃 path-level mutation事实；
 - snapshot truncation 不等同于 task failure，但必须降低 evidence completeness。
 
@@ -2941,14 +2942,22 @@ pre == post
 WRITE / UNKNOWN-mutating：
 
 ```text
-no proven mutation
-AND attribution complete
+mutation_evidence == PROVEN_NONE
 → post == pre
 
-observed mutation
-OR attribution unknown/truncated
+mutation_evidence == OBSERVED
+OR mutation_evidence == UNKNOWN
 → post.generation = pre.generation + 1
 ```
+
+关键是：
+
+```text
+scanner saw no changed path
+≠ PROVEN_NONE
+```
+
+只要通用 mutating tool（尤其 `bash`）实际执行，而 Runtime 无法证明其对 scanner-excluded environment 没有副作用，就按 `UNKNOWN` 推进 generation。
 
 Node 的：
 
@@ -8933,6 +8942,11 @@ Implementation PoC Pending
 - P1 core hard-required Tool identity 以 `ToolConfig.use` 为稳定 anchor；
 - Python object identity / Tool provenance label 不作为 Provider hard-feasibility authority；
 - schema_hash 只用于 compatibility drift，不替代 implementation identity。
+- DeerFlow WorkspaceChangeSet 只覆盖 scanner-visible filesystem scope，不是 sandbox/environment complete mutation oracle；
+- P1 新增 `MutationEvidence = PROVEN_NONE | OBSERVED | UNKNOWN`；
+- mutating/UNKNOWN tool 一旦实际执行但副作用不可完全观测，按 UNKNOWN 处理；
+- WorkspaceRevision 对 OBSERVED / UNKNOWN 都推进；
+- WRITE retry 只有 PROVEN_NONE 才可进入自动 retry 候选。
 
 新增 PoC：
 
@@ -8968,6 +8982,10 @@ Implementation PoC Pending
 | POC-51 | 同一 Coder Provider 顺序执行两个 Node | 第二个 Node 不自动继承第一个模型上下文 |
 | POC-52 | Node B 依赖 Node A | 只有显式 NodeHandoff / Workspace evidence 进入 B |
 | POC-53 | 单 Provider 覆盖全部 WorkItem | TeamSpec 单成员，但 DAG Node 数与语义边界保持不变 |
+| POC-54 | bash 执行但只改变 .venv / cache | scanner 可无 observed paths，但 mutation_evidence=UNKNOWN，revision 推进 |
+| POC-55 | WRITE Node 在任何 mutating tool 前失败 | mutation_evidence=PROVEN_NONE，可按 RetryPolicy 重试 |
+| POC-56 | failed bash Node 且 scanner 显示 no changes | 不自动 retry；按 DIRTY_WRITE_FAILURE / UNKNOWN mutation fail closed |
+| POC-57 | snapshot truncated 且无 observed changed path | changed_paths_complete=false；mutation_evidence=UNKNOWN；revision 推进 |
 
 ---
 
