@@ -2567,6 +2567,216 @@ Runtime gate 的 capability 不是 LLM hint，而是 compiler-owned requirement�
 
 不得自动把普通 Planner WorkItem 的 objective 拆成两个新语义任务；只有 Contract 已明确要求的 gate 才允许 Runtime 注入。
 
+#### Structured Review Gate Contract
+
+仅仅存在：
+
+```text
+WorkKind = REVIEW
+capability = code_review
+```
+
+还不足以形成 gate。
+
+如果 Reviewer 只返回：
+
+```text
+"Looks good overall..."
+```
+
+Runtime 无法可靠区分：
+
+- approve；
+- request changes；
+- 无法判断；
+- 被 guard cap 截断的半成品。
+
+P1 因此要求 mandatory Review 使用 A-SWE-owned structured output contract：
+
+```python
+class ReviewDecision(str, Enum):
+    APPROVE = "approve"
+    REQUEST_CHANGES = "request_changes"
+    UNVERIFIED = "unverified"
+
+class ReviewFinding(BaseModel):
+    severity: Literal["blocker", "major", "minor", "note"]
+    summary: str
+
+    path: str | None = None
+    line: int | None = None
+
+    # Reviewer evidence handle / explanation, still semantic model output.
+    evidence: str | None = None
+
+class ReviewVerdict(BaseModel):
+    decision: ReviewDecision
+
+    summary: str
+    findings: tuple[ReviewFinding, ...] = ()
+
+    reviewed_workspace_revision_generation: int
+    reviewed_repository_state_fingerprint: str
+
+    reviewer_execution_id: str
+    reviewer_attempt: int
+```
+
+`ReviewVerdict` 是：
+
+> **structured semantic evidence**
+
+不是 deterministic proof。
+
+#### DeerFlow Direct-Return Integration
+
+Pinned DeerFlow 支持 Tool：
+
+```python
+return_direct = True
+```
+
+且 `SubagentExecutor` 会从 compiled Tool registry 自动识别 return-direct tools。
+
+当最终 assistant turn 只调用 return-direct Tool 时：
+
+```text
+ToolMessage
+→ SubagentExecutor._terminal_direct_results()
+→ Node result
+```
+
+如果 direct-return ToolMessage 为 error：
+
+```text
+SubagentStatus.FAILED
+```
+
+因此 P1 为 Review Node 增加 A-SWE-owned：
+
+```text
+submit_review_verdict
+```
+
+其 args schema 就是结构化 ReviewVerdict payload（Runtime-owned fields 如 execution/revision 由 Tool 实现补齐或覆盖，不能信任模型自填）。
+
+Tool 特性：
+
+- no Repository mutation；
+- no external side effect；
+- `return_direct=True`；
+- 只在 REVIEW Node execution 中允许；
+- ordinary DeerFlow run 不暴露；
+- 不属于业务 Capability tool；
+- 属于 required runtime output/infrastructure contract。
+
+Reviewer 过程：
+
+```text
+read / inspect repository
+      ↓
+reason about patch / risks
+      ↓
+final assistant turn
+      ↓
+submit_review_verdict(...)
+      ↓
+schema validation
+      ↓
+direct-return terminal ToolMessage
+      ↓
+ReviewVerdict evidence
+```
+
+Runtime 不从普通 reviewer prose 猜 verdict。
+
+#### Required Runtime Output Tool
+
+`NodeExecutionPolicy` 需要区分：
+
+```text
+infrastructure_tool_names
+required_infrastructure_tools
+```
+
+对 mandatory Review：
+
+```text
+required_infrastructure_tools
+= {"submit_review_verdict"}
+```
+
+它与 business required tools 一样必须在 every-model admission 中保持可用，但不会赋予 Repository mutation authority。
+
+A-SWE 只能在 operator / Provider static contract 允许该 execution surface 时使用它；不能借 runtime output tool 绕过 operator deny。
+
+#### Review Gate Outcome
+
+Review Node 只有同时满足：
+
+```text
+backend status = completed
+AND completeness = CLEAN
+AND valid terminal submit_review_verdict
+AND RepositoryStateDigest unchanged
+```
+
+才进入 ReviewDecision 判断。
+
+然后：
+
+```text
+APPROVE
+→ mandatory review gate satisfied
+
+REQUEST_CHANGES
+→ REVIEW_GATE_REJECTED
+→ P1 保留 findings
+→ 不自动基于纯 semantic reviewer opinion 修改代码
+
+UNVERIFIED
+→ REVIEW_GATE_UNVERIFIED
+→ gate unsatisfied
+```
+
+`CAPPED_PARTIAL` 即使已经产生旧/中间 reviewer prose，也不能 satisfy mandatory Review。
+
+如果 TaskContract 的 review 只是 advisory 而不是 mandatory，可在未来定义 softer semantics；P1 runtime-owned `__aswe_review` 默认是 hard gate。
+
+#### Review Verdict Revision Binding
+
+Tool 实现从当前 immutable `NodeExecutionInvocation` / Binding 读取：
+
+```text
+execution_workspace_revision
+current repository state fingerprint
+execution_id
+attempt
+```
+
+并写入 verdict。
+
+模型不能自行声称：
+
+```text
+reviewed revision = 7
+```
+
+Runtime 收到 verdict 后再验证：
+
+```text
+verdict.reviewed revision/fingerprint
+==
+actual review execution state
+```
+
+随后作为 `EvidenceRef(kind="review_verdict")` 写入 ExecutionEvidenceStore。
+
+原则：
+
+> **The model chooses the semantic decision; the runtime owns the decision envelope and state identity.**
+
+
 ### 4.13 Two-Stage Plan Compiler
 
 Plan validation 分为两道关：
@@ -2822,6 +3032,7 @@ class EvidenceRef(BaseModel):
         "report_receipt_verdict",
         "acceptance_verdict",
         "verification_result",
+        "review_verdict",
         "repository_invariant",
     ]
 
@@ -2850,6 +3061,7 @@ class HandoffEvidence(BaseModel):
     report_receipt_verdict: EvidenceRef | None = None
     acceptance_verdict: EvidenceRef | None = None
     verification_result: EvidenceRef | None = None
+    review_verdict: EvidenceRef | None = None
 
 class NodeHandoff(BaseModel):
     source_node_id: str
@@ -5892,6 +6104,8 @@ ExecutionTransientFailure
 ExecutionCappedPartial
 AcceptanceFailure
 VerificationFailure
+ReviewGateRejected
+ReviewGateUnverified
 PlanInvalidated
 PolicyViolation
 RepositoryInvariantFailure
@@ -5914,6 +6128,8 @@ Cancelled
 | WRITE failure 且已有/无法排除 workspace change | publish dirty post revision，然后 fail closed |
 | acceptance does-not-hold | repair unmet condition / fail |
 | verification test failure | bounded upstream repair，再 verify |
+| review decision = REQUEST_CHANGES | REVIEW_GATE_REJECTED；保留 findings；P1 不自动 semantic repair |
+| review decision = UNVERIFIED | REVIEW_GATE_UNVERIFIED；gate unsatisfied |
 | UNVERIFIED | additional deterministic check 或保留 uncertainty |
 | PLAN_INVALIDATED before any WRITE | bounded replan |
 | PLAN_INVALIDATED after WRITE | MVP fail / restart-from-baseline |
@@ -6551,6 +6767,7 @@ class NodeExecutionPolicy(BaseModel):
 
     allowed_business_tools: tuple[str, ...]
     infrastructure_tool_names: tuple[str, ...]
+    required_infrastructure_tools: tuple[str, ...]
     denied_tools: tuple[str, ...]
 
     preferred_skills: tuple[str, ...]
@@ -6976,7 +7193,7 @@ Skill activation / authorization state可能在后续模型轮次继续收窄 To
 所以每次 model call 都重新验证：
 
 ```text
-required eager tools ⊆ current request.tools
+(required eager business tools ∪ required infrastructure tools) ⊆ current request.tools
 ```
 
 若中途不再成立：
@@ -9487,6 +9704,9 @@ Source Audit In Progress
 - capped partial 只有完整 deterministic acceptance + invariants 全通过时才可带 warning 接受；
 - mandatory REVIEW / 无 deterministic completeness proof 的 DISCOVERY capped run 不得静默成功；
 - 未接受的 capped partial 保留 evidence，但不产生 normal success Handoff。
+- mandatory Review 不解析自由文本 verdict，使用 A-SWE-owned structured direct-return Tool；
+- ReviewDecision 是 semantic evidence，Runtime 拥有 revision/execution envelope；
+- mandatory Review 只接受 CLEAN completion + valid ReviewVerdict + repository state unchanged。
 - BindingStore 横跨 Scheduler loop 与 DeerFlow isolated subagent loop，P1 使用 thread-safe 同步而非 loop-bound asyncio.Lock。
 
 新增 PoC：
@@ -9568,6 +9788,15 @@ Source Audit In Progress
 | POC-H72 | capped run 未被接受 | partial result/evidence 保留，但不生成 normal success Handoff |
 | POC-H73 | capped run acceptance 含 UNVERIFIED | 不允许提升为 success |
 | POC-H74 | capped clean retry | new attempt/evidence；Runtime 不自动提高 operator guard budget |
+| POC-H75 | clean Reviewer 最终调用 submit_review_verdict(APPROVE) | structured verdict 入 EvidenceStore，review gate satisfied |
+| POC-H76 | Reviewer 自由文本说 approved 但未调用 submit tool | review gate unsatisfied |
+| POC-H77 | submit_review_verdict schema invalid | direct-return Tool error → execution/review failure |
+| POC-H78 | Reviewer REQUEST_CHANGES | REVIEW_GATE_REJECTED；保留 findings，不自动修代码 |
+| POC-H79 | Reviewer UNVERIFIED | REVIEW_GATE_UNVERIFIED |
+| POC-H80 | Reviewer capped 后曾产生 review prose | 不接受旧 prose / 非终态 verdict |
+| POC-H81 | Reviewer verdict 伪造 revision/execution id | Tool/Runtime 覆盖并验证 authoritative envelope |
+| POC-H82 | ordinary DeerFlow run | 不暴露 submit_review_verdict |
+| POC-H83 | REVIEW Node 修改 Git-visible repo 后 APPROVE | mutation authority violation 优先，review 不通过 |
 
 ---
 
@@ -9704,6 +9933,7 @@ Executable TaskDAG
 - synthetic policy-failure ModelResponse short-circuit；
 - A-SWE failure marker → structured failure mapping；
 - final model-visible tool filtering；
+- required runtime output tool contract；
 - tool-call name-level deny backstop；
 - A-SWE AgentAssemblyObserver extension；
 - DeerFlow AssemblyAttestation；
@@ -9746,7 +9976,7 @@ Executable TaskDAG
 - Build / Import Check；
 - Test Execution；
 - Regression Test；
-- Reviewer；
+- Reviewer + structured `submit_review_verdict` direct-return gate；
 - Git-aware task-level Repository ChangeSet；
 - per-attempt NodeWorkspaceDelta；
 - DeerFlow Workspace ChangeSet；
@@ -9929,6 +10159,7 @@ Coder            exclusive WRITE
 39. DeerFlow 的 one-AppConfig-snapshot 设计如何减少 TOCTOU？
 40. 为什么 Tester 可以获得 WRITE lock，却仍然不能修改 Git-visible Repository patch？
 41. 为什么 DeerFlow `completed + stop_reason` 不能直接映射为 A-SWE Node success？
+42. 为什么 mandatory Review 不能只解析 Reviewer 自由文本，而要用 structured direct-return verdict？
 
 ### 21.4 代码掌握边界
 
