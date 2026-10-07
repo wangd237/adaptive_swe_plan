@@ -3283,6 +3283,141 @@ P1 默认实现建议使用 task-runtime 本地文件持久化，而不是只存
 
 一期只要求 single-process writer；不承诺 distributed transactional store。
 
+#### 为什么不直接复用 DeerFlow ExtensionData / RunEventStore
+
+Pinned DeerFlow 已经存在两类状态容器，但职责与 A-SWE EvidenceStore 不同。
+
+**ExtensionData 不能作为 durable evidence store。**
+
+`deerflow_extension_api.ExtensionData` 的源码契约明确是：
+
+```text
+extension-private state attached to one host-owned scope
+host creates one instance per app/task scope
+host drops it when scope ends
+```
+
+因此 task-scoped ExtensionData 适合：
+
+- middleware 运行期 scratch state；
+- observer coordination；
+- 同一 subagent execution 内共享 typed objects。
+
+不适合：
+
+- Node A 完成以后由 Node B 继续随机解析；
+- task 结束后 Trace Viewer 重放；
+- retry / repair 跨 attempt 保存 immutable evidence；
+- Runtime restart 后恢复 evidence。
+
+所以：
+
+> **ExtensionData 可以帮助 execution-local wiring，但不能成为 ExecutionEvidenceStore backend。**
+
+**RunEventStore 也不作为 canonical evidence payload store。**
+
+Pinned `RunEventStore` 的主契约是：
+
+```text
+thread_id + run_id + monotonically increasing seq
+→ event stream
+```
+
+它适合：
+
+- messages；
+- lifecycle events；
+- trace/debug/audit timeline；
+- task_id-scoped subagent event pagination。
+
+但它不是 content-addressed / EvidenceRef-addressed artifact API：
+
+- 没有 `get(evidence_id)` canonical random-access contract；
+- event identity 主要是 `thread/run/seq`；
+- `list_events()` 默认存在 bounded limit / cursor 语义；
+- event retention / deletion 与 thread/run 生命周期绑定；
+- 默认 backend 可以是 in-memory；
+- direct `SubagentExecutor` 并不要求存在 Gateway RunJournal / RunEventStore；
+- large patch / test-log payload 塞进 event metadata 会把 event stream 与 artifact persistence 耦合。
+
+因此 P1 冻结：
+
+```text
+ExecutionEvidenceStore
+→ canonical immutable evidence payloads
+
+A-SWE RuntimeEvent / DeerFlow RunEventStore
+→ timeline / correlation / observability
+```
+
+允许在 EvidenceStore `put()` 成功后发布小型事件：
+
+```text
+EvidenceCreated
+  evidence_id
+  kind
+  node_id
+  execution_id
+  attempt
+  content_sha256
+```
+
+但 event 只引用 EvidenceRef，不复制完整 payload。
+
+同理 `EvidenceConsumed` / `EvidenceMarkedHistorical` 可以进入 Trace；事实 payload 仍以 EvidenceStore 为 authority。
+
+原则：
+
+> **Evidence is an artifact; trace is an event stream.**
+
+二者可以关联，不能互相冒充。
+
+#### LocalEvidenceStore Durability / Integrity Contract
+
+P1 本地文件实现虽然只承诺 single-process writer，也不能使用：
+
+```text
+open(target, "w")
+→ json.dump(...)
+```
+
+直接覆盖最终文件。
+
+每条 evidence 写入必须：
+
+1. canonical serialize payload；
+2. 计算 **完整 SHA-256** `content_sha256`；
+3. 生成唯一 `evidence_id`；
+4. 写同目录 temporary file；
+5. flush + fsync temporary file；
+6. atomic `os.replace(temp, final)`；
+7. 必要时 fsync parent directory；
+8. final file 一经 publish 不再原地修改。
+
+`get(ref)` 必须：
+
+- 验证 evidence_id 对应文件存在；
+- 验证 task/node/execution/attempt/kind 元数据；
+- canonical re-hash payload；
+- 与 `EvidenceRef.content_sha256` 比较；
+- 不匹配则返回 typed integrity failure，而不是继续把内容交给 Handoff Renderer。
+
+注意区分 DeerFlow receipt 的：
+
+```text
+args_sha256 / output_sha256
+```
+
+当前实现是短 hash display/freshness stamp，与 A-SWE EvidenceStore 的 full SHA-256 integrity hash 不是同一安全语义。
+
+写入中途 crash：
+
+- 未 rename 的 temp file 不算 published evidence；
+- startup/task recovery 可清理 orphan temp files；
+- final evidence file 不允许 silent overwrite。
+
+P1 不要求跨多个 evidence objects 的原子事务；一个 attempt 的多个 EvidenceRef 通过 terminal NodeExecutionRecord / Trace 关联。
+
 #### Attempt Ownership
 
 Evidence 是 attempt-scoped：
@@ -9281,6 +9416,11 @@ Implementation PoC Pending
 | POC-58 | Handoff via ParentContextSnapshot | 禁止作为 A-SWE 实现路径；compat test 确认正式路径不依赖该 carrier |
 | POC-59 | 多轮 Node tool loop + summarization | request-scoped Handoff 每轮仍存在，但不进入 child state / compaction |
 | POC-60 | task objective 与 dependency handoff 同时存在 | 两者为独立 HumanMessage provenance / trust domain |
+| POC-61 | ExtensionData task scope 结束 | A-SWE evidence 仍可被 downstream Node resolve |
+| POC-62 | DeerFlow RunEventStore backend=memory | A-SWE EvidenceStore durability 不随其消失 |
+| POC-63 | Evidence 写入在 rename 前 crash | final path 不出现半写 JSON；orphan temp 可清理 |
+| POC-64 | Evidence 文件被篡改/损坏 | get() full SHA-256 mismatch → typed integrity failure |
+| POC-65 | EvidenceCreated trace event | event 只携带 EvidenceRef metadata，不复制大 payload |
 
 ---
 
