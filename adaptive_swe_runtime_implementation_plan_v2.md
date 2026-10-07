@@ -1519,31 +1519,58 @@ SemanticPlanner 不只生成 WorkItem，还需要声明 positive obligation cove
 建议扩展：
 
 ```python
+class WorkKind(str, Enum):
+    DISCOVERY = "discovery"
+    IMPLEMENTATION = "implementation"
+    VERIFICATION = "verification"
+    REVIEW = "review"
+
 class WorkItemProposal(BaseModel):
     id: str
     objective: str
 
+    work_kind: WorkKind
     capability_hints: list[str]
     depends_on: list[str]
 
-    satisfies: list[str] = []
-
-    effect_hint: Literal["read", "write"] | None = None
+    coverage_claims: list[str] = []
     acceptance_intent: list[str] = []
 ```
 
-其中 `satisfies` 引用 `CompiledConstraint.id`。
+其中 `coverage_claims` 引用 `CompiledConstraint.id`，表示 Planner 声明“该 WorkItem 计划覆盖此 obligation”，不是完成证明。
 
-SemanticPlanValidator 检查：
+SemanticPlanValidator 对 positive obligation 建立 `PlanCoverageMap`：
+
+```python
+class CoverageMode(str, Enum):
+    RUNTIME_ENFORCED = "runtime_enforced"
+    PLANNER_DECLARED = "planner_declared"
+
+class PlanCoverageEntry(BaseModel):
+    constraint_id: str
+    mode: CoverageMode
+    work_item_ids: tuple[str, ...]
+```
+
+规则：
 
 ```text
 所有 LOCKED / HARD positive obligation
-→ 必须存在 coverage 或 Runtime-owned enforcement
+→ 必须存在 Runtime-owned enforcement
+  或至少一个合法 coverage_claim
 ```
+
+但 `PLANNER_DECLARED` 只证明：
+
+> Planner 没有把 obligation 遗忘。
+
+它不证明：
+
+> objective 在语义上真的足以满足 obligation。
 
 负向 constraint 不要求 Planner 每个节点重复声明，而由 ExecutionPlanValidator / NodeExecutionPolicy 全局应用。
 
-LLM 的 coverage claim 本身不是完成证据，只是 Plan coverage metadata。
+最终 SATISFIED 只来自 Execution / Evaluation evidence。
 
 #### 4.8.14 Contract → Execution Policy
 
@@ -1920,18 +1947,22 @@ Planner 只回答：
 LLM 只输出 proposal，不直接输出可执行 `TaskDAG`。
 
 ```python
+class WorkKind(str, Enum):
+    DISCOVERY = "discovery"
+    IMPLEMENTATION = "implementation"
+    VERIFICATION = "verification"
+    REVIEW = "review"
+
 class WorkItemProposal(BaseModel):
     id: str
     objective: str
 
+    work_kind: WorkKind
     capability_hints: list[str]
     depends_on: list[str]
 
-    # references CompiledConstraint.id for positive obligations
-    satisfies: list[str] = []
-
-    # hint only; runtime owns final side effect
-    effect_hint: Literal["read", "write"] | None = None
+    # planner declaration only; not satisfaction evidence
+    coverage_claims: list[str] = []
 
     acceptance_intent: list[str] = []
 
@@ -1939,6 +1970,41 @@ class WorkPlanProposal(BaseModel):
     items: list[WorkItemProposal]
     rationale: str
 ```
+
+#### WorkKind 与 WorkspaceAccess 是正交维度
+
+`WorkKind` 表示**语义执行阶段**：
+
+```text
+DISCOVERY
+→ 理解 / 定位 / 诊断
+
+IMPLEMENTATION
+→ 产生任务要求的业务修改
+
+VERIFICATION
+→ 独立验证修改结果
+
+REVIEW
+→ 修改后审查 / 风险检查
+```
+
+`WorkspaceAccess` 表示**物理共享 Workspace 的并发副作用类别**。
+
+二者不能互相推导。
+
+典型例子：
+
+| WorkKind | Tool | WorkspaceAccess |
+|---|---|---|
+| DISCOVERY | read_file / grep | READ |
+| IMPLEMENTATION | str_replace | WRITE |
+| VERIFICATION | bash pytest | WRITE |
+| REVIEW | read_file / grep | READ |
+
+因此：
+
+> **Tester 因 bash 获得 WRITE lock，不代表它属于 IMPLEMENTATION；Reviewer 即使是 READ，也不代表它应该在 Writer 前执行。**
 
 ### 4.12 Node Boundary Policy
 
@@ -2000,6 +2066,36 @@ workspace_access = WRITE
 
 > **在 specialization / parallelism / verification benefit 与 handoff / duplicate discovery / coordination cost 之间选择最小合理 work package。**
 
+#### Runtime-Owned Verification / Review Gates
+
+当 TaskContract 要求 verification / review，而 Planner 未提供合法独立 gate 时，Runtime 可以单调注入 gate。
+
+Verification：
+
+```text
+all IMPLEMENTATION nodes
+        ↓
+__aswe_verify
+WorkKind = VERIFICATION
+required capability = regression_testing
+```
+
+Review：
+
+```text
+if verification exists:
+    verification gate(s) → __aswe_review
+else:
+    implementation node(s) → __aswe_review
+
+WorkKind = REVIEW
+required capability = code_review
+```
+
+Runtime gate 的 capability 不是 LLM hint，而是 compiler-owned requirement。
+
+不得自动把普通 Planner WorkItem 的 objective 拆成两个新语义任务；只有 Contract 已明确要求的 gate 才允许 Runtime 注入。
+
 ### 4.13 Two-Stage Plan Compiler
 
 Plan validation 分为两道关：
@@ -2029,11 +2125,13 @@ Provider 选择前即可判断：
 - dependency existence；
 - self dependency；
 - DAG acyclic；
+- WorkKind vocabulary / consistency；
 - capability vocabulary；
-- user / task obligation coverage；
+- coverage_claim references 是否只指向存在的 positive constraints；
+- positive obligation structural coverage；
 - node count / plan budget；
-- NodeBoundaryPolicy；
-- missing verification / review gates。
+- deterministic NodeBoundaryPolicy；
+- mandatory verification / review gate presence。
 
 #### ExecutionPlanValidator
 
@@ -2067,6 +2165,11 @@ cycle
 self dependency
 dependency references nonexistent item
 unknown / impossible capability
+coverage_claim references nonexistent / negative-only constraint
+WorkKind / capability contradiction
+REVIEW mixed with business mutation capability
+VERIFICATION mixed with business implementation capability when independent verification is required
+explicit dependency contradicts mandatory phase ordering
 semantic contradiction
 node count exceeds hard limit
 unsatisfied hard user constraint
@@ -2085,23 +2188,49 @@ PLAN_INVALID
 可以安全加强：
 
 ```text
-code_modification present
-AND effect_hint == READ
-→ upgrade WRITE
+CompiledTaskContract requires verification
+AND no VERIFICATION work item
+→ append runtime-owned verification gate
 
-testing_required == true
-AND no verification work item
-→ append verification gate
+CompiledTaskContract requires review
+AND no REVIEW work item
+→ append runtime-owned review gate
 
-risk == high
-AND no review work item
-→ append review gate
+duplicate dependency edge
+→ canonical dedupe
 
 unordered workspace-conflicting nodes
-→ add deterministic ordering edge
+→ materialization-time deterministic phase/order edge
 ```
 
+不再根据 `effect_hint` repair，因为 WorkspaceAccess 已由 Capability + ToolEffect 编译，Planner 不拥有该 authority。
+
 规则只能增强 safety / completeness，不能静默删除用户需求，也不能重写核心任务目标。
+
+#### Mandatory Gate Budget
+
+Runtime 在调用 SemanticPlanner 前就知道 TaskContract 是否要求 verification / review。
+
+因此 planner budget 应先扣除 runtime-owned mandatory gates：
+
+```text
+max_work_items = 8
+mandatory_gate_count = required_verification + required_review
+
+planner_work_item_budget
+= max_work_items - mandatory_gate_count
+```
+
+这样避免 Planner 已经生成 8 个 Node 后，Runtime 再注入两个 gate 导致总预算失控。
+
+Runtime-injected gate 使用 reserved id namespace，例如：
+
+```text
+__aswe_verify
+__aswe_review
+```
+
+Planner 不允许创建 `__aswe_` 前缀 ID。
 
 #### Warning / Optimization
 
