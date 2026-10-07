@@ -2426,8 +2426,16 @@ class WorkspaceRevision(BaseModel):
 
 class ReceiptRef(BaseModel):
     source_execution_id: str
-    receipt_id: str
-    tool_name: str | None = None
+
+    # Stable execution identity.
+    tool_call_id: str
+    tool_name: str
+
+    args_sha256: str
+    output_sha256: str
+
+    # Model-facing display/citation label only; not a durable primary key.
+    display_receipt_id: str | None = None
 
 class EvidenceRef(BaseModel):
     evidence_id: str
@@ -2590,13 +2598,17 @@ Agent 的路径声明若与 Runtime evidence 不一致，只能进入 warning / 
 
 上游 receipt 是历史证据引用，不是下游执行证据。
 
-DeerFlow receipt id（例如 `r3`）是 execution-local identifier。不同 Node execution 都可能产生：
+DeerFlow receipt display id（例如 `r3`）既是 execution-local，又可能在 history compaction 后重新编号。
+
+Pinned DeerFlow `tool_receipt.py` 明确规定：
 
 ```text
-r1
-r2
-r3
+rN
+→ positional display id
+→ may renumber after summarization / compaction
 ```
+
+Completed SubagentResult 会优先 harvest citing-turn ledger snapshot，避免把终态 compact 后的 `rN` 重新解释为另一条调用；但 A-SWE 仍不能把 `rN` 当 durable evidence key。
 
 因此 Handoff 禁止保存裸：
 
@@ -2604,22 +2616,49 @@ r3
 receipt_ids = ["r3"]
 ```
 
-必须使用：
+也不把：
 
 ```text
+(source_execution_id, r3)
+```
+
+视为长期稳定主键。
+
+ReceiptRef 使用：
+
+```text
+source_execution_id
++
+tool_call_id
++
+tool_name
++
+args_sha256
++
+output_sha256
+```
+
+作为稳定 execution fact identity；`display_receipt_id` 仅用于重现模型当时看到的 citation label。
+
+例如：
+
+```python
 ReceiptRef(
-  source_execution_id=...,
-  receipt_id="r3",
-  tool_name="write_file"
+    source_execution_id="exec-123",
+    tool_call_id="call_abc",
+    tool_name="write_file",
+    args_sha256="...",
+    output_sha256="...",
+    display_receipt_id="r3",
 )
 ```
 
 下游 prompt 必须明确：
 
 ```text
-r3 from execution A
-≠ r3 from execution B
-≠ your own tool execution
+[r3] is historical display metadata
+not a durable global id
+not your own execution proof
 ```
 
 不得让 Node B 引用 Node A 的 receipt 来证明“Node B 已执行该动作”。
@@ -7962,6 +8001,7 @@ Source Audit In Progress
 - repair feedback 使用独立 typed contract；
 - Handoff fingerprint 与 Workspace state fingerprint 分离。
 - DeerFlow receipt 必须 execution-scoped，不保存裸 rN；
+- `rN` 是可重编号 display id；durable ReceiptRef 使用 tool_call_id + hashes；
 - changeset / acceptance / verification 由 ExecutionEvidenceStore 持有；
 - EvidenceRef immutable 且 attempt-scoped；
 - retry / repair 不覆盖旧 attempt evidence；
@@ -7987,7 +8027,8 @@ Source Audit In Progress
 | POC-H13 | operator prompt_overlay 已配置 | A-SWE handoff 不修改 overlay 内容/顺序 |
 | POC-H14 | handoff 中含 `<system>` / fake framework tag | renderer neutralize，不能逃逸到 authority channel |
 | POC-H15 | 多轮 model call | handoff request-scoped 重投影，不写入 graph state/不重复累积 |
-| POC-H16 | 两个 Node 都有 r3 receipt | ReceiptRef 通过 source_execution_id 消除歧义 |
+| POC-H16 | 两个 Node 都有 r3 receipt | ReceiptRef 通过 source_execution_id + tool_call_id 消除歧义 |
+| POC-H16A | 同一 execution compaction 后 receipt renumber | durable ref 仍由 tool_call_id/hashes 解析，display rN 不作主键 |
 | POC-H17 | Node retry attempt 2 成功 | Handoff 只引用 terminal attempt 2 evidence |
 | POC-H18 | old attempt evidence | Trace 可查，但不自动进入新 Handoff |
 | POC-H19 | Runtime restart 后读 Demo trace | file-backed EvidenceRef 仍可 resolve |
