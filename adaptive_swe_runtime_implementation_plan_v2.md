@@ -3679,6 +3679,8 @@ Scheduler 不负责 Task decomposition。
 
 ```text
 AdmissionFailure
+BackendPreflightStale
+ProviderAssemblyMismatch
 ExecutionTransientFailure
 AcceptanceFailure
 VerificationFailure
@@ -3693,6 +3695,8 @@ Cancelled
 | Failure | 行为 |
 |---|---|
 | admission failure before execution | wait / bounded retry |
+| backend preflight stale | fail before execution；pre-WRITE 时可 bounded replan |
+| provider assembly mismatch | fail closed；P1 不自动换 Provider |
 | READ transient failure | RetryPolicy |
 | WRITE failure 且无 workspace change | bounded retry |
 | WRITE failure 且已有 workspace change | fail closed |
@@ -4023,6 +4027,10 @@ class NodeExecutionPolicy(BaseModel):
 
     timeout_seconds: int
     max_turns: int
+
+    provider_contract_fingerprint: str
+    planning_inventory_fingerprint: str
+    task_contract_fingerprint: str
 
     fingerprint: str
 ```
@@ -4505,13 +4513,26 @@ NodeReady
 Dependency Handoff Assemble
    │
    ▼
+ExecutionBackend.prepare_node()
+   │
+   ├── live backend revalidation
+   ├── monotonic runtime narrowing
+   ├── snapshot pinning
+   └── stale preflight → fail before workspace lock
+   │
+   ▼
 WorkspaceAccessCheck
    │
    ▼
 WRITE? capture pre-attempt snapshot
    │
    ▼
-ExecutionBackend.execute_node()
+ExecutionBackend.execute_prepared()
+   │
+   ├── NodePolicyStore bind
+   ├── DeerFlow Subagent assembly
+   ├── first/every-model admission gate
+   └── tool / contract enforcement
    │
    ▼
 Runtime Assembly Attestation
@@ -5819,6 +5840,8 @@ a-swe-runtime/
 │       ├── reasoning.py
 │       ├── inventory.py
 │       ├── preflight.py
+│       ├── preparation.py
+│       ├── snapshot_store.py
 │       ├── model_auth.py
 │       ├── node_policy_store.py
 │       ├── node_policy_outcome.py
@@ -6587,6 +6610,11 @@ Implementation PoC Pending
 - NodeToolPolicy 在每次 model call 重新验证 required eager tool availability；
 - required-tool mismatch 复用 DeerFlow AdmissionError 路径，在 upstream LLM request 前 fail；
 - AssemblyDescriptor 定位为 attestation/reproducibility evidence，不作为 admission gate。
+- `PREFLIGHT_FEASIBLE` 只是 planning-time 判断；NodeReady 后必须 live revalidate；
+- DeerFlow execution 使用单一 AppConfig / Tool / Extension snapshot，避免 execution 内 config TOCTOU；
+- fingerprint drift 本身不是 failure，重新验证 requirement 失败才是 `BACKEND_PREFLIGHT_STALE`；
+- runtime 只允许 monotonic narrowing，不允许隐式扩权或 Provider rebinding；
+- authorization 保持 live gate，不伪造 frozen policy snapshot。
 
 新增 PoC：
 
@@ -6610,6 +6638,12 @@ Implementation PoC Pending
 | POC-42 | Skill activation 后收窄掉 required tool | 下一次 model call admission fail，LLM 不再调用 |
 | POC-43 | Node admission mismatch | SubagentResult=FAILED 且 Adapter 映射 structured PROVIDER_ASSEMBLY_MISMATCH |
 | POC-44 | NodeToolPolicy ordinary run store miss | pass-through；普通 DeerFlow 不受影响 |
+| POC-45 | planning 后新增无关 Tool | inventory drift 被记录，但 Node 仍可 PREPARED |
+| POC-46 | planning 后 required Tool 被移除 | prepare_node 返回 BACKEND_PREFLIGHT_STALE，LLM/Workspace 零副作用 |
+| POC-47 | operator timeout/max_turns 收紧但仍可满足 | effective policy 单调收窄 |
+| POC-48 | prepare 后 config 热更新 | execute_prepared 仍使用 prepare 阶段 pinned AppConfig snapshot |
+| POC-49 | live authorization 在 execution 中改变 | runtime auth gate 生效，不依赖 stale planning verdict |
+| POC-50 | Provider stale 但另一个 Provider 可用 | P1 不隐式切换，显式 fail/replan |
 
 ---
 
@@ -6717,6 +6751,10 @@ Executable TaskDAG
 
 - Scheduler；
 - Ready Node calculation；
+- NodeExecutionPreparation；
+- live Backend revalidation；
+- Backend snapshot pinning；
+- `BACKEND_PREFLIGHT_STALE` classification；
 - Dependency Handoff Routing；
 - READ / WRITE Workspace Access；
 - provably READ-only Basic Parallel Execution；
@@ -6940,6 +6978,11 @@ Coder            exclusive WRITE
 32. 为什么 NodeToolPolicy 与 ContractGuardrail 要分开？
 33. 为什么 WorkspaceAccess 要按最终 allowed tools，而不是 required tools 计算？
 34. NodePolicyStore 为什么一期只承诺 single-process？
+35. 为什么 planning-time preflight 之后还需要 prepare_node？
+36. Backend inventory fingerprint 变化为什么不应该自动判失败？
+37. 为什么 authorization 不能被当成 frozen snapshot？
+38. 为什么 P1 不在 runtime 自动切换另一个 Provider？
+39. DeerFlow 的 one-AppConfig-snapshot 设计如何减少 TOCTOU？
 
 ### 21.4 代码掌握边界
 
