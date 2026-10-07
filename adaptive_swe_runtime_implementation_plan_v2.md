@@ -2414,6 +2414,82 @@ Provider CapabilityBinding
 Concrete Resource Requirements
 ```
 
+### 5.4.1 CapabilityBinding Merge
+
+一个 WorkItem 可以要求多个 Capability，而一个 AgentProvider 可以同时覆盖它们。
+
+对同一个 Provider：
+
+```text
+required_tools
+→ stable ordered union
+
+optional_tools
+→ stable ordered union
+→ 再减去已经 required 的 names
+
+preferred_skills
+→ stable ordered union
+```
+
+例如：
+
+```text
+bug_diagnosis
+required: grep, read_file
+
+code_modification
+required: read_file, str_replace
+
+合并后
+required: grep, read_file, str_replace
+```
+
+required wins over optional：
+
+```text
+Capability A: bash optional
+Capability B: bash required
+→ bash required
+```
+
+禁止通过集合排序破坏声明稳定顺序；fingerprint 使用 canonical representation，execution config 保持 deterministic first-occurrence order。
+
+### 5.4.2 Optional Tool Selection
+
+`optional_tools` 表示 Provider 的可选增强资源，不代表默认全部开放。
+
+P1 默认：
+
+> **optional tool 不自动进入 Node allowed_tools。**
+
+只有 ToolSelectionPolicy 显式选中后，才进入：
+
+```text
+selected_optional_tools
+```
+
+选择条件至少包括：
+
+- backend candidate inventory 中存在；
+- operator policy 未禁止；
+- TaskContract 未禁止；
+- 不会在没有明确收益时扩大 side-effect class；
+- 不会无理由扩大 external side-effect surface。
+
+例如：
+
+```text
+repo_exploration
+required = read_file, grep
+optional = bash
+
+没有明确需求
+→ bash 不开放
+```
+
+这保持 least privilege，也避免“optional bash”把本可并行 READ Node 无意义升级成 WRITE。
+
 ### 5.5 Capability / Tool Side-Effect Authority
 
 最终 `workspace_access` 不由 LLM 决定，也不能只从 Capability 名称推断。
@@ -2476,7 +2552,8 @@ P1 保守分类：
 
 ```text
 semantic effect == READ
-AND all required execution resources are provably READ_ONLY
+AND every tool in the final effective Node allowlist
+    is provably READ_ONLY
 → WorkspaceAccess.READ
 
 otherwise
@@ -2486,6 +2563,24 @@ otherwise
 即：
 
 > **MVP 只有“可证明只读”的 Node 才能并发读取 Workspace。**
+
+这里必须使用最终：
+
+```text
+required_tools
++
+selected_optional_tools
++
+Node-visible non-infrastructure execution tools
+```
+
+而不是只检查 `required_tools`。
+
+因为：
+
+> **Tool 只要被开放给模型，就必须按“可能被调用”计算 side effect。
+
+因此最终 WorkspaceAccess 在 NodePolicy materialization **最后一步**确定；NodeToolPolicy 允许的业务 Tool 集发生变化时，必须重新计算 fingerprint 与 WorkspaceAccess。**
 
 LLM 的 `effect_hint` 仍然只是 hint，可以更保守，但不能降低 Runtime 编译结果。
 
@@ -2618,7 +2713,7 @@ class BackendInventorySnapshot(BaseModel):
 
     candidate_agent_types: frozenset[str]
     candidate_tool_names: frozenset[str]
-    enabled_skill_names: frozenset[str]
+    candidate_skill_names: frozenset[str]
     configured_model_names: frozenset[str]
 
     sandbox_features: frozenset[str]
@@ -2688,8 +2783,10 @@ Declared Capability
 4. Sandbox / backend 是否支持 required execution primitive；
 5. TaskContract 是否禁止该 Tool / effect；
 6. resolved model 是否存在；
-7. authorization-enabled deployment 下，model 是否通过 Adapter 的 model-use preflight；
-8. 由 Capability + ToolEffect 编译后的 WorkspaceAccess 是否满足 Node policy。
+7. authorization-enabled deployment 下，required tools 做 identity-aware authorization preflight；
+8. authorization-enabled deployment 下，resolved model 做 `model:use` preflight；
+9. selected optional tools 是否满足 least-privilege / effect policy；
+10. 由**最终 allowed tool set**编译出的 WorkspaceAccess 是否满足 Node policy。
 
 通过后才进入：
 
@@ -3476,7 +3573,7 @@ class AssemblyAttestation(BaseModel):
 
     effective_model: str
     actual_tool_names: frozenset[str]
-    enabled_skill_names: frozenset[str]
+    candidate_skill_names: frozenset[str]
 
     middleware_names: tuple[str, ...]
     deferred_tool_names: frozenset[str]
@@ -3487,17 +3584,30 @@ class AssemblyAttestation(BaseModel):
     diagnostics: list[str]
 ```
 
+DeerFlow `build_assembly_descriptor()` 会将：
+
+```text
+explicit bound tools
++
+middleware.tools
+```
+
+合并后写入 descriptor，因此 descriptor.tools 可以覆盖最终 build-time declared tool set，而不是只看 `SubagentConfig.tools`。
+
 至少检查：
 
 ```text
-required_tools ⊆ actual_bound_tools
+required_tools ⊆ actual tool descriptors
 ```
 
 以及：
 
 ```text
 actual business tools
-⊆ effective node allowlist
+⊆ NodeExecutionPolicy.allowed_business_tools
+
+actual infrastructure tools
+⊆ NodeExecutionPolicy.infrastructure_tool_names
 ```
 
 同时可以检查：
@@ -3557,8 +3667,10 @@ class NodeExecutionPolicy(BaseModel):
     required_capabilities: tuple[str, ...]
 
     required_tools: tuple[str, ...]
-    optional_tools: tuple[str, ...]
-    allowed_tools: tuple[str, ...]
+    selected_optional_tools: tuple[str, ...]
+
+    allowed_business_tools: tuple[str, ...]
+    infrastructure_tool_names: tuple[str, ...]
     denied_tools: tuple[str, ...]
 
     preferred_skills: tuple[str, ...]
@@ -3577,7 +3689,23 @@ class NodeExecutionPolicy(BaseModel):
     fingerprint: str
 ```
 
-`allowed_tools` 是该 Node 的**最大业务工具集**，不是“建议工具”。
+`allowed_business_tools` 是该 Node 的**最大业务执行工具集**，不是“建议工具”。
+
+```text
+allowed_business_tools
+=
+required_tools
++
+selected_optional_tools
+```
+
+Framework-generated helper 单独放入：
+
+```text
+infrastructure_tool_names
+```
+
+避免把业务权限和 Harness 自身 discovery machinery 混在一起。
 
 例如 Recon Probe：
 
@@ -3619,6 +3747,200 @@ Operator deny
 因此：
 
 > **NodeExecutionPolicy 永远不能扩大 DeerFlow Operator 已经设置的权限。**
+
+#### Final Tool Visibility Backstop
+
+Pinned DeerFlow 中 `SubagentConfig.tools` 只过滤 explicit / regular tools。
+
+随后仍可能加入：
+
+- generated `tool_search`；
+- generated `describe_skill`；
+- middleware-declared tools，例如 model-dependent / extension tool。
+
+DeerFlow 自身的 `tool_declarations.py` 也明确说明：
+
+> LangChain 会在 host explicit tool list 过滤之后，再把 `middleware.tools` 折入最终 ToolNode。
+
+因此：
+
+```text
+SubagentConfig.tools
+≠ complete final model-visible schema allowlist
+```
+
+P1 若要真正实现 Node-scoped least privilege，需要第二道 name-level policy。
+
+##### 不能使用 packaged Extension Middleware 做 enforcement
+
+公开 `deerflow_extension_api` 的 middleware contribution 在 pinned baseline 是 observational contract：
+
+- host 强制向下游传 original request；
+- 不能 veto tool call；
+- 不能改写 model-visible tools；
+- contributor failure fail-open。
+
+因此它适合：
+
+```text
+Assembly Observer
+Trace / Metrics
+```
+
+不适合：
+
+```text
+Node security enforcement
+```
+
+##### Trusted Configured Middleware
+
+DeerFlow 另外提供 operator-owned：
+
+```text
+extensions.middlewares
+```
+
+这是 trusted `AgentMiddleware` customization：
+
+- 直接实例化真实 AgentMiddleware；
+- 同时进入 lead / subagent chain；
+- 不经过 observational isolation wrapper；
+- 可以修改 ModelRequest；
+- 可以 veto ToolCall；
+- 配置加载失败会让 agent build fail loudly。
+
+A-SWE P1 可以增加：
+
+```text
+ASWENodeToolPolicyMiddleware
+```
+
+作为 trusted configured middleware。
+
+##### NodePolicyStore
+
+`SubagentExecutor` 没有任意 extra runtime context 参数。
+
+因此 P1 不滥用：
+
+```text
+authz_attributes
+knowledge_scope
+```
+
+承载 A-SWE 业务 policy。
+
+采用进程内、短生命周期：
+
+```python
+NodePolicyStore[node_execution_id] = NodeExecutionPolicy
+```
+
+Adapter 为每次 Node attempt 生成唯一：
+
+```text
+run_id = aswe:<task>:<node>:<attempt>:<uuid>
+```
+
+并传给 `SubagentExecutor.run_id`。
+
+Middleware 从：
+
+```text
+runtime.context["run_id"]
+```
+
+查当前 Node policy。
+
+生命周期：
+
+```text
+register policy
+      ↓
+execute node
+      ↓
+finally remove policy
+```
+
+要求：
+
+- concurrency-safe；
+- immutable value；
+- bounded / cleanup-safe；
+- cancellation 也必须 finally cleanup；
+- 普通 DeerFlow run 查不到 A-SWE policy → pass-through；
+- `aswe:` managed run 若 policy 丢失 → fail closed。
+
+这个设计只承诺：
+
+> **single-process P1 runtime。**
+
+分布式 Worker 后续必须把 PolicyStore 换成显式 durable / remote policy carrier。
+
+##### Middleware Enforcement
+
+在 model-call boundary：
+
+```text
+request.tools
+∩
+(Node allowed business tools
+ + allowed framework infrastructure tools)
+      ↓
+model-visible tool schemas
+```
+
+在 tool-call boundary：
+
+```text
+tool call name
+      ↓
+Node policy check
+      ↓
+ALLOW / DENY
+```
+
+因此形成：
+
+```text
+Static pruning:
+SubagentConfig.tools
+
+Dynamic final visibility:
+ASWENodeToolPolicyMiddleware
+
+Identity authorization:
+DeerFlow AuthorizationProvider
+
+Argument-sensitive contract:
+ContractGuardrailProvider
+```
+
+四层职责不同，禁止合并成一个大 Policy 类。
+
+##### Framework Infrastructure Tools
+
+至少区分：
+
+```text
+business tools
+vs
+framework infrastructure tools
+```
+
+例如 DeerFlow 生成的：
+
+```text
+tool_search
+describe_skill
+```
+
+不应因为它们不是 CapabilityBinding.required_tools 就被误判成业务越权。
+
+但 infrastructure allowlist 只能由 DeerFlow Adapter 根据当前 assembly mode 生成，不能由 LLM / Provider 自报。
+
+`tool_search` 本身的 deferred catalog 已基于 SubagentConfig + authorization 后的候选集构建，因此允许该 helper 不等价于允许它重新引入已被 Node static pruning 移除的 ordinary tools。
 
 #### Skill Narrowing
 
@@ -3926,9 +4248,9 @@ Adapter 的 monotonic narrowing：
 base = get_subagent_config(provider.backend_agent_type)
 
 if base.tools is None:
-    narrowed_allow = node_policy.allowed_tools
+    narrowed_allow = node_policy.allowed_business_tools
 else:
-    narrowed_allow = intersection(base.tools, node_policy.allowed_tools)
+    narrowed_allow = intersection(base.tools, node_policy.allowed_business_tools)
 
 narrowed_deny = union(
     base.disallowed_tools,
@@ -4024,9 +4346,37 @@ Model Authorization Preflight
 SubagentExecutor
 ```
 
-P1 优先复用 DeerFlow 现有 model authorization semantics；若只能通过 pinned private helper `_authorize_model_name`，则必须封装在 Anti-Corruption Layer 并由 compatibility test 钉住，禁止 Core 直接 import。
+P1 不复制 Lead Agent 的“deny → fallback to another model”私有逻辑，也不依赖 private `_authorize_model_name` 作为核心接口。
 
-不复制一套独立 RBAC / fallback 逻辑。
+A-SWE 采用更严格、可解释的策略：
+
+```text
+model:use ALLOW
+→ execute
+
+model:use DENY
+→ PROVIDER_MODEL_UNAUTHORIZED
+→ provider infeasible / node admission failure
+```
+
+provider error：
+
+```text
+authorization.fail_closed = true
+→ fail closed
+
+authorization.fail_closed = false
+→ preserve DeerFlow fail-open policy
+```
+
+实现只复用 DeerFlow 已有 lower-level authorization primitives：
+
+- `AuthorizationProvider`；
+- `AuthzRequest(resource="model", action="use")`；
+- `build_principal_from_context`；
+- async provider resolution pattern。
+
+这样不复制 RBAC policy engine，也不会在 A-SWE 背后静默替用户换模型。
 
 ### 10.8 Provider Contract Fingerprint
 
@@ -4983,6 +5333,8 @@ a-swe-runtime/
 │       ├── inventory.py
 │       ├── preflight.py
 │       ├── model_auth.py
+│       ├── node_policy_store.py
+│       ├── node_tool_policy.py
 │       ├── config_mapper.py
 │       ├── assembly_attestation.py
 │       ├── attestation_extension.py
@@ -5737,7 +6089,12 @@ Implementation PoC Pending
 - A-SWE 通过公开 AgentAssemblyObserver extension 开启 descriptor generation；
 - AssemblyAttestation 是 compatibility / validity gate，不替代 authorization；
 - direct SubagentExecutor 的 model authorization 需要 Adapter 显式 preflight；
-- private DeerFlow model helper 若被复用，只能封装在 ACL 并用 pinned compatibility tests 保护。
+- P1 对 denied model 使用 strict provider-infeasible 语义，不静默 fallback；
+- `SubagentConfig.tools` 不能覆盖 generated / middleware-declared tool 的全部 visibility；
+- packaged extension middleware 是 observational，不能承担 Node enforcement；
+- strict Node tool visibility 使用 trusted `extensions.middlewares` + ASWENodeToolPolicyMiddleware；
+- NodePolicyStore 用 unique A-SWE run_id 做进程内短生命周期 correlation；
+- P1 明确限制为 single-process policy carrier；distributed carrier 后置。
 
 新增 PoC：
 
@@ -5750,6 +6107,13 @@ Implementation PoC Pending
 | POC-31 | preferred skill enabled 但未 activation | 不误报 skill-used，也不把 Node 判失败 |
 | POC-32 | authorization deny resolved model | direct-executor Adapter 在 LLM 调用前按 DeerFlow policy fail/fallback |
 | POC-33 | ordinary DeerFlow run | A-SWE attestation extension 不改变普通 Agent execution semantics |
+| POC-34 | middleware-declared tool 不在 Node allowlist | model-visible schema 被 ASWENodeToolPolicyMiddleware 移除 |
+| POC-35 | unauthorized tool call 绕过 model visibility | tool-call boundary 再次 deny |
+| POC-36 | generated tool_search / describe_skill | 只允许 adapter-classified infrastructure helper |
+| POC-37 | A-SWE managed run policy store miss | fail closed |
+| POC-38 | Node cancellation / timeout | NodePolicyStore entry 一定 cleanup |
+| POC-39 | optional bash 未选择 | READ Node 不因 Provider optional declaration 被升级 WRITE |
+| POC-40 | optional bash 被选择 | WorkspaceAccess 自动升级 WRITE 且 fingerprint 改变 |
 
 ---
 
@@ -5864,7 +6228,11 @@ Executable TaskDAG
 - ContractGuardrailProvider integration；
 - Pre-tool constraint guard；
 - monotonic SubagentConfig narrowing；
-- model authorization preflight；
+- identity-aware Tool / Model authorization preflight；
+- NodePolicyStore；
+- trusted ASWENodeToolPolicyMiddleware；
+- final model-visible tool filtering；
+- tool-call name-level deny backstop；
 - A-SWE AgentAssemblyObserver extension；
 - DeerFlow AssemblyAttestation；
 - PROVIDER_ASSEMBLY_MISMATCH classification；
@@ -6069,6 +6437,11 @@ Coder            exclusive WRITE
 27. enabled skill 与 skill activation / usage 有什么区别？
 28. 为什么 AssemblyObserver 不能作为 execution safety gate？
 29. direct SubagentExecutor 的 model authorization 边界是什么？
+30. 为什么 SubagentConfig.tools 不是最终 schema allowlist？
+31. packaged Extension middleware 与 trusted extensions.middlewares 有什么权限差异？
+32. 为什么 NodeToolPolicy 与 ContractGuardrail 要分开？
+33. 为什么 WorkspaceAccess 要按最终 allowed tools，而不是 required tools 计算？
+34. NodePolicyStore 为什么一期只承诺 single-process？
 
 ### 21.4 代码掌握边界
 
