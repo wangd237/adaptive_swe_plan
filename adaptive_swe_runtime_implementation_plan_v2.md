@@ -576,6 +576,7 @@ class ExecutionBackend(Protocol):
     async def execute_prepared(
         self,
         preparation: NodeExecutionPreparation,
+        invocation: NodeExecutionInvocation,
         workspace: WorkspaceSession,
     ) -> NodeExecutionResult:
         ...
@@ -601,10 +602,36 @@ class ExecutionBackend(Protocol):
 TaskNode
 NodeExecutionPolicy
 NodeExecutionPreparation
+NodeExecutionInvocation
 WorkspaceSession
 NodeExecutionResult
 NodeAcceptanceResult
 ```
+
+其中 `NodeExecutionPreparation` 冻结 backend resources；`NodeExecutionInvocation` 冻结**拿到 Workspace lock 以后才能确定的本 attempt execution context**：
+
+```python
+class NodeExecutionInvocation(BaseModel):
+    task_id: str
+    node_id: str
+    attempt: int
+    attempt_kind: NodeAttemptKind
+
+    execution_id: str
+    run_id: str
+
+    execution_workspace_revision: WorkspaceRevision
+
+    # Already deterministically rendered, bounded and neutralized.
+    dependency_context_text: str
+    dependency_handoff_fingerprints: tuple[str, ...]
+
+    repair_feedback_text: str | None
+
+    context_fingerprint: str
+```
+
+Core 不知道 DeerFlow middleware store；Adapter 再将 Invocation 投影到 DeerFlow-specific execution binding。
 
 而不知道 DeerFlow 内部如何加载 Skill、Tool、MCP、Middleware 或 Sandbox。
 
@@ -3076,7 +3103,7 @@ ASWEHandoffContextMiddleware
 
 ```text
 run_id starts with "aswe:"
-AND NodePolicyStore contains execution binding
+AND NodeExecutionBindingStore contains execution binding
 ```
 
 生效。
@@ -6040,9 +6067,9 @@ ASWENodeToolPolicyMiddleware
 
 作为 trusted configured middleware。
 
-##### NodePolicyStore
+##### NodeExecutionBindingStore
 
-`SubagentExecutor` 没有任意 extra runtime context 参数。
+`SubagentExecutor` 没有任意 extra A-SWE runtime context 参数。
 
 因此 P1 不滥用：
 
@@ -6051,70 +6078,141 @@ authz_attributes
 knowledge_scope
 ```
 
-承载 A-SWE 业务 policy。
+承载 A-SWE 业务 policy / handoff。
 
-采用进程内、短生命周期：
+Adapter 使用进程内、短生命周期：
 
 ```python
-NodePolicyStore[node_execution_id] = NodeExecutionPolicy
+@dataclass(frozen=True)
+class NodeExecutionBinding:
+    run_id: str
+    execution_id: str
+
+    policy: NodeExecutionPolicy
+    invocation: NodeExecutionInvocation
+
+class NodeExecutionRuntimeOutcome:
+    admission_checked: bool
+    admission_failure: str | None
+    missing_required_tools: tuple[str, ...]
+    denied_tool_calls: list[dict]
+
+NodeExecutionBindingStore[run_id]
+    = (NodeExecutionBinding, NodeExecutionRuntimeOutcome)
 ```
 
-Adapter 为每次 Node attempt 生成唯一：
+Adapter 为每次 Node attempt 生成不可复用的：
 
 ```text
 run_id = aswe:<task>:<node>:<attempt>:<uuid>
 ```
 
-并传给 `SubagentExecutor.run_id`。
+并同时：
 
-Middleware 从：
+1. 写入 `NodeExecutionBindingStore[run_id]`；
+2. 传给 `SubagentExecutor.run_id`。
+
+Pinned SubagentExecutor 会把它写入：
 
 ```text
 runtime.context["run_id"]
 ```
 
-查当前 Node policy。
-
-生命周期：
+因此：
 
 ```text
-register immutable policy
+ASWENodeToolPolicyMiddleware
+ASWEHandoffContextMiddleware
+```
+
+都通过同一个 exact run_id lookup 获取当前 execution binding。
+
+#### 为什么 Handoff 在进入 Store 前就 Render
+
+Handoff evidence resolve / revision classification 发生在 Workspace lock granted 后。
+
+如果让 DeerFlow middleware 每次 model call 自己：
+
+```text
+read EvidenceStore
+recompute staleness
+render dependency context
+```
+
+会引入：
+
+- isolated-loop 文件 I/O；
+- 每轮重复工作；
+- middleware 内新的 TOCTOU；
+- EvidenceStore / Core object 泄漏进 DeerFlow middleware。
+
+因此：
+
+```text
+Workspace lock granted
       ↓
-attach mutable runtime outcome
+freeze execution_workspace_revision
+      ↓
+resolve EvidenceRefs
+      ↓
+deterministic HandoffRenderer
+      ↓
+bounded + neutralized dependency_context_text
+      ↓
+create immutable NodeExecutionInvocation
+      ↓
+register NodeExecutionBinding
+      ↓
+SubagentExecutor
+```
+
+`ASWEHandoffContextMiddleware` 每次 model call 只做：
+
+```text
+lookup exact run_id
+→ read immutable dependency_context_text
+→ inject request-scoped messages
+```
+
+不做磁盘 / EvidenceStore / Git I/O。
+
+#### Store Lifecycle
+
+```text
+prepare backend resources
+      ↓
+acquire workspace access
+      ↓
+build immutable NodeExecutionInvocation
+      ↓
+register NodeExecutionBinding
       ↓
 execute node
       ↓
-Adapter reads terminal outcome
+Adapter reads terminal runtime outcome
       ↓
 finally remove binding
+      ↓
+release workspace access
 ```
-
-建议：
-
-```python
-class NodePolicyRuntimeOutcome:
-    admission_checked: bool
-    admission_failure: str | None
-    missing_required_tools: tuple[str, ...]
-    denied_tool_calls: list[dict]
-```
-
-Policy 本身 immutable；runtime outcome 单独存放，不允许 middleware 原地改写 compiled policy。
 
 要求：
 
-- concurrency-safe；
-- immutable value；
+- exact `run_id` 作为唯一 key，不使用可碰撞的 node_id；
+- immutable policy + immutable invocation；
+- mutable outcome 独立并由 concurrency-safe holder 管理；
 - bounded / cleanup-safe；
-- cancellation 也必须 finally cleanup；
-- 普通 DeerFlow run 查不到 A-SWE policy → pass-through；
-- `aswe:` managed run 若 policy 丢失 → fail closed。
+- cancellation / timeout / exception 都必须 finally cleanup；
+- ordinary DeerFlow run 没有 matching A-SWE binding → pass-through；
+- `aswe:` run_id 但 exact binding 丢失 → fail closed；
+- prefix 只用于 managed-run diagnostics，不是 authority；authority 来自 exact in-process binding；
+- execution binding 不跨 process。
 
 这个设计只承诺：
 
 > **single-process P1 runtime。**
 
-分布式 Worker 后续必须把 PolicyStore 换成显式 durable / remote policy carrier。
+分布式 Worker 后续必须把 BindingStore 换成显式 durable / remote execution-context carrier。
 
 ##### Middleware Enforcement
 
@@ -6224,27 +6322,6 @@ otherwise
 ```
 
 如果未来 DeerFlow 提供正式公开的 typed node-admission failure contract，再评估替换；P1 不依赖不存在的 admission seam。
-4. 不调用 LLM provider；
-5. 不重试；
-6. 生成带 `deerflow_error_fallback=true` 的 terminal AIMessage；
-7. `SubagentExecutor` 现有 `_extract_llm_error_fallback` 将结果映射为 FAILED；
-8. Adapter 从 NodePolicy runtime outcome 映射成 A-SWE 的 `PROVIDER_ASSEMBLY_MISMATCH`。
-
-这条 DeerFlow internal exception 只能存在于：
-
-```text
-integrations/deerflow/
-```
-
-Anti-Corruption Layer 内，并通过 pinned compatibility test 保护。
-
-Core 只看：
-
-```text
-NodeAdmissionFailure
-reason = PROVIDER_ASSEMBLY_MISMATCH
-```
-
 ###### Revalidation on Every Model Turn
 
 required tool availability 不只首轮检查。
@@ -6441,7 +6518,7 @@ WRITE / UNKNOWN-MUTATING → mandatory pre-attempt snapshot
    ▼
 ExecutionBackend.execute_prepared()
    │
-   ├── NodePolicyStore bind
+   ├── NodeExecutionBindingStore bind immutable Invocation
    ├── DeerFlow Subagent assembly
    ├── first/every-model admission gate
    └── tool / contract enforcement
@@ -8611,7 +8688,7 @@ Implementation PoC Pending
 - `SubagentConfig.tools` 不能覆盖 generated / middleware-declared tool 的全部 visibility；
 - packaged extension middleware 是 observational，不能承担 Node enforcement；
 - strict Node tool visibility 使用 trusted `extensions.middlewares` + ASWENodeToolPolicyMiddleware；
-- NodePolicyStore 用 unique A-SWE run_id 做进程内短生命周期 correlation；
+- NodeExecutionBindingStore 用 unique A-SWE run_id 做进程内短生命周期 correlation；
 - P1 明确限制为 single-process policy carrier；distributed carrier 后置。
 - required hard Tool dependency 一期必须是 eager；deferred MCP 仅作为 optional enhancement；
 - NodeToolPolicy 在每次 model call 重新验证 required eager tool availability；
@@ -8650,7 +8727,7 @@ Implementation PoC Pending
 | POC-35 | unauthorized tool call 绕过 model visibility | tool-call boundary 再次 deny |
 | POC-36 | generated tool_search / describe_skill | 只允许 adapter-classified infrastructure helper |
 | POC-37 | A-SWE managed run policy store miss | fail closed |
-| POC-38 | Node cancellation / timeout | NodePolicyStore entry 一定 cleanup |
+| POC-38 | Node cancellation / timeout | NodeExecutionBindingStore entry 一定 cleanup |
 | POC-39 | optional bash 未选择 | READ Node 不因 Provider optional declaration 被升级 WRITE |
 | POC-40 | optional bash 被选择 | WorkspaceAccess 自动升级 WRITE 且 fingerprint 改变 |
 | POC-41 | required tool 被标记 deferred MCP | P1 compile-time reject：hard required tool 必须 eager |
@@ -8721,6 +8798,10 @@ Source Audit In Progress
 - Retry 与 Repair 共享 attempt ledger，但触发条件完全不同；
 - repair/reverify 全部生成 fresh execution/evidence，旧 verdict 只保留 Trace；
 - P1 repair 只支持 deterministic failure + unique single writer target；
+- post-lock dependency projection 通过 provider-neutral NodeExecutionInvocation 进入 Backend；
+- DeerFlow Adapter 用 exact run_id 绑定 immutable NodeExecutionBinding；
+- Handoff middleware 不在 isolated loop 读取 EvidenceStore / Git；
+- run_id prefix 不是 authority，exact BindingStore entry 才是 authority。
 
 新增 PoC：
 
@@ -8778,6 +8859,12 @@ Source Audit In Progress
 | POC-H49 | repair succeeded | Verification 同 Node 以 REVERIFY 新 attempt 执行，旧 verdict 不复用 |
 | POC-H50 | 两个 writer 都可能致因 | P1 不自动 repair，fail / explicit restart path |
 | POC-H51 | repair 需要额外 Tool/Capability | 不扩权，判 plan invalidated / unsupported repair |
+| POC-H52 | post-lock handoff projection | NodeExecutionInvocation fingerprint 固定且传入 execute_prepared |
+| POC-H53 | 两个并发 A-SWE Node | exact run_id 分别读取自己的 immutable binding，无 context 串线 |
+| POC-H54 | aswe: run_id 但 binding 丢失 | managed run fail closed |
+| POC-H55 | ordinary DeerFlow run 无 binding | 两个 A-SWE middleware 都 pass-through |
+| POC-H56 | 多轮 model call | middleware 不读 Git/EvidenceStore，只复用 immutable rendered context |
+| POC-H57 | cancellation / timeout | finally 删除 execution binding，无 store leak |
 
 ---
 
@@ -8908,7 +8995,7 @@ Executable TaskDAG
 - Pre-tool constraint guard；
 - monotonic SubagentConfig narrowing；
 - identity-aware Tool / Model authorization preflight；
-- NodePolicyStore；
+- NodeExecutionBindingStore / NodeExecutionInvocation；
 - trusted ASWENodeToolPolicyMiddleware；
 - first-model / every-model required-tool admission gate；
 - synthetic policy-failure ModelResponse short-circuit；
@@ -9129,7 +9216,7 @@ Coder            exclusive WRITE
 31. packaged Extension middleware 与 trusted extensions.middlewares 有什么权限差异？
 32. 为什么 NodeToolPolicy 与 ContractGuardrail 要分开？
 33. 为什么 WorkspaceAccess 要按最终 allowed tools，而不是 required tools 计算？
-34. NodePolicyStore 为什么一期只承诺 single-process？
+34. NodeExecutionBindingStore 为什么一期只承诺 single-process？
 35. 为什么 planning-time preflight 之后还需要 prepare_node？
 36. Backend inventory fingerprint 变化为什么不应该自动判失败？
 37. 为什么 authorization 不能被当成 frozen snapshot？
