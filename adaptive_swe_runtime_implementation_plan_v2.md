@@ -4402,7 +4402,45 @@ Acceptance Intent
       ↓
 Acceptance Compiler
       ↓
-Canonical Acceptance Criteria
+Compiled Acceptance Plan
+      ├── Canonical Acceptance Criteria
+      ├── VerificationCommand
+      └── Required Sandbox Evidence Features
+```
+
+#### VerificationCommand
+
+Shell-based deterministic verification 必须先编译成一个 provider-neutral、immutable command artifact，而不是分别在：
+
+```text
+tests_passed:<command>
+BashCommandPolicy.allowed_commands
+```
+
+里复制字符串。
+
+建议：
+
+```python
+class VerificationCommandKind(str, Enum):
+    TEST = "test"
+    BUILD = "build"
+    IMPORT_CHECK = "import_check"
+    STATIC_CHECK = "static_check"
+
+class VerificationCommand(BaseModel):
+    id: str
+    kind: VerificationCommandKind
+
+    command: str
+
+    source: Literal[
+        "user_hard_requirement",
+        "repository_profile",
+        "runtime_rule",
+    ]
+
+    fingerprint: str
 ```
 
 例如：
@@ -4410,8 +4448,98 @@ Canonical Acceptance Criteria
 ```text
 "regression tests should pass"
       ↓
-tests_passed:<resolved-test-command>
+VerificationCommand(
+    id="verify-tests",
+    kind=TEST,
+    command="pytest -q",
+    ...
+)
+      ↓
+tests_passed:pytest -q
+      +
+BashCommandPolicy.EXACT_ALLOWLIST["pytest -q"]
 ```
+
+因此：
+
+> **Acceptance criterion 与 executable bash authority 必须来自同一个 VerificationCommand identity。**
+
+若二者 command 不一致：
+
+```text
+ACCEPTANCE_COMMAND_POLICY_MISMATCH
+→ compile-time fail
+```
+
+#### Sandbox Evidence Requirement
+
+Pinned DeerFlow 的 `tests_passed:<command>` 不是“bash 退出码为 0”这么简单。
+
+其 checker 会读取 `SubagentResult.bash_executions`，并要求 matched execution：
+
+```text
+shell_persistent is False
+```
+
+若：
+
+```text
+shell_persistent == True
+OR
+shell_persistent == None
+```
+
+则 fail closed：
+
+```text
+UNVERIFIED
+```
+
+因此，任何 load-bearing：
+
+```text
+tests_passed:<command>
+```
+
+必须自动添加：
+
+```text
+required_sandbox_features += deerflow_tests_passed_evidence
+```
+
+这个 requirement 不是 Planner hint，而是 Acceptance Compiler 的 deterministic derivation。
+
+#### Bash Evidence Collection Must Be Declared Before Execution
+
+Pinned `SubagentExecutor` 只有在：
+
+```text
+acceptance_criteria is non-empty
+```
+
+时才累积 `bash_executions`。
+
+因此：
+
+```text
+execute first
+→ later decide "let's check tests_passed"
+```
+
+在 P1 是无效流程。
+
+所有 shell-based load-bearing acceptance 必须在构造 SubagentExecutor 前完成：
+
+```text
+VerificationCommand
+→ canonical acceptance criteria
+→ executor.acceptance_criteria
+→ bash evidence collection enabled
+```
+
+事后不得伪造或从 self-report 补回 test evidence。
+
+#### Undecidable Intent
 
 无法确定性编译的 criterion：
 
@@ -6660,6 +6788,15 @@ class ProviderAssignment(BaseModel):
 
 `ProviderAssignment` 是 planning artifact。
 
+其中 `required_sandbox_features` 不只来自 Capability / Tool execution needs，也必须合并 Acceptance Compiler 的 evidence requirements，例如：
+
+```text
+tests_passed:<command>
+→ deerflow_tests_passed_evidence
+```
+
+因此“Tester provider 有 bash”不足以通过 regression verification preflight。
+
 它记录：
 
 > **为什么在当时的 Backend snapshot 下选择了这个 Provider。**
@@ -6755,6 +6892,57 @@ class BackendInventorySnapshot(BaseModel):
     fingerprint: str
 ```
 
+#### P1 Sandbox Feature Vocabulary
+
+Adapter 不只报告：
+
+```text
+"bash available"
+```
+
+还必须报告 shell / evidence semantics。
+
+P1 至少使用：
+
+```text
+fresh_shell_per_command
+deerflow_tests_passed_evidence
+persistent_shell_sessions
+shell_session_semantics_unknown
+```
+
+Pinned DeerFlow 映射：
+
+```text
+Sandbox.persistent_shell_sessions == False
+→ fresh_shell_per_command
+→ deerflow_tests_passed_evidence
+
+Sandbox.persistent_shell_sessions == True
+→ persistent_shell_sessions
+→ NO deerflow_tests_passed_evidence
+
+Sandbox.persistent_shell_sessions == None
+→ shell_session_semantics_unknown
+→ NO deerflow_tests_passed_evidence
+```
+
+当前 pinned provider declarations：
+
+```text
+LocalSandbox      → False
+E2B               → False
+OpenSandbox       → False
+Tenki             → False
+BoxLite           → False
+
+AioSandbox        → True
+```
+
+> **Sandbox 能执行 bash ≠ Sandbox 能为 DeerFlow native tests_passed checker 提供 load-bearing deterministic evidence。**
+
+AIO 的 ordinary subagent bash path使用 execution-scoped persistent shell；当前 `_harvest_bash_executions` 的 provenance stamp 又来自 Sandbox-level `persistent_shell_sessions=True`，因此 P1 不把 AIO 宣称为 native `tests_passed` evidence-capable backend。
+
 注意命名：
 
 > **candidate_tools，而不是 actual_bound_tools。**
@@ -6825,7 +7013,7 @@ Declared Capability
 2. binding.required_tools 的 Tool Contract ID 是否都能唯一解析到预期 `implementation_id`；
 3. required tool 是否存在于 backend inventory 且 `delivery == eager`；
 4. resolved implementation 的 exposed name 是否仍满足 operator SubagentConfig 静态 allow / deny；
-5. Sandbox / backend 是否支持 required execution primitive；
+5. `required_sandbox_features ⊆ BackendInventorySnapshot.sandbox_features`，包括 acceptance-derived evidence semantics；
 6. TaskContract 是否禁止该 Tool / effect；
 7. resolved model 是否存在；
 8. authorization-enabled deployment 下，required tools 做 identity-aware authorization preflight；
@@ -7769,6 +7957,7 @@ ProviderAssemblyMismatch
 ExecutionTransientFailure
 ExecutionCappedPartial
 AcceptanceFailure
+AcceptanceCommandPolicyMismatch
 VerificationFailure
 ReviewGateRejected
 ReviewGateUnverified
@@ -8626,6 +8815,7 @@ class NodeExecutionPolicy(BaseModel):
     contract_guard_rules: tuple[str, ...]
     post_node_invariants: tuple[str, ...]
 
+    verification_commands: tuple[VerificationCommand, ...]
     bash_policy: BashCommandPolicy
 
     # True only when every load-bearing Node acceptance obligation has a
@@ -11371,7 +11561,7 @@ PoC 矩阵：
 |---|---|---|
 | POC-01 | 直接 `SubagentExecutor(repo-explorer)` | 不经过 Lead Agent 即可执行 |
 | POC-02 | Explorer 写 `marker.txt` → Coder 读取 | 同 thread workspace |
-| POC-03 | Coder 修改 Python 文件 → Tester pytest | 修改对后续 Node 可见 |
+| POC-03 | Coder 修改 Python 文件 → Tester pytest | 修改对后续 Node 可见；fresh-shell reference 下 tests_passed 可确定性成立 |
 | POC-04 | 两个 READ Node 并发 | 能共享 Workspace / Sandbox |
 | POC-05 | 两个 Subagent 并发 | 一个结束不会提前释放另一个正在使用的 Sandbox |
 | POC-06 | timeout / cancel | capacity 与 sandbox lease 无泄漏 |
@@ -11444,8 +11634,9 @@ Evaluation / Patch Result
 - Repository invariant：A-SWE 实现；
 - filesystem snapshot / diff：复用 DeerFlow `workspace_changes`；
 - Git-aware Patch：A-SWE 实现；
-- LocalSandbox：仅可信开发 / Demo；
-- Local AIO Container：Repository-Level SWE 默认执行环境；
+- Fresh-shell Sandbox Profile：P1 deterministic regression reference execution environment；
+- LocalSandbox：最简单的 trusted local/demo fresh-shell reference（host bash 必须显式允许）；
+- Local AIO Container：仍可用于 Agent execution / shared Workspace isolation，但 pinned baseline 下不具备 native `deerflow_tests_passed_evidence`，不能作为完整 deterministic regression reference；
 - public HTTPS repo / local fixture：MVP 必须支持；
 - private repo credential：optional integration。
 
@@ -11460,7 +11651,8 @@ Evaluation / Patch Result
 | POC-17 | Agent 擅自 commit / checkout | invariant fail |
 | POC-18 | final Git ChangeSet | tracked + untracked 完整 |
 | POC-19 | baseline snapshot timing | clone 文件不进入 task diff |
-| POC-20 | Local AIO repo execution | clone / edit / pytest / diff 全链路成立 |
+| POC-20A | fresh-shell reference sandbox repo execution | clone / edit / pytest / deterministic tests_passed / diff 全链路成立 |
+| POC-20B | Local AIO pytest execution | pytest 可运行，但 bash evidence shell_persistent=true，native tests_passed=UNVERIFIED |
 
 P0-2 的目标不是让 Agent 学会 Git，而是让 Runtime 掌握 Repository execution identity 与可复现 baseline。
 
@@ -11923,6 +12115,11 @@ Source Audit In Progress
 - SubagentResult first-terminal-wins 会隐藏“COMPLETED 后 cleanup tail 触发 outer timeout”的竞态；
 - completion compatibility outcome 必须独立记录 outer_timeout_fired；
 - COMPLETED + lifecycle deadline overrun 可继续 deterministic evaluation，但不得记为 clean within-budget completion。
+- SubagentExecutor 只有 acceptance_criteria 非空时才采集 bash execution evidence；
+- native tests_passed 明确要求 shell_persistent=False；True/None 均 UNVERIFIED；
+- AIO pinned baseline persistent_shell_sessions=True，因此不能承担 P1 load-bearing native tests_passed reference path；
+- sandbox execution capability 与 deterministic-evidence capability 分离；
+- VerificationCommand 同时驱动 tests_passed criterion 与 BashCommandPolicy exact command，避免 command identity drift。
 - A-SWE P1 统一资源顺序为 Workspace → DeerFlow native capacity，避免内部 ABBA；
 - capacity snapshot 只能做 pre-lock backpressure hint，不能当 reservation；
 - P1 接受 backend saturation 时的 Workspace lock hoarding，并以 metrics 量化，不自建第二套 capacity controller。
@@ -11962,7 +12159,7 @@ Final Node logical state
 P0-7 Go/No-Go：
 
 ```text
-POC-R34 / R35 / R36 / R38 / R50 / R51
+POC-R34 / R35 / R36 / R38 / R50 / R51 / R69 / R70 / R73
 ```
 
 必须通过。
@@ -11975,6 +12172,46 @@ Direct SubagentExecutor backend
 ```
 
 不能用“terminal status + sleep 一下”替代。
+
+---
+
+#### P0-7.1 Deterministic Verification Sandbox Profile
+
+P1 reference deployment 必须满足：
+
+```text
+shared Repository Workspace
++
+required core tools
++
+fresh_shell_per_command
++
+deerflow_tests_passed_evidence
+```
+
+因此当前 pinned baseline：
+
+| Sandbox | Agent/SWE execution | Native tests_passed load-bearing evidence | P1 reference status |
+|---|---:|---:|---|
+| LocalSandbox | Yes | Yes | ✅ trusted local/demo reference |
+| AioSandbox | Yes | No (`persistent_shell_sessions=True`) | 🟡 execution supported, deterministic regression reference NO |
+| E2B/OpenSandbox/Tenki/BoxLite | provider-dependent | declared fresh-shell | optional future profiles |
+
+P1 不为了保留 AIO “默认”标签而绕过 DeerFlow checker。
+
+未来若希望 AIO 成为完整 deterministic reference，可以新增单独：
+
+```text
+FreshShellVerificationBackend
+```
+
+在同一 Workspace 上由 Runtime 直接执行 canonical `VerificationCommand`，并产生独立 typed evidence；但这必须是新的明确验证 seam，不能把 AIO persistent-shell evidence 伪装成 native `tests_passed`。
+
+DeerFlow acceptance checker 自身已经采用：
+
+> persistent / unknown shell provenance → fail closed
+
+A-SWE 保持这一边界。
 
 ---
 
@@ -12049,6 +12286,13 @@ P0-7 新增 PoC：
 | POC-R65 | timeout 在 terminal result 前发生 | TIMED_OUT；outer_timeout_fired=true |
 | POC-R66 | COMPLETED + deadline overrun + acceptance holds | 可 logical accept，但 Trace 标 BACKEND_LIFECYCLE_DEADLINE_OVERRUN |
 | POC-R67 | completion outcome 丢失 timeout marker | compatibility test fail，不允许仅从 result.status 猜 |
+| POC-R68 | acceptance_criteria=None 但 Agent 调 bash | SubagentResult.bash_executions=None；不能事后补 tests_passed |
+| POC-R69 | LocalSandbox exact pytest | shell_persistent=false；native tests_passed checker 可产生 holds=true |
+| POC-R70 | AioSandbox exact pytest | shell_persistent=true；native tests_passed checker 必须 UNVERIFIED |
+| POC-R71 | custom sandbox shell semantics=None | native tests_passed fail closed为 UNVERIFIED |
+| POC-R72 | VerificationCommand 与 BashCommandPolicy command 不一致 | ACCEPTANCE_COMMAND_POLICY_MISMATCH，compile-time fail |
+| POC-R73 | verification Node required deerflow_tests_passed_evidence，但 backend 缺失 | Provider preflight fail before Workspace lock / execution |
+| POC-R74 | cancel 发生在已 yielded passing pytest ToolMessage 之后 | 已发布 bash evidence 保留；是否接受仍由 terminal/completeness policy决定 |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
@@ -12076,7 +12320,9 @@ P0-7 新增 PoC：
 - Git submodule / sparse-checkout P1 bootstrap rejection；
 - Workspace identity：`task_id → user_id + thread_id`；
 - shared execution capacity；
-- DeerFlow compatibility integration tests。
+- DeerFlow compatibility integration tests；
+- fresh-shell deterministic-verification reference Sandbox profile；
+- AIO persistent-shell evidence limitation documented。
 
 目标：
 
@@ -12114,7 +12360,9 @@ DeerFlow Subagent Execution
 - NodeBoundaryPolicy；
 - PlanValidator；
 - PlanNormalizer；
-- Acceptance Compiler。
+- Acceptance Compiler；
+- VerificationCommand / command identity；
+- acceptance-derived sandbox evidence requirements。
 
 目标：
 
@@ -12135,6 +12383,7 @@ ValidatedWorkPlan
 - Agent Registry；
 - AgentProvider / ProviderContract；
 - BackendInventorySnapshot；
+- Sandbox evidence feature inventory / preflight；
 - Provider preflight feasibility；
 - ProviderContract fingerprint；
 - Minimal Feasible Team Policy；
@@ -12400,7 +12649,7 @@ Coder            exclusive WRITE
 18. Execution Trace 为什么不仅仅是日志？
 19. Evaluation 为什么优先使用确定性检查？
 20. Direct Subagent 的 Skill projection 有什么已知边界？
-21. 为什么一期限制 Local Sandbox / Local AIO，而不直接承诺 Remote Sandbox？
+21. 为什么一期要区分 Sandbox execution capability 与 deterministic-evidence capability？
 22. 为什么 CapabilitySpec 不直接保存 required_tools / eligible_agents？
 23. CapabilityBinding 为什么属于 Provider，而不是 Capability？
 24. Backend Inventory 与 DeerFlow Assembly Attestation 有什么区别？
@@ -12425,6 +12674,9 @@ Coder            exclusive WRITE
 43. 为什么 Review direct-return verdict 不能复用普通 self-report receipt verifier？
 44. 为什么 executor quiescence 不等于 AIO container/process quiescence？
 45. 为什么 P1 的 bash 使用 exact Runtime allowlist，而不是允许 Agent 自由拼 shell？
+46. 为什么“Sandbox 能执行 pytest”不等于 DeerFlow tests_passed 能产生确定性通过证据？
+47. 为什么 AIO 在 pinned baseline 下不是 P1 deterministic regression reference backend？
+48. 为什么 VerificationCommand 必须同时生成 acceptance criterion 和 bash authority？
 
 ### 21.4 代码掌握边界
 
