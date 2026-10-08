@@ -3112,11 +3112,13 @@ class TaskLogicalStatus(str, Enum):
     CANCELLED = "cancelled"
 
 class WorkspaceDisposition(str, Enum):
-    CLEAN = "clean"
+    # Backend quiescence is proven and the terminal workspace state is stable.
+    # This says nothing about whether a legitimate/residual repository patch exists.
+    STABLE = "stable"
 
-    # Observed mutation exists, or mutation cannot be ruled out.
-    # Backend quiescence is nevertheless proven.
-    MUTATED_OR_UNKNOWN = "mutated_or_unknown"
+    # Backend quiescence is proven, but bounded workspace observation cannot rule
+    # out scanner-excluded/environment side effects.
+    STABLE_WITH_UNCERTAINTY = "stable_with_uncertainty"
 
     # Backend may still be live / late-mutating.
     QUARANTINED = "quarantined"
@@ -3138,7 +3140,7 @@ class PatchDisposition(str, Enum):
 
 ```text
 FAILED
-+ WorkspaceDisposition.MUTATED_OR_UNKNOWN
++ WorkspaceDisposition.STABLE
 + RepositoryDisposition.PATCH_PRESENT
 + PatchDisposition.RESIDUAL_UNACCEPTED
 ```
@@ -3151,12 +3153,12 @@ FAILED
 
 ```text
 FAILED
-+ WorkspaceDisposition.MUTATED_OR_UNKNOWN
++ WorkspaceDisposition.STABLE_WITH_UNCERTAINTY
 + RepositoryDisposition.BASELINE_CLEAN
 + PatchDisposition.NONE
 ```
 
-例如 bash 改了 scanner-excluded cache/environment，但 Git-visible business patch 没有变化。
+例如 bash 进入过 mutating/UNKNOWN execution path，Git-visible business patch 没有变化，但 scanner-excluded cache/environment side effect 无法完全排除。
 
 以及：
 
@@ -3168,6 +3170,34 @@ FAILED
 ```
 
 因此“dirty”不能被偷换成“Git patch 一定存在”。
+
+Workspace disposition 的计算只描述 terminal stability：
+
+```text
+quiescence not proven
+→ QUARANTINED
+
+quiescence proven
+AND final physical-mutation attribution complete enough for the relevant contract
+→ STABLE
+
+quiescence proven
+BUT scanner-excluded / environment mutation cannot be ruled out
+→ STABLE_WITH_UNCERTAINTY
+```
+
+Repository / Patch disposition 再独立回答：
+
+> Git-visible business patch 是否存在、是否被接受。
+
+因此一个正常成功的软件修改完全可以是：
+
+```text
+SUCCEEDED
++ WorkspaceDisposition.STABLE
++ RepositoryDisposition.PATCH_PRESENT
++ PatchDisposition.ACCEPTED
+```
 
 ##### Atomic Task Fail-Closed Transition
 
@@ -3201,7 +3231,7 @@ Writer dirty-fails
 
 已 `SUCCEEDED` 的 Node 保留其历史 logical success / evidence；Task failure 不重写历史 attempt。它们的 accepted Handoff 也不得再用于新的 ordinary dispatch，因为 Task dispatch gate 已关闭。
 
-如果 quiescence **无法证明**：
+如果 dirty-failure path 上 quiescence **无法证明**：
 
 ```text
 TaskLogicalStatus → FAILED
@@ -3209,6 +3239,8 @@ WorkspaceSessionStatus → QUARANTINED
 WorkspaceDisposition → QUARANTINED
 ordinary dispatch = closed
 ```
+
+这里仍保持三轴正交：若进入 QUARANTINED 的根因是 task-wide user cancellation，而不是 dirty business failure，则 TaskLogicalStatus 可以是 `CANCELLED`；WorkspaceDisposition 仍为 `QUARANTINED`。
 
 并禁止 workspace-touching finalization。
 
@@ -3324,7 +3356,7 @@ class TaskResult(BaseModel):
 status == SUCCEEDED
 → root_failure_refs empty
 → patch_disposition in {NONE, ACCEPTED}
-→ workspace_disposition != QUARANTINED
+→ workspace_disposition in {STABLE, STABLE_WITH_UNCERTAINTY}
 
 status == FAILED
 AND repository_disposition == PATCH_PRESENT
