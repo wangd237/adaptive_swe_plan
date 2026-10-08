@@ -356,6 +356,8 @@
 | POC-R124 | same WorkspaceRevision R，Writer H1 已 revoke 但 repair 尚未修改 workspace | revision check alone would pass；acceptance_epoch/handoff stamp 必须阻止旧 consumer commit |
 | POC-R125 | Writer logical success publication 与 downstream READY recompute 并发 | accepted_attempt/handoff + acceptance_epoch increment + READY recompute 在同一 SchedulerStateMutex transaction |
 | POC-R126 | READY Node claim 与 Writer reopen 并发 | READY check + dependency stamps capture + single ticket claim 原子化；ticket 不混合两代 authority |
+| POC-R127 | task-wide cancellation 时 Git-visible patch 已存在 | Task=CANCELLED；PatchDisposition=RESIDUAL_UNACCEPTED，不得 ACCEPTED |
+| POC-R128 | task-wide cancellation 后无法证明 active execution quiescence | Task=CANCELLED；WorkspaceDisposition=QUARANTINED；不读取 final workspace |
 
 ## P0-Final：Design Freeze Static Conformance
 
