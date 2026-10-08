@@ -1,6 +1,6 @@
 # Evidence / Trace / Evaluation Specification
 
-> Authoritative implementation specification. 内容由原实施方案第 13–14 章零语义迁移。
+> Authoritative implementation specification. 已经 P0 consistency sweep / Design Freeze 收口；Trace/Evaluation/ContractVerdict 语义以本文为准。
 
 ## 13. Execution Trace / Observability
 
