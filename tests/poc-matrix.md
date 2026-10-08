@@ -338,4 +338,6 @@
 | POC-R122 | source Verification failure 触发合法 reopen | source Verification→REMEDIATION_PENDING；repair success 后同 Node 用 REVERIFY fresh attempt |
 | POC-R123 | running consumer 被 fail-close cancel 且留下 mutation | consumer 不是业务 root failure，但 mutation evidence 影响最终 Workspace/Repository disposition |
 | POC-R124 | same WorkspaceRevision R，Writer H1 已 revoke 但 repair 尚未修改 workspace | revision check alone would pass；acceptance_epoch/handoff stamp 必须阻止旧 consumer commit |
+| POC-R125 | Writer logical success publication 与 downstream READY recompute 并发 | accepted_attempt/handoff + acceptance_epoch increment + READY recompute 在同一 SchedulerStateMutex transaction |
+| POC-R126 | READY Node claim 与 Writer reopen 并发 | READY check + dependency stamps capture + single ticket claim 原子化；ticket 不混合两代 authority |
 
