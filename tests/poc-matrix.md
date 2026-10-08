@@ -116,7 +116,7 @@
 | POC-62 | DeerFlow RunEventStore backend=memory | A-SWE EvidenceStore durability 不随其消失 |
 | POC-63 | Evidence 写入在 rename 前 crash | final path 不出现半写 JSON；orphan temp 可清理 |
 | POC-64 | Evidence 文件被篡改/损坏 | get() full SHA-256 mismatch → typed integrity failure |
-| POC-65 | EvidenceCreated trace event | event 只携带 EvidenceRef metadata，不复制大 payload |
+| POC-65 | EvidenceCreated trace event | event 携带 scope-aware EvidenceRef/TaskEvidenceRef metadata，不复制大 payload |
 | POC-66 | A-SWE execution run_id | 符合 DeerFlow JsonlRunEventStore safe-id regex；无冒号/路径字符；并可创建 thread workspace |
 | POC-70 | raw external user id 含 unsafe chars | 不直接作为 DeerFlow filesystem user_id |
 | POC-71 | receipt tool_call_id 为空 | ReceiptRef 仍通过 ledger EvidenceRef + ledger_index 稳定解析 |
