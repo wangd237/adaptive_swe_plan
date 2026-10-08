@@ -304,4 +304,19 @@
 | POC-R88 | same Provider 执行两个 IMPLEMENTATION logical nodes | 仍是两个 candidates；Provider identity 不合并 ownership |
 | POC-R89 | singleton Writer accepted 后，另一个 business Writer 改 Git-visible state，再运行 verifier | SCOPE_INVALIDATED；不沿用旧 singleton attribution |
 | POC-R90 | UNIQUE_WRITER attribution 后 Scheduler reopen | Writer reopen + old handoff revoke 先于 READY recomputation，无旧 handoff 解锁窗口 |
+| POC-R91 | WRITE execution terminal fail + mutation observed + quiescence proven | Task=FAILED；Workspace=FROZEN，不误标 QUARANTINED |
+| POC-R92 | WRITE failure mutation UNKNOWN + no legal remediation | task-wide fail closed；剩余 ordinary nodes 不再 dispatch |
+| POC-R93 | dirty root failure 时另有 unrelated READY branch | unrelated branch → BLOCKED + TASK_FAIL_CLOSED，不允许继续污染共享状态 |
+| POC-R94 | dirty failure 后 planned Reviewer 尚未运行 | Reviewer 不 dispatch；不会为了“诊断”重新打开 Agent execution |
+| POC-R95 | FROZEN dirty workspace finalization | 只允许 Runtime-owned repository digest / changeset / evidence aggregation |
+| POC-R96 | dirty failed task + Git-visible patch present | TaskResult FAILED + PATCH_PRESENT + RESIDUAL_UNACCEPTED |
+| POC-R97 | dirty failed task + only ignored/cache/environment mutation | Workspace=MUTATED_OR_UNKNOWN；Repository=BASELINE_CLEAN；Patch=NONE |
+| POC-R98 | quiescence proof missing after mutating failure | Workspace=QUARANTINED；禁止 workspace-touching finalizer |
+| POC-R99 | QUARANTINED 但已有 pre-quarantine RepositoryChangeSet evidence | TaskResult 可引用旧 trusted artifact，但不得声明为重新观察的 current snapshot |
+| POC-R100 | Review REQUEST_CHANGES after valid Writer patch | Task FAILED；patch 保留为 RESIDUAL_UNACCEPTED，不伪装 accepted |
+| POC-R101 | AcceptanceFailure + mutation + legal deterministic Repair | Node=REMEDIATION_PENDING；不提前 task-wide fail closed |
+| POC-R102 | Repair budget exhausted while repository patch remains | Task=FAILED；Workspace→FROZEN；residual patch reported |
+| POC-R103 | terminal dirty fail-close state transaction | failing node FAILED + task FAILED + dispatch closed + remaining nodes BLOCKED 原子化 |
+| POC-R104 | Task FAILED + 10 blocked descendants | root_failure_refs 只报告真实 root；blocked nodes 作为 propagation consequences |
+| POC-R105 | terminal TaskResult repository_changeset | 只保存 EvidenceRef，不复制完整 patch bytes |
 
