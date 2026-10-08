@@ -3236,6 +3236,7 @@ Writer attempt 2 is repairing the same workspace
 single target WRITE Node uniquely identified
 AND repair budget remains
 AND target's mutation authority permits repair
+AND no affected ordinary downstream dispatch is COMMITTED / RUNNING
 AND no ordinary non-verification descendant has already committed
     a logical success that depends on the target's currently accepted Handoff
 AND no later business WRITE has made target repair ownership ambiguous
@@ -3498,6 +3499,17 @@ AcceptanceFailure + mutation
 ```
 
 只有 remediation 不成立 / 已耗尽 / scope invalidated 后，才进入 terminal fail-closed。
+
+特别地，`REPAIR_SCOPE_INVALIDATED(reason=ACTIVE_DOWNSTREAM_DISPATCH)` 即使尚未发生新的 dirty mutation，也必须先：
+
+```text
+close Task dispatch gate
+→ cancel/join affected committed executions
+→ wait for quiescence classification
+→ then freeze/finalize Task
+```
+
+它复用 task-wide terminal drain path，但不能在仍有 active consumer 时提前把 Workspace 标成 `FROZEN`。
 
 ##### Task / Workspace / Repository / Patch 四轴状态
 
@@ -4267,32 +4279,48 @@ test failed before patch
 
 ##### Atomic Reopen Boundary
 
-`UNIQUE_WRITER` 产生后：
+`UNIQUE_WRITER` 只代表 attribution 成功，不代表 Writer 一定可以立即 reopen。
+
+实际 reopen 必须进入前文 **Writer Reopen vs Downstream Dispatch Race** gate，并与 consumer 的 final dispatch commit 在同一个 `SchedulerStateMutex` 上线性化：
 
 ```text
-persist RepairAttributionEvidence
+RepairAttributionEvidence
         ↓
-build RepairFeedback
+SchedulerStateMutex
         ↓
-Scheduler state transaction
-    W: SUCCEEDED → REMEDIATION_PENDING
-    revoke ordinary dependency authority of old accepted_handoff
-    attach pending repair attribution
+inspect affected descendants / dispatch tickets
         ↓
-only then recompute READY set
+┌──────────────────────────────────────────────┐
+│ any affected COMMITTED/RUNNING or committed │
+│ ordinary downstream success?                │
+└───────────────┬──────────────────────────────┘
+            yes │                      no
+                ▼                       ▼
+REPAIR_SCOPE_INVALIDATED      revoke pre-commit tickets
+close task dispatch gate      revoke Writer authority
+cancel/join active runs       acceptance_epoch += 1
+Task FAILED                   Writer → REMEDIATION_PENDING
 ```
 
-这三件事必须属于一个 Scheduler logical state transition。
-
-禁止：
+因此禁止两类窗口：
 
 ```text
 create RepairFeedback
-→ recompute downstream READY
-→ later reopen Writer
+→ recompute READY
+→ later revoke Writer
 ```
 
-否则旧 `accepted_handoff` 可能在窗口期继续解锁 consumer。
+以及：
+
+```text
+consumer post-lock validation succeeds
+→ Writer reopens
+→ consumer enters backend
+```
+
+最终 authority boundary 是：
+
+> **Writer reopen and downstream dispatch commit are mutually exclusive Scheduler state transactions.**
 
 真正 REPAIR dispatch 时，仍然执行已经冻结的：
 
@@ -4304,17 +4332,20 @@ current revision under WRITE lock
 
 freshness gate。
 
-所以职责分离为：
+职责最终分离为：
 
 ```text
 VerificationRepairBinding
 → compile-time ownership scope
 
 RepairAttributionResolver
-→ post-verification unique-owner decision
+→ unique logical repair owner
+
+Scheduler reopen race gate
+→ whether old downstream consumption has crossed commit boundary
 
 RepairFeedback freshness check
-→ pre-repair current-state validity
+→ whether failure evidence still applies to current workspace state
 ```
 
 ##### Explicit Non-Attribution Rules
