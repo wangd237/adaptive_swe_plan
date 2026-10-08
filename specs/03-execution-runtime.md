@@ -101,6 +101,33 @@ class WorkspaceSession(BaseModel):
     status: WorkspaceSessionStatus
 ```
 
+#### Runtime Identity Safety
+
+任何进入 Runtime filesystem / backend registry key 的 identity 都必须由 Runtime/server ownership 保证安全。
+
+P1 safe-id 子集：
+
+```regex
+^[A-Za-z0-9_-]+$
+```
+
+规则：
+
+- `task_id`：server-generated opaque id，推荐 `aswe-task-${uuid4().hex}`；
+- `thread_id`：server-generated / trusted-mapped opaque safe id；
+- `run_id`：execution-scoped `aswe-${uuid4().hex}`；
+- `evidence_id` / `finalization_id` / `preparation_id`：Store/Runtime generated safe ids；
+- `node_id` 可以保留 planner semantic id，但不得直接拼入 filesystem path；
+- raw external user/account id 不直接作为 DeerFlow filesystem `user_id`；必须经过 trusted identity mapping / opaque safe-id projection。
+
+因此 LocalEvidenceStore 的：
+
+```text
+tasks/<task_id>/...
+```
+
+只接受已经通过 Runtime identity contract 的 `task_id`，不在 storage layer 对任意用户字符串做 path join。
+
 关键约束：
 
 `FROZEN` 与 `QUARANTINED` 必须严格区分：
