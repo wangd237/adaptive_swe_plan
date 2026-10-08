@@ -1839,6 +1839,7 @@ class BackendFailureClass(str, Enum):
 class NodeExecutionResult(BaseModel):
     execution_id: str
     node_id: str
+    attempt: int
 
     # Backend terminal result, not logical Node status.
     terminal_status: BackendTerminalStatus
@@ -1873,6 +1874,65 @@ class NodeExecutionResult(BaseModel):
     # Adapter-mapped execution lifecycle metadata.
     outer_timeout_fired: bool
     lifecycle_warnings: tuple[str, ...]
+```
+
+### 3.5.1 NodeAcceptanceResult
+
+`ExecutionBackend.check_acceptance()` 返回 provider-neutral typed result，并作为 attempt-scoped `EvidenceRef(kind="acceptance_verdict")` 的 payload authority。
+
+```python
+class AcceptanceCriterionStatus(str, Enum):
+    HOLDS = "holds"
+    DOES_NOT_HOLD = "does_not_hold"
+    UNVERIFIED = "unverified"
+
+class AcceptanceCriterionResult(BaseModel):
+    criterion: str
+    status: AcceptanceCriterionStatus
+
+    # Bounded deterministic diagnostics from the checker.
+    diagnostics: tuple[str, ...] = ()
+
+class NodeAcceptanceResult(BaseModel):
+    node_id: str
+    execution_id: str
+    attempt: int
+
+    observed_workspace_revision: WorkspaceRevision
+
+    criteria: tuple[AcceptanceCriterionResult, ...]
+
+    all_required_hold: bool
+    has_unverified: bool
+
+    checker: str = "deerflow_acceptance_checks"
+    fingerprint: str
+```
+
+冻结规则：
+
+```text
+all_required_hold == true
+↔ every load-bearing criterion status == HOLDS
+
+any DOES_NOT_HOLD
+→ AcceptanceFailure candidate
+
+any UNVERIFIED
+→ cannot promote to logical success when that criterion is load-bearing
+```
+
+`UNVERIFIED` 与 `DOES_NOT_HOLD` 不得合并：前者表示证据不足/检查器不能确定，后者表示确定性 obligation 未满足。
+
+Adapter 顺序：
+
+```text
+NodeExecutionResult
+→ check_acceptance()
+→ NodeAcceptanceResult
+→ ExecutionEvidenceStore.put_attempt(kind="acceptance_verdict")
+→ EvidenceRef
+→ logical acceptance/completeness gate
 ```
 
 #### Terminal Status 与 Cap 必须正交
@@ -3744,6 +3804,7 @@ P1 明确禁止在 task-wide fail closed 后继续执行：
 ```text
 final RepositoryStateDigest resolve/materialization
 final RepositoryChangeSet / residual patch materialization
+final ContractVerdict evaluation
 final WorkspaceRevision reference
 root failure aggregation
 blocked-node aggregation
@@ -3855,6 +3916,8 @@ class TaskResult(BaseModel):
 ```text
 status == SUCCEEDED
 → root_failures empty
+→ final_contract_verdict is not None
+→ resolved ContractVerdict.all_required_satisfied == true
 → patch_disposition in {NONE, ACCEPTED}
 → workspace_disposition in {STABLE, STABLE_WITH_UNCERTAINTY}
 
