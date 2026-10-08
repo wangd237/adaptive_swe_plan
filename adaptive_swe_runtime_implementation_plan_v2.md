@@ -1363,7 +1363,11 @@ Core 永远不理解 DeerFlow Future、registry 或 cancel-event 细节。
 
 #### 3.4.4 Quiescence Guarantee Scope
 
-Pinned DeerFlow 对 **sandbox-backed core tools** 已提供 cancellation drain：
+P1 必须精确定义“quiescent”，不能把不同层级混成一句“没有后台任务”。
+
+##### Level 1：Executor-Owned Quiescence
+
+Pinned DeerFlow 对 sandbox-backed core tool 的同步 worker 提供 cancellation drain：
 
 ```text
 async sandbox wrapper
@@ -1375,23 +1379,227 @@ async sandbox wrapper
 → only then propagate cancellation
 ```
 
-Sandbox lease release 也使用同样的 shield/drain 思路，确保 provider acquire/release 或同步 client operation 不会在 execution holder 释放后继续运行。
+Sandbox lease release 同样 shield + drain。
 
-因此 A-SWE P1 对以下 core execution surface：
+配合 3.4.2 的 independent completion signal，A-SWE 可以证明：
 
 ```text
-ls / glob / grep / read_file
-write_file / str_replace
-bash
+DeerFlow execution coroutine exited
+AND executor-owned sandbox/tool worker drained
+AND capacity slot exited
+AND sandbox lease release path finished
 ```
 
-可以复用 DeerFlow 的：
+这定义为：
 
-> **execution coroutine quiescence → sandbox-backed worker quiescence**
+> **executor-owned quiescence**
 
-而不额外实现 thread kill / process kill。
+它是 Workspace lock 正常释放所需的最低 backend fence。
 
-但这个结论不能泛化到所有扩展工具。
+##### Level 2：不是 Container / Arbitrary Process Quiescence
+
+不能进一步声称：
+
+```text
+executor-owned quiescence
+→ every process in sandbox/container is gone
+```
+
+Pinned AIO 明确：
+
+```text
+AioSandboxProvider.release()
+→ healthy sandbox enters warm pool
+→ container keeps running
+```
+
+而 AIO execution-scoped shell：
+
+```text
+release_command_scope(scope_id)
+→ _cleanup_session_best_effort(...)
+```
+
+其 cleanup exception 会被内部吞掉并只记录 warning。
+
+因此现有 DeerFlow API 无法向 A-SWE 提供强证明：
+
+```text
+remote shell session cleanup definitely succeeded
+```
+
+也无法证明 Agent 若主动启动：
+
+```text
+detached process
+daemon
+nohup/background job
+external asynchronous side effect
+```
+
+已经停止。
+
+所以：
+
+> **Executor-owned quiescence is not arbitrary process quiescence.**
+
+##### P1 Managed Bash Contract
+
+为了让 shared mutable Workspace 仍具有可证明的生命周期边界，P1 不允许 A-SWE managed Node 使用任意 LLM-generated free-form shell。
+
+增加 provider-neutral：
+
+```python
+class BashCommandPolicyMode(str, Enum):
+    DENY = "deny"
+    EXACT_ALLOWLIST = "exact_allowlist"
+
+class BashCommandPolicy(BaseModel):
+    mode: BashCommandPolicyMode
+
+    # Canonical Runtime-compiled foreground commands.
+    allowed_commands: tuple[str, ...] = ()
+
+    fingerprint: str
+```
+
+并进入：
+
+```python
+class NodeExecutionPolicy(BaseModel):
+    ...
+    bash_policy: BashCommandPolicy
+    ...
+```
+
+P1 规则：
+
+```text
+Node 不需要 bash
+→ DENY
+
+Node 需要 deterministic test/build/import command
+→ EXACT_ALLOWLIST
+→ only Runtime-compiled commands
+```
+
+Runtime-compiled command 可以来自：
+
+- canonical `tests_passed:<command>` acceptance；
+- RepositoryProfile 已确认的 test/build command；
+- Runtime-owned deterministic evaluation rule；
+- explicit user HARD command requirement。
+
+不能来自：
+
+> “模型觉得这条命令可能有用，所以临时加进 allowlist”。
+
+##### Command Matching
+
+P1 不做通用 shell semantic equivalence。
+
+Guard 对 `bash(command=...)` 使用 canonical string identity：
+
+```text
+normalize only Runtime-owned benign formatting
+→ compare against exact allowed command set
+```
+
+禁止为了方便而：
+
+- shell-eval 后比较；
+- 忽略 control operator；
+- 通过前缀匹配允许额外 suffix；
+- `startsWith("pytest")` 这类宽松规则。
+
+如果 Agent 想把：
+
+```text
+pytest -q
+```
+
+改成：
+
+```text
+pytest -q & ...
+```
+
+必须被拒绝。
+
+##### Detached-Execution Defense in Depth
+
+在 exact allowlist 之外，可以再对已允许命令做 defense-in-depth validation，拒绝已知 daemon/background/detach 形态，例如：
+
+```text
+nohup
+disown
+setsid
+tmux / screen session launch
+system/service manager start
+docker/podman detached mode
+known daemonization flags
+background control operators when parsed as control syntax
+```
+
+但这只是 secondary guard。
+
+不能宣传为：
+
+> “我们写了几个正则，所以任意 shell 都不会 daemonize。”
+
+真正的 P1 guarantee 来自：
+
+> **只运行 Runtime 预先编译并审定的 foreground command identity。**
+
+##### Bash Outside the Contract
+
+如果任务确实要求：
+
+- 启动长期 server；
+- background daemon；
+- detached watcher；
+- arbitrary shell workflow；
+- command 本身会 fork-and-detach；
+
+则 P1：
+
+```text
+UNSUPPORTED_BACKGROUND_EXECUTION
+```
+
+或要求未来更强 Backend contract，例如：
+
+```text
+per-node disposable sandbox/container
++
+explicit process-group kill/drain proof
+```
+
+不得在当前 shared AIO warm-pool contract 下假装安全执行。
+
+##### AIO Best-Effort Cleanup 的解释
+
+当 exact foreground command 已经由 tool handler 返回并且 executor worker 已 drain：
+
+- shell-session cleanup failure 仍应进入 warning / backend diagnostics；
+- 但 P1 不把“cleanup warning 未暴露”当作可以证明 session close 的依据；
+- correctness 依赖“没有被允许启动 detached work”，而不是依赖 best-effort session close；
+- 若未来 DeerFlow 暴露 strict cleanup outcome，Adapter 可进一步提升 quiescence attestation。
+
+当前 completion signal 因此证明的是：
+
+```text
+executor-owned work quiescent
+```
+
+不是：
+
+```text
+container stopped
+remote process universe empty
+```
+
+##### External Tool Boundary
 
 对于：
 
@@ -1402,12 +1610,12 @@ ACP
 custom external-side-effect tool
 ```
 
-若其实现不受 DeerFlow sandbox execution lease / drained worker contract 约束：
+若其实现不受 DeerFlow sandbox drained-worker contract 约束：
 
 - backend execution quiescent 只表示 DeerFlow agent/tool-call coroutine 已结束；
-- 不能证明远端服务没有异步继续处理已经提交的 side effect；
-- 不能证明外部系统可以 rollback；
-- `MutationEvidence.PROVEN_NONE` 不得仅依赖 DeerFlow workspace snapshot。
+- 不能证明远端服务没有继续处理已提交 side effect；
+- 不能证明外部系统 rollback；
+- `MutationEvidence.PROVEN_NONE` 不得仅依赖 Workspace snapshot。
 
 所以 P1：
 
@@ -1417,21 +1625,19 @@ OR unverified custom UNKNOWN tool admitted
 → automatic clean retry disabled by default
 ```
 
-除非该 Tool Contract 明确提供：
+除非 Tool Contract 明确提供：
 
 ```text
 idempotency key
-or
-transaction / rollback contract
-or
-backend-specific quiescence/idempotency proof
+or transaction / rollback contract
+or backend-specific quiescence/idempotency proof
 ```
 
-一期 core SWE Runtime 不以外部 side-effect Tool 作为 hard dependency，因此不需要预先实现通用 distributed side-effect recovery。
+一期 core SWE Runtime 不以这类 Tool 作为 hard dependency。
 
 原则：
 
-> **Workspace quiescence is not distributed side-effect quiescence.**
+> **Workspace quiescence is bounded by the execution contract, not by wishful assumptions about every process or external service.**
 
 ### 3.5 NodeExecutionResult
 
@@ -2975,12 +3181,17 @@ A-SWE ContractGuardrailProvider
 
 > `bash(command=...)` 是自由 shell，不能仅凭简单 path argument policy 证明其无写副作用。
 
-因此 bash-related constraint 仍需：
+因此 bash-related constraint 在 P1 收窄为：
 
 - conservative WRITE scheduling；
-- command allow / exact test command policy（可验证时）；
+- `BashCommandPolicy.DENY | EXACT_ALLOWLIST`；
+- Runtime-compiled foreground command identity；
+- ContractGuardrail 对 bash command 做 exact match；
+- detached/background pattern 仅做 defense-in-depth deny；
 - post-node Git ChangeSet；
 - final contract evaluation。
+
+P1 不开放 arbitrary LLM-generated free-form bash。
 
 ##### Defense in Depth
 
@@ -3019,7 +3230,8 @@ class EnforcementGuarantee(str, Enum):
 |---|---|
 | `write_file` path scope | PREVENTIVE + DETECTIVE |
 | final changed-path scope | DETECTIVE |
-| generic `bash` does not mutate source | DETECTIVE in P1 |
+| arbitrary generic `bash` | unsupported in managed P1 |
+| Runtime-allowlisted foreground `bash` | PREVENTIVE command identity + DETECTIVE post-node invariant |
 | semantic behavior requirement | SEMANTIC |
 | required deterministic test command | PREVENTIVE where command allowlist applies + DETECTIVE via receipt |
 
@@ -8181,6 +8393,8 @@ class NodeExecutionPolicy(BaseModel):
     contract_guard_rules: tuple[str, ...]
     post_node_invariants: tuple[str, ...]
 
+    bash_policy: BashCommandPolicy
+
     # True only when every load-bearing Node acceptance obligation has a
     # deterministic P1 checker.
     deterministic_acceptance_complete: bool
@@ -11289,6 +11503,11 @@ Source Audit In Progress
 - DeerFlow sandbox-backed sync work通过 shield + drain 防止 worker outlive execution holder；
 - A-SWE quiescence join 可以作为 core sandbox tool 的 workspace-lock release fence；
 - external MCP/plugin/custom side effect 不继承该保证，默认不参与 automatic clean retry。
+- AIO healthy release 进入 warm pool，container remains running；
+- AIO scoped shell cleanup 是 best-effort，异常被吞掉，不能作为 strict process-quiescence proof；
+- completion signal 只证明 executor-owned quiescence，不证明任意 detached process / container stop；
+- P1 managed bash 因此只允许 Runtime-compiled EXACT foreground command set；arbitrary free-form bash 禁用；
+- background/daemon/detached workflow 在 P1 视为 unsupported，除非未来提供更强 process-group/container lifecycle proof。
 - Attempt failure 与 Logical Node failure 分离；有合法 remediation 时 Node=REMEDIATION_PENDING；
 - ordinary dependency 只由当前 SUCCEEDED + accepted_attempt/handoff 满足；
 - Writer reopen for Repair 会立即撤销旧 accepted handoff 的 dependency authority；
@@ -11338,7 +11557,7 @@ Final Node logical state
 P0-7 Go/No-Go：
 
 ```text
-POC-R34 / R35 / R36 / R38
+POC-R34 / R35 / R36 / R38 / R50 / R51
 ```
 
 必须通过。
@@ -11404,6 +11623,13 @@ P0-7 新增 PoC：
 | POC-R44 | PRE_START timeout + snapshot truncated | 仍可由 execution-phase proof判 backend PROVEN_NONE |
 | POC-R45 | started_at=None 但出现 admitted tool record | BACKEND_CONTRACT_MISMATCH，fail closed |
 | POC-R46 | user cancel while queued | CANCELLED + PRE_START；workspace safe，但不自动 retry user cancellation |
+| POC-R47 | AIO release_command_scope cleanup 内部失败 | completion 仍可能完成；Runtime 不声称 remote shell cleanup 被严格证明 |
+| POC-R48 | AIO healthy provider.release | container 进入 warm pool且仍运行；quiescence attestation 不写“container stopped” |
+| POC-R49 | Verification exact `pytest -q` | BashCommandPolicy allow；前台命令完成后进入 normal evidence path |
+| POC-R50 | Agent 将允许命令改为 `pytest -q & ...` | exact command mismatch，pre-tool fail closed |
+| POC-R51 | `nohup` / `setsid` / daemon / detached workflow | P1 contract reject / UNSUPPORTED_BACKGROUND_EXECUTION |
+| POC-R52 | implementation Node 无 Runtime-approved bash command | bash denied，即使 Provider generic config 原本暴露 bash |
+| POC-R53 | external MCP submitted async side effect | executor quiescence 不升级为 distributed side-effect quiescence；no auto retry |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
@@ -11530,6 +11756,8 @@ Executable TaskDAG
 - provably READ-only Basic Parallel Execution；
 - WRITE / UNKNOWN-MUTATING Exclusive Execution；
 - ContractGuardrailProvider integration；
+- BashCommandPolicy DENY / EXACT_ALLOWLIST；
+- managed foreground-shell contract；
 - Pre-tool constraint guard；
 - monotonic SubagentConfig narrowing；
 - identity-aware Tool / Model authorization preflight；
@@ -11772,6 +12000,8 @@ Coder            exclusive WRITE
 41. 为什么 DeerFlow `completed + stop_reason` 不能直接映射为 A-SWE Node success？
 42. 为什么 mandatory Review 不能只解析 Reviewer 自由文本，而要用 structured direct-return verdict？
 43. 为什么 Review direct-return verdict 不能复用普通 self-report receipt verifier？
+44. 为什么 executor quiescence 不等于 AIO container/process quiescence？
+45. 为什么 P1 的 bash 使用 exact Runtime allowlist，而不是允许 Agent 自由拼 shell？
 
 ### 21.4 代码掌握边界
 
