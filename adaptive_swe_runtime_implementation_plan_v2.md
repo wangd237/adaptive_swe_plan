@@ -448,6 +448,14 @@ git add -A
 git diff --cached --binary <base_sha>
 ```
 
+同一次 materialization 还应执行：
+
+```text
+git write-tree
+```
+
+生成 `working_tree_oid`，使 Final Patch 与 RepositoryStateDigest 来自同一 canonical Git view，而不是两套独立扫描逻辑。
+
 Baseline Workspace Snapshot 必须在 clone / checkout 完成之后采集，否则整个 Repository 会被误判为 task-created files。
 
 Task-level baseline / Git ChangeSet 用于最终 Repository patch。
@@ -530,9 +538,13 @@ class NodeWorkspaceDelta(BaseModel):
     before_revision_generation: int
     after_revision_generation: int
 
+    # DeerFlow scanner-visible filesystem attribution.
     changed_paths: tuple[str, ...]
-    # Complete only within DeerFlow scanner-visible roots/scope.
     changed_paths_complete: bool
+
+    # Git-visible per-attempt business patch attribution.
+    repository_changed_paths: tuple[str, ...]
+    repository_changed_paths_complete: bool
 
     has_observed_changes: bool
     attribution_truncated: bool
@@ -784,22 +796,65 @@ class RepositoryStateDigest(BaseModel):
     base_sha: str
     head_sha: str
 
-    tracked_state_hash: str
-    untracked_nonignored_hash: str
+    base_tree_oid: str
+    working_tree_oid: str
 
-    changed_paths: tuple[str, ...]
+    head_matches_baseline: bool
+    dirty_vs_base: bool
 
     fingerprint: str
 ```
 
 Digest 表达当前 **Git-visible Repository working state**，不复制完整 patch。
 
-构建至少覆盖：
+P1 不自行发明目录哈希，直接复用 Git object model。
 
-- `HEAD`；
-- tracked working-tree/index relevant state；
-- non-ignored untracked paths/content identity；
-- canonical path ordering。
+Runtime 在 Repository root 创建**真实 index 之外**的 temporary index：
+
+```text
+temp_index outside repository .git
+        ↓
+GIT_INDEX_FILE=<temp_index>
+git read-tree <resolved_base_sha>
+        ↓
+GIT_INDEX_FILE=<temp_index>
+git add -A -- .
+        ↓
+GIT_INDEX_FILE=<temp_index>
+git write-tree
+        ↓
+working_tree_oid
+```
+
+同时：
+
+```text
+base_tree_oid = git rev-parse <resolved_base_sha>^{tree}
+head_sha      = git rev-parse HEAD
+```
+
+因此：
+
+```text
+working_tree_oid == base_tree_oid
+→ Git-visible working state clean relative to baseline
+
+working_tree_oid != base_tree_oid
+→ Git-visible business patch differs from baseline
+```
+
+这个 tree identity 原生覆盖：
+
+- tracked file content changes；
+- tracked deletion；
+- non-ignored untracked file；
+- file mode；
+- symlink/tree structure；
+- canonical Git path/tree ordering。
+
+ignored cache/build artifact 不进入 tree，符合“business patch state”语义。
+
+真实 Repository index 不参与 authority，也不被修改。
 
 它与 WorkspaceRevision 不同：
 
@@ -812,6 +867,35 @@ RepositoryStateDigest
 → Git-visible business patch state
 → 用于 semantic repository-mutation authority
 ```
+
+#### Per-Attempt Repository Attribution
+
+pre/post attempt 都 capture `RepositoryStateDigest` 后，可直接：
+
+```text
+git diff --name-status <pre.working_tree_oid> <post.working_tree_oid>
+```
+
+得到**当前 attempt 的 Git-visible path delta**。
+
+这优于：
+
+```text
+git diff <base_sha>
+```
+
+因为后者是 cumulative patch，会把更早 Node 的修改重复归给当前 Node。
+
+建议 Node evidence 同时保留：
+
+```python
+repository_changed_paths: tuple[str, ...]
+repository_changed_paths_complete: bool
+```
+
+默认 complete 仅在 Git tree materialization + tree-to-tree diff 全部成功时成立。
+
+Handoff 对代码修改路径优先使用 repository per-attempt delta；DeerFlow WorkspaceChangeSet 继续补充 outputs/cache/filesystem observation。
 
 #### READ_ONLY Semantic Authority Invariant
 
@@ -889,6 +973,56 @@ Discovery agent creates non-ignored source file
 原则：
 
 > **A verifier may physically write; it may not semantically rewrite the patch being verified.**
+
+---
+
+#### P1 Git Feature Boundary
+
+Temporary-index tree identity has one重要边界：Git submodule dirty working state is **not** represented by the parent tree OID when the gitlink commit itself is unchanged.
+
+例如：
+
+```text
+parent gitlink SHA unchanged
+submodule working tree dirty
+→ parent working_tree_oid may remain unchanged
+```
+
+因此 P1 bootstrap 必须显式 detect：
+
+```text
+tracked mode 160000 / .gitmodules
+→ UNSUPPORTED_GIT_SUBMODULES_P1
+```
+
+而不是让 semantic mutation invariant 产生 false clean。
+
+同理，P1 默认拒绝 active sparse checkout：
+
+```text
+core.sparseCheckout / sparse-index active
+→ UNSUPPORTED_SPARSE_CHECKOUT_P1
+```
+
+因为“working tree materialization”不再等价于完整 Repository tree，`git add -A -- .` 的 authority 语义需要额外规则。
+
+P1 支持范围冻结为：
+
+- ordinary non-bare Git worktree；
+- detached baseline HEAD；
+- no submodule working-tree semantics；
+- no sparse checkout；
+- normal files / executable mode / symlink 由 Git tree object 处理。
+
+未来若需要 submodule：
+
+```text
+parent tree oid
++
+recursive submodule HEAD/dirty digest
+```
+
+单独扩展，不在 MVP 隐式支持。
 
 ---
 
@@ -4459,7 +4593,7 @@ NodeWorkspaceDelta 同时记录 pre / post revision，用于回答“本 attempt
 |---|---|
 | `self_report` | model-authored / untrusted |
 | `receipt_refs` | DeerFlow execution-scoped evidence reference |
-| `changed_paths` | per-attempt NodeWorkspaceDelta observed deterministic evidence |
+| `changed_paths` | per-attempt Git Repository delta优先；Workspace delta补充 filesystem evidence |
 | `untracked_paths` | Git-aware Runtime evidence |
 | acceptance verdict | deterministic checker output |
 | verification result | Runtime verifier output |
@@ -11669,6 +11803,9 @@ Source Audit In Progress
 - AIO scoped shell cleanup 是 best-effort，异常被吞掉，不能作为 strict process-quiescence proof；
 - completion signal 只证明 executor-owned quiescence，不证明任意 detached process / container stop；
 - P1 managed bash 因此只允许 Runtime-compiled EXACT foreground command set；arbitrary free-form bash 禁用；
+- Git-visible Repository state 使用 temporary index + `git write-tree` canonical OID，不自行目录哈希；
+- semantic READ_ONLY pre/post invariant 比较 per-attempt working_tree_oid；
+- parent tree OID 不覆盖 dirty submodule working state，因此 P1 bootstrap 显式拒绝 submodule / sparse checkout。
 - background/daemon/detached workflow 在 P1 视为 unsupported，除非未来提供更强 process-group/container lifecycle proof。
 - Attempt failure 与 Logical Node failure 分离；有合法 remediation 时 Node=REMEDIATION_PENDING；
 - ordinary dependency 只由当前 SUCCEEDED + accepted_attempt/handoff 满足；
@@ -11799,6 +11936,12 @@ P0-7 新增 PoC：
 | POC-R55 | WRITE 已拿锁后等待 native capacity | 后续 Workspace Node 不越过锁；记录 backend_capacity_wait_after_workspace_lock |
 | POC-R56 | 多个 A-SWE ready Node | max_inflight_node_executions 不超过 configured backend capacity |
 | POC-R57 | external DeerFlow traffic 占满 capacity | A-SWE correctness 不变；可能 lock hoarding，但无 ABBA deadlock |
+| POC-R58 | tracked modify/delete + nonignored untracked | temp-index working_tree_oid 改变，real index 不变 |
+| POC-R59 | ignored cache only | working_tree_oid 不变，但 WorkspaceRevision 可因 physical evidence变化 |
+| POC-R60 | Node A/B 顺序修改 | tree-to-tree diff 只归属当前 attempt 的 repository_changed_paths |
+| POC-R61 | dirty submodule、gitlink SHA 不变 | bootstrap/feature gate 拒绝，不误判 clean |
+| POC-R62 | sparse checkout active | P1 bootstrap fail with explicit unsupported feature |
+| POC-R63 | semantic READ_ONLY Tester 改 tracked source | pre/post working_tree_oid 不同 → mutation authority violation |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
@@ -11822,6 +11965,8 @@ P0-7 新增 PoC：
 - baseline workspace snapshot；
 - Repository invariant；
 - Repository ChangeSet；
+- temporary-index RepositoryStateDigest / working_tree_oid；
+- Git submodule / sparse-checkout P1 bootstrap rejection；
 - Workspace identity：`task_id → user_id + thread_id`；
 - shared execution capacity；
 - DeerFlow compatibility integration tests。
