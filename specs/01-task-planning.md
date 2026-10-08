@@ -3075,13 +3075,20 @@ A-SWE RuntimeEvent / DeerFlow RunEventStore
 EvidenceCreated
   evidence_id
   kind
-  node_id
-  execution_id
-  attempt
+  scope = attempt | task
+
+  # attempt scope only
+  node_id?
+  execution_id?
+  attempt?
+
+  # task scope only
+  finalization_id?
+
   content_sha256
 ```
 
-但 event 只引用 EvidenceRef，不复制完整 payload。
+但 event 只引用 `EvidenceRef | TaskEvidenceRef` metadata，不复制完整 payload。
 
 同理 `EvidenceConsumed` / `EvidenceMarkedHistorical` 可以进入 Trace；事实 payload 仍以 EvidenceStore 为 authority。
 
@@ -3116,7 +3123,7 @@ open(target, "w")
 `get(ref)` 必须：
 
 - 验证 evidence_id 对应文件存在；
-- 验证 task/node/execution/attempt/kind 元数据；
+- 按 ref scope 验证 provenance metadata：attempt ref 校验 task/node/execution/attempt/kind；task ref 校验 task/finalization/kind；
 - canonical re-hash payload；
 - 与 `EvidenceRef.content_sha256` 比较；
 - 不匹配则返回 typed integrity failure，而不是继续把内容交给 Handoff Renderer。
