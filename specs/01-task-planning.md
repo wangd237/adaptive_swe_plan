@@ -2381,6 +2381,24 @@ class EvidenceRef(BaseModel):
     # Full SHA-256 over A-SWE canonical serialized evidence payload.
     content_sha256: str
 
+class TaskEvidenceRef(BaseModel):
+    evidence_id: str
+
+    kind: Literal[
+        "final_repository_state",
+        "final_repository_changeset",
+        "final_contract_verdict",
+    ]
+
+    task_id: str
+    finalization_id: str
+
+    # Present only when a stable terminal workspace observation exists.
+    workspace_revision_generation: int | None
+    workspace_state_fingerprint: str | None
+
+    content_sha256: str
+
 class ReceiptRef(BaseModel):
     source_execution_id: str
 
@@ -2864,7 +2882,7 @@ P1 新增 provider-neutral：
 
 ```python
 class ExecutionEvidenceStore(Protocol):
-    def put(
+    def put_attempt(
         self,
         *,
         task_id: str,
@@ -2873,10 +2891,25 @@ class ExecutionEvidenceStore(Protocol):
         attempt: int,
         kind: str,
         payload: BaseModel | dict,
+        workspace_revision: WorkspaceRevision | None,
     ) -> EvidenceRef:
         ...
 
-    def get(self, ref: EvidenceRef) -> BaseModel | dict:
+    def put_task(
+        self,
+        *,
+        task_id: str,
+        finalization_id: str,
+        kind: str,
+        payload: BaseModel | dict,
+        workspace_revision: WorkspaceRevision | None,
+    ) -> TaskEvidenceRef:
+        ...
+
+    def get(
+        self,
+        ref: EvidenceRef | TaskEvidenceRef,
+    ) -> BaseModel | dict:
         ...
 ```
 
@@ -2885,13 +2918,15 @@ class ExecutionEvidenceStore(Protocol):
 - evidence object immutable；
 - `evidence_id` 由 Store 生成；
 - `content_sha256` 基于 canonical serialized payload；
-- ref 必须绑定 node / execution / attempt；
+- `put_attempt()` 绑定 node / execution / attempt，返回 attempt-scoped `EvidenceRef`；
+- `put_task()` 绑定 task / finalization，返回 terminal task-scoped `TaskEvidenceRef`；
 - workspace-sensitive evidence 必须同时绑定 observed WorkspaceRevision generation + state fingerprint；
 - get 时验证 ref metadata 与 stored record 一致；
 - retry / repair 不覆盖旧 evidence；
 - 新 attempt 产生新 EvidenceRef；
+- terminal finalization 产生新的 TaskEvidenceRef，不伪造 synthetic node/attempt；
 - Trace UI / Handoff renderer 通过 Store resolve；
-- Handoff 只携带 bounded facts + immutable refs，不复制大 patch / test log。
+- Handoff 只携带 bounded facts + immutable attempt refs，不复制大 patch / test log。
 
 P1 默认实现建议使用 task-runtime 本地文件持久化，而不是只存在 Python dict：
 
