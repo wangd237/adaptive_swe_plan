@@ -3986,6 +3986,12 @@ class NodeAttemptKind(str, Enum):
     REPAIR = "repair"
     REVERIFY = "reverify"
 
+class NodeAttemptStatus(str, Enum):
+    RUNNING = "running"
+    ACCEPTED = "accepted"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
 class NodeAttemptRecord(BaseModel):
     node_id: str
     attempt: int
@@ -3996,7 +4002,10 @@ class NodeAttemptRecord(BaseModel):
     pre_workspace_revision: WorkspaceRevision
     post_workspace_revision: WorkspaceRevision | None
 
-    status: str
+    status: NodeAttemptStatus
+
+    # Stable machine-readable code from §9.8 Failure Taxonomy / compiler failure
+    # vocabulary. Kept extensible across backend compatibility versions.
     failure_kind: str | None
 
     evidence_refs: tuple[EvidenceRef, ...] = ()
@@ -4063,6 +4072,24 @@ accepted_attempt == N
 ```
 
 历史 Handoff 保留在对应 `NodeAttemptRecord.handoff`；Writer reopen 只清除 current `accepted_*` authority，不删除历史 attempt artifact。
+
+Attempt status 语义：
+
+```text
+dispatch commit
+→ RUNNING
+
+logical acceptance gate passes
+→ ACCEPTED
+
+attempt ends without acceptance
+→ FAILED
+
+task/user cancellation owns terminalization
+→ CANCELLED
+```
+
+是否还有 Retry / Repair / Reverify 由 `NodeRuntimeState.logical_status` 决定；所以 `attempt.status == FAILED` 不推出 `Node.logical_status == FAILED`。
 
 因此：
 
