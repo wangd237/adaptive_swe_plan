@@ -166,6 +166,7 @@ class TaskType(str, Enum):
     BUG_FIX = "bug_fix"
     FEATURE = "feature"
     REFACTOR = "refactor"
+    ARCHITECTURE_CHANGE = "architecture_change"
     TEST = "test"
     DOCUMENTATION = "documentation"
     ANALYSIS = "analysis"
