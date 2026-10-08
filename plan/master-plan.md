@@ -1101,6 +1101,7 @@ Executable TaskDAG
 - ExecutionEvidenceStore；
 - ToolReceiptLedgerEvidence / ledger-backed ReceiptRef；
 - attempt-scoped EvidenceRef；
+- task-scoped TaskEvidenceRef for terminal finalization；
 - backend trace correlation；
 - Metrics；
 - 简单 Trace Viewer。
