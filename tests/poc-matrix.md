@@ -318,5 +318,8 @@
 | POC-R102 | Repair budget exhausted while repository patch remains | Task=FAILED；Workspace→FROZEN；residual patch reported |
 | POC-R103 | terminal dirty fail-close state transaction | failing node FAILED + task FAILED + dispatch closed + remaining nodes BLOCKED 原子化 |
 | POC-R104 | Task FAILED + 10 blocked descendants | root_failure_refs 只报告真实 root；blocked nodes 作为 propagation consequences |
-| POC-R105 | terminal TaskResult repository_changeset | 只保存 EvidenceRef，不复制完整 patch bytes |
+| POC-R105 | terminal TaskResult final_repository_changeset | 使用 TaskEvidenceRef 指向 immutable artifact，不复制完整 patch bytes |
+| POC-R106 | FROZEN finalizer 生成 final repository changeset | 使用 task-scoped TaskEvidenceRef；不伪造 synthetic Node attempt |
+| POC-R107 | TaskEvidenceRef 被尝试放入 NodeHandoff | schema/policy reject；task-finalization evidence 不进入 ordinary execution handoff |
+| POC-R108 | QUARANTINED task finalization | 不创建声称 current-final 的 TaskEvidenceRef；仅保留 last_trusted attempt EvidenceRef |
 
