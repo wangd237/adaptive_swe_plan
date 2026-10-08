@@ -362,7 +362,7 @@
 | PoC | 测试内容 | 必须验证 |
 |---|---|---|
 | POC-F01 | active specs schema scan | 每个 authoritative class name 只定义一次；archive 不参与 source-of-truth scan |
-| POC-F02 | TaskNode schema | immutable；无 status / RetryPolicy / RepairPolicy mutable fields |
+| POC-F02 | TaskNode schema | immutable；无 mutable lifecycle / per-node retry-repair policy fields |
 | POC-F03 | Planning output boundary | Capability Resolver / DAG Materializer 只消费 ValidatedWorkPlan，不回读 unvalidated WorkPlanProposal |
 | POC-F04 | Handoff ownership | accepted_handoff 类型为 NodeHandoff；EvidenceRef 只引用其内部 authority artifacts |
 | POC-F05 | TaskDAG fingerprint | VerificationRepairBinding 绑定 structure_fingerprint；final DAG fingerprint 不形成自引用 hash cycle |
