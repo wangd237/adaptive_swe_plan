@@ -2394,19 +2394,25 @@ class WorkspaceRevision(BaseModel):
     repository_state_fingerprint: str
     dirty: bool
 
+class AttemptEvidenceKind(str, Enum):
+    TOOL_RECEIPT_LEDGER = "tool_receipt_ledger"
+    REPOSITORY_CHANGESET = "repository_changeset"
+    WORKSPACE_CHANGESET = "workspace_changeset"
+    REPORT_RECEIPT_VERDICT = "report_receipt_verdict"
+    ACCEPTANCE_VERDICT = "acceptance_verdict"
+    VERIFICATION_RESULT = "verification_result"
+    REPAIR_ATTRIBUTION = "repair_attribution"
+    REVIEW_VERDICT = "review_verdict"
+    REPOSITORY_INVARIANT = "repository_invariant"
+
+class TaskEvidenceKind(str, Enum):
+    FINAL_REPOSITORY_STATE = "final_repository_state"
+    FINAL_REPOSITORY_CHANGESET = "final_repository_changeset"
+    FINAL_CONTRACT_VERDICT = "final_contract_verdict"
+
 class EvidenceRef(BaseModel):
     evidence_id: str
-    kind: Literal[
-        "tool_receipt_ledger",
-        "repository_changeset",
-        "workspace_changeset",
-        "report_receipt_verdict",
-        "acceptance_verdict",
-        "verification_result",
-        "repair_attribution",
-        "review_verdict",
-        "repository_invariant",
-    ]
+    kind: AttemptEvidenceKind
 
     source_node_id: str
     source_execution_id: str
@@ -2423,11 +2429,7 @@ class EvidenceRef(BaseModel):
 class TaskEvidenceRef(BaseModel):
     evidence_id: str
 
-    kind: Literal[
-        "final_repository_state",
-        "final_repository_changeset",
-        "final_contract_verdict",
-    ]
+    kind: TaskEvidenceKind
 
     task_id: str
     finalization_id: str
@@ -2928,7 +2930,7 @@ class ExecutionEvidenceStore(Protocol):
         node_id: str,
         execution_id: str,
         attempt: int,
-        kind: str,
+        kind: AttemptEvidenceKind,
         payload: BaseModel | dict,
         workspace_revision: WorkspaceRevision | None,
     ) -> EvidenceRef:
@@ -2939,7 +2941,7 @@ class ExecutionEvidenceStore(Protocol):
         *,
         task_id: str,
         finalization_id: str,
-        kind: str,
+        kind: TaskEvidenceKind,
         payload: BaseModel | dict,
         workspace_revision: WorkspaceRevision | None,
     ) -> TaskEvidenceRef:
