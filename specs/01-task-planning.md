@@ -946,25 +946,13 @@ CompiledTaskContract 是 immutable runtime artifact。
 
 SemanticPlanner 不只生成 WorkItem，还需要声明 positive obligation coverage。
 
-建议扩展：
+`WorkKind` / `WorkItemProposal` 的 **唯一 authoritative schema** 见 §4.11。本节只定义其中 `coverage_claims` 的 contract semantics：
 
-```python
-class WorkKind(str, Enum):
-    DISCOVERY = "discovery"
-    IMPLEMENTATION = "implementation"
-    VERIFICATION = "verification"
-    REVIEW = "review"
-
-class WorkItemProposal(BaseModel):
-    id: str
-    objective: str
-
-    work_kind: WorkKind
-    capability_hints: list[str]
-    depends_on: list[str]
-
-    coverage_claims: list[str] = []
-    acceptance_intent: list[str] = []
+```text
+WorkItemProposal.coverage_claims
+→ references CompiledConstraint.id
+→ planner-declared structural coverage only
+→ never satisfaction evidence
 ```
 
 其中 `coverage_claims` 引用 `CompiledConstraint.id`，表示 Planner 声明“该 WorkItem 计划覆盖此 obligation”，不是完成证明。
@@ -1502,6 +1490,12 @@ workspace_access = WRITE
 因此 NodeBoundaryPolicy 的目标不是“尽量多拆”，而是：
 
 > **在 specialization / parallelism / verification benefit 与 handoff / duplicate discovery / coordination cost 之间选择最小合理 work package。**
+
+P1 冻结：
+
+> **NodeBoundaryPolicy 是 deterministic compiler ruleset / module，不是单独持久化的 schema artifact。**
+
+它由 `SemanticPlanValidator / PlanNormalizer` 执行；若未来需要可配置 policy object，再以独立版本化 schema 引入。当前实现不要创建一个与规则正文重复的 `NodeBoundaryPolicy(BaseModel)`。
 
 #### Provider-Neutral Boundary Invariant
 
@@ -2098,6 +2092,60 @@ cross-node handoff overhead
 
 一期先记录 Trace Warning；只有语义单调、安全的 normalization 才自动应用。
 
+#### ValidatedWorkPlan Authoritative Schema
+
+`ValidatedWorkPlan` 是 Planning Pipeline 对 Capability / Provider / DAG 阶段的唯一输入 contract；下游不得重新读取未经验证的 `WorkPlanProposal` 来补字段。
+
+```python
+class PlanRepair(BaseModel):
+    code: str
+    affected_work_item_ids: tuple[str, ...] = ()
+    details: dict[str, object]
+
+class PlanWarning(BaseModel):
+    code: str
+    affected_work_item_ids: tuple[str, ...] = ()
+    details: dict[str, object]
+
+class ValidatedWorkItem(BaseModel):
+    id: str
+    objective: str
+
+    work_kind: WorkKind
+    capability_hints: tuple[str, ...]
+    depends_on: tuple[str, ...]
+
+    coverage_claims: tuple[str, ...] = ()
+    acceptance_intent: tuple[str, ...] = ()
+
+    # Stable order from the validated proposal; runtime-owned gates are assigned
+    # deterministic ordinals after planner items.
+    planner_ordinal: int
+
+    runtime_owned: bool = False
+
+class ValidatedWorkPlan(BaseModel):
+    items: tuple[ValidatedWorkItem, ...]
+
+    task_contract_fingerprint: str
+
+    repairs: tuple[PlanRepair, ...] = ()
+    warnings: tuple[PlanWarning, ...] = ()
+
+    planner_rationale: str
+    fingerprint: str
+```
+
+冻结规则：
+
+- `WorkPlanProposal` 是 untrusted planner proposal；
+- `ValidatedWorkPlan` 是 deterministic validator/normalizer 输出；
+- runtime-injected `__aswe_verify / __aswe_review` 必须进入 `items` 且 `runtime_owned=true`；
+- dependency dedupe、mandatory gate injection 等单调修复写入 `repairs`；
+- warning 不改变语义；
+- Capability Resolver、Team Builder、DAG Materializer 只消费 `ValidatedWorkPlan`；
+- `fingerprint` 覆盖 canonical items + task contract fingerprint + repair log。
+
 ### 4.15 Acceptance Compilation
 
 Planner 的 `acceptance_intent` 是语义意图，不直接成为 DeerFlow canonical acceptance criteria。
@@ -2387,6 +2435,13 @@ class NodeHandoff(BaseModel):
 
     fingerprint: str
 ```
+
+P1 类型边界：
+
+- `NodeHandoff` 本身是 bounded runtime contract，**不是** `EvidenceRef`；
+- 大型/权威执行证据仍通过 `HandoffEvidence -> EvidenceRef` 引用；
+- accepted / historical Handoff 由 Node attempt/runtime state 保存，不伪造成 `EvidenceRef(kind="node_handoff")`；
+- `NodeHandoff.fingerprint` 用于 dependency authority stamp 与一致性校验。
 
 #### 4.17.2 Workspace Revision
 
@@ -2730,22 +2785,7 @@ ExecutionEvidenceStore
   - `output_bytes`；
   - `created_at`。
 
-单条 durable receipt reference 使用：
-
-```python
-class ReceiptRef(BaseModel):
-    source_execution_id: str
-
-    ledger_evidence: EvidenceRef
-    ledger_index: int
-
-    display_receipt_id: str | None
-    tool_call_id: str | None
-    tool_name: str
-
-    args_freshness_stamp: str | None
-    output_freshness_stamp: str | None
-```
+单条 durable receipt reference 统一使用 §4.17.1 已定义的 authoritative `ReceiptRef` schema，不在这里重复声明。
 
 authoritative locator 是：
 
