@@ -144,27 +144,52 @@ DAGCreated
 NodeReady
 NodeDispatchTicketIssued
 NodeDispatchTicketRevoked
-NodeDispatchCommitted
-NodeScheduled
 
 WorkspaceAccessGranted
 WorkspaceAccessBlocked
-WorkspaceAccessReleased
 
+NodeDispatchCommitted
 NodeStarted
 NodeCompleted
 NodeFailed
 NodeRetried
+NodeRemediationPending
 NodeCancelled
 
-AcceptanceChecked
+WorkspaceAccessReleased
 
+RepairAttributionResolved
+WriterReopened
+TaskDispatchGateClosed
+
+AcceptanceChecked
+EvidenceCreated
+
+WorkspaceFrozen
+WorkspaceQuarantined
+
+TaskFinalizationStarted
 EvaluationStarted
 EvaluationCompleted
+TaskFinalizationCompleted
 
 TaskCompleted
 TaskFailed
+TaskCancelled
+WorkspaceClosed
 ```
+
+事件线性化语义：
+
+- `NodeDispatchTicketIssued`：READY claim + dependency stamp capture 已在 SchedulerStateMutex 下完成；
+- `NodeDispatchCommitted`：A-SWE attempt identity 已分配，Node logical status 已进入 RUNNING；
+- `NodeStarted`：backend execution phase 真正进入 STARTED；它可以晚于 dispatch commit；
+- pre-commit revoke 只产生 `NodeDispatchTicketRevoked`，不产生 NodeStarted / NodeFailed；
+- `WorkspaceFrozen` 只在所有 committed execution quiescent 后发布；
+- `WorkspaceQuarantined` 表示 quiescence 无法证明，不能与 Frozen 同义；
+- `EvidenceCreated` payload 使用 attempt/task scope-aware provenance。
+
+旧的模糊 `NodeScheduled` 不再作为 P1 minimum event；claim 与 commit 必须分别记录。
 
 低层 `ToolCalled / ToolReturned / LLMStarted` 不强制重新转写成 A-SWE Event；需要时通过 `backend_trace_id` 下钻到底层 Trace。
 
