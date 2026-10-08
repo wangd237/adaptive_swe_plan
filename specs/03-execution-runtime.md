@@ -1,6 +1,6 @@
 # Execution Runtime Specification
 
-> Authoritative implementation specification. Workspace、Backend、TaskDAG、Scheduler、Retry/Repair/Reverify 等内容由原实施方案第 3、9 章零语义迁移。
+> Authoritative implementation specification. 已经 P0 consistency sweep / Design Freeze 收口；Workspace、TaskDAG、Scheduler、Retry/Repair/Reverify 与 TaskResult 以本文为准。
 
 ## 3. 总体系统架构
 
