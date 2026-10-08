@@ -1,12 +1,53 @@
 # DeerFlow Source Audit / Phase 0 Architecture Freeze
 
-> 本文件由原单体实施方案的 Phase 0 原样迁移而来。设计语义不变；PoC 表仅移动到 `tests/poc-matrix.md`，避免双重维护。
+> 本文件由原单体实施方案的 Phase 0 迁移并持续审计。PoC authority 位于 `tests/poc-matrix.md`，避免双重维护。
+
+## P0 Design Freeze Status
+
+```text
+Architecture / Execution Semantics: DESIGN FROZEN
+PoC Execution: PENDING
+Real DeerFlow Shared-Workspace Integration: GO/NO-GO GATED
+```
+
+这里的 `DESIGN FROZEN` 只表示：
+
+- authoritative schemas / ownership 已收口；
+- P1 execution semantics 已无已知未决大项；
+- Core/FakeBackend 实现可以开始。
+
+它**不表示** DeerFlow integration PoC 已通过。
+
+在允许真实 DeerFlow backend 承担 P1 shared mutable Workspace 主链路前，至少必须通过既有关键 integration gates：
+
+```text
+POC-02 / POC-03 / POC-05 / POC-09
+POC-R34 / R35 / R36 / R38
+POC-R50 / R51
+POC-R69 / R70 / R73
+```
+
+此外，Writer reopen / dispatch linearization 的：
+
+```text
+POC-R109 ~ POC-R126
+```
+
+必须先在 deterministic FakeBackend/Scheduler tests 中通过，再接入真实 backend。
+
 
 ### Phase 0：Integration Validation / Architecture Freeze
 
 正式实现 Phase 1 前，先验证 A-SWE 对 DeerFlow 的关键假设。
 
 #### P0-1：DeerFlow Integration PoC
+
+状态：
+
+```text
+Design Frozen
+PoC Execution Pending
+```
 
 冻结审计基线：
 
@@ -34,8 +75,8 @@ POC-09
 状态：
 
 ```text
-Architecture Audited
-Implementation PoC Pending
+Design Frozen
+PoC Execution Pending
 ```
 
 审计后冻结链路：
@@ -91,8 +132,8 @@ P0-2 的目标不是让 Agent 学会 Git，而是让 Runtime 掌握 Repository e
 状态：
 
 ```text
-Architecture Audited
-Plan Compiler Rules Audit In Progress
+Design Frozen
+PoC Execution Pending
 ```
 
 当前冻结结论：
@@ -157,8 +198,8 @@ Canonical Plan Fingerprint
 状态：
 
 ```text
-Architecture Audited
-Implementation PoC Pending
+Design Frozen
+PoC Execution Pending
 ```
 
 目标：
@@ -196,8 +237,8 @@ Implementation PoC Pending
 状态：
 
 ```text
-Architecture Audited
-Implementation PoC Pending
+Design Frozen
+PoC Execution Pending
 ```
 
 冻结结论：
@@ -258,8 +299,8 @@ Implementation PoC Pending
 状态：
 
 ```text
-Architecture Audited
-Integration PoC Pending
+Design Frozen
+PoC Execution Pending
 ```
 
 当前冻结结论：
@@ -342,7 +383,8 @@ Integration PoC Pending
 状态：
 
 ```text
-Source Audit In Progress
+Design Frozen
+PoC Execution Pending
 ```
 
 已确认的第一条边界：
@@ -381,7 +423,7 @@ Source Audit In Progress
 - 每个 failed deterministic check 都必须有 compiler-owned VerificationRepairBinding；所有 failed check 必须解析到同一个 singleton logical Writer 才允许 automatic repair；
 - downstream repair target 使用该 Writer 当前 accepted_attempt；旧 retry/repair attempt 不作为 current owner；
 - distinct intervening business Writer 若在 target acceptance 后改变 Git-visible Repository state，则 attribution scope invalidated；
-- RepairAttributionEvidence 持久化并进入 RepairFeedback；Writer reopen + old accepted_handoff revocation + READY recomputation 必须是一个 Scheduler logical state transition。
+- RepairAttributionEvidence 持久化并进入 RepairFeedback；Writer reopen 必须先经过 downstream dispatch-race gate，并与 consumer dispatch commit 在 SchedulerStateMutex 上线性化。
 - direct SubagentExecutor terminal vocabulary 固定为 completed/failed/cancelled/timed_out；polling_timed_out 不进入 Adapter backend status；
 - `stop_reason` 与 terminal status 正交；FAILED 也可能是 capped execution；
 - capacity `admission_failure` 只映射 backend admission，不与 policy/preflight/model auth failure 混用；
@@ -474,6 +516,32 @@ Direct SubagentExecutor backend
 不能用“terminal status + sleep 一下”替代。
 
 ---
+
+#### P0-7 Design Freeze Conclusion
+
+P0-7 的 execution semantics 已冻结：
+
+```text
+terminal outcome
+→ mutation classification
+→ retry/repair eligibility
+→ handoff authority / dispatch race
+→ failure propagation
+→ task finalization
+```
+
+后续若 PoC 暴露 pinned DeerFlow implementation 与这些 contract 不兼容，优先动作是：
+
+1. 修 DeerFlow compatibility Adapter/seam；
+2. 若 contract 本身不可实现，再显式 reopen Design Freeze；
+3. 禁止在实现代码里偷偷弱化 quiescence、evidence 或 fail-closed semantics。
+
+状态保持：
+
+```text
+Design Frozen
+PoC Execution Pending
+```
 
 #### P0-7.1 Deterministic Verification Sandbox Profile
 
