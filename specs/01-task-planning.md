@@ -1,6 +1,6 @@
 # Task Understanding & Planning Specification
 
-> Authoritative implementation specification. 内容由原实施方案第 4 章零语义迁移。
+> Authoritative implementation specification. 已经 P0 consistency sweep / Design Freeze 收口；archive 仅保留历史，不再作为语义对照源。
 
 ## 4. Task Understanding 与 Planning Pipeline
 
