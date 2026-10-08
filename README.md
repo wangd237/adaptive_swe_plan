@@ -4,6 +4,7 @@
 
 ## Documentation Map
 
+- [AGENTS.md](AGENTS.md) — Coding 阶段的 AI implementation constitution；定义 source of truth、禁止事项、Design Freeze 规则、Coding Order 和 Spec→Code→Test 约束。
 - [Master Plan](plan/master-plan.md) — 项目定位、总体流程、工程边界、实施阶段与包装重点。
 - [Task Understanding & Planning Spec](specs/01-task-planning.md) — TaskSpec、TaskContract、ValidatedWorkPlan、Acceptance Compiler，以及 shared EvidenceRef / NodeHandoff / EvidenceStore contracts。
 - [Capability / Provider / Team Spec](specs/02-capability-provider-dag.md) — WorkspaceAccess、Capability、Provider、Team、BackendInventory / Preparation、Agent/Skill/MCP contracts。
@@ -28,6 +29,12 @@ Rules:
 3. `archive/` 永远不是 implementation authority；
 4. 若 ownership 必须迁移，需在一次变更中同步引用、PoC 与 README map；
 5. Design Freeze 后新增 core schema 需要说明为什么现有 owner 无法表达该 contract。
+
+## Coding Repository Note
+
+当前仓库是设计/审计 authority。创建正式 `adaptive-swe-runtime` coding repository 时，应将根目录 `AGENTS.md` 一并复制到新仓库根目录，并保持其中的 Spec/PoC 引用可访问或同步迁移。
+
+若 Coding repo 与 Plan repo 分离，`AGENTS.md` 仍然是编码代理进入任务时必须首先读取的项目级约束文件。
 
 ## Source-of-Truth Rule
 
