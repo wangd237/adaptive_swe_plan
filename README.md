@@ -16,7 +16,7 @@
 
 | Authoritative Spec | Owns |
 |---|---|
-| `specs/01-task-planning.md` | RepositoryProfile / TaskSpec / Constraint & Contract / WorkKind / WorkPlanProposal / ValidatedWorkPlan / VerificationCommand / WorkspaceRevision / EvidenceRef / TaskEvidenceRef / ReceiptRef / NodeHandoff / ExecutionEvidenceStore |
+| `specs/01-task-planning.md` | RepositoryProfile / TaskSpec / Constraint & Contract / WorkKind / WorkPlanProposal / ValidatedWorkPlan / VerificationCommand / WorkspaceRevision / ExecutionCompleteness / EvidenceRef / TaskEvidenceRef / ReceiptRef / NodeHandoff / ExecutionEvidenceStore |
 | `specs/02-capability-provider-dag.md` | WorkspaceAccess / CapabilitySpec / CapabilityBinding / ToolEffect / Provider & Team contracts / BackendInventorySnapshot / NodeExecutionPreparation |
 | `specs/03-execution-runtime.md` | WorkspaceSession / RepositoryStateDigest / NodeExecutionResult / NodeAcceptanceResult / TaskNode / TaskDAG / NodeExecutionPolicy / NodeRuntimeState / dispatch tickets / Repair contracts / TaskResult |
 | `specs/04-evidence-evaluation.md` | ContractLeafVerdict / ContractVerdict / Evaluation & Trace semantics |
