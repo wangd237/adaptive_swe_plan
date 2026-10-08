@@ -9091,6 +9091,163 @@ Verify Backend Execution Quiescent
 Release Workspace Access
 ```
 
+### 9.15.1 Workspace Lock 与 Backend Capacity 的资源顺序
+
+Pinned DeerFlow native capacity 在：
+
+```text
+SubagentExecutor._aexecute()
+      ↓
+async with capacity.slot()
+```
+
+内部获取。
+
+A-SWE Scheduler 则必须先拿 WorkspaceAccess，才能：
+
+- freeze current WorkspaceRevision；
+- resolve handoff staleness；
+- capture pre-attempt evidence；
+- 保证 execution context 与实际共享 Working Tree 一致。
+
+因此 P1 冻结统一资源顺序：
+
+```text
+prepare backend
+      ↓
+(optional capacity-busy hint)
+      ↓
+acquire WorkspaceAccess
+      ↓
+freeze execution context
+      ↓
+enter DeerFlow execution
+      ↓
+DeerFlow capacity.slot()
+```
+
+#### Correctness
+
+所有 A-SWE Node 都只采用：
+
+```text
+Workspace → Backend Capacity
+```
+
+禁止另一条 A-SWE 路径：
+
+```text
+Backend Capacity → wait Workspace
+```
+
+因此 A-SWE 自己不会形成：
+
+```text
+Node A holds Workspace, waits Capacity
+Node B holds Capacity, waits Workspace
+```
+
+这种 ABBA resource deadlock。
+
+外部普通 DeerFlow run 只占 native capacity，不占 A-SWE Workspace lock，也不会形成上述环。
+
+#### Performance Trade-off
+
+但统一顺序有明确代价：
+
+```text
+WRITE Node acquired Workspace
+      ↓
+backend saturated by unrelated work
+      ↓
+Node waits capacity queue
+      ↓
+Workspace remains exclusively locked
+```
+
+这叫：
+
+```text
+workspace lock hoarding while backend queued
+```
+
+它是 P1 的 throughput / latency trade-off，不是 correctness violation。
+
+不能为了优化而在 P1 私自读取/占用 DeerFlow private waiter queue，或构建第二套“假 capacity reservation”。
+
+#### Capacity Snapshot 仅作 Hint
+
+Pinned `SubagentExecutionCapacity.snapshot()` 能返回：
+
+```text
+max_running
+running
+max_queued
+queued
+admission_policy
+```
+
+但 snapshot 是瞬时、racy observation，不是 reservation。
+
+Scheduler 可在**拿 Workspace lock 之前**把它用于：
+
+- backpressure hint；
+- 延迟不必要的 dispatch；
+- Trace / metrics；
+- 避免在明显 saturated 时立即让 WRITE 抢锁。
+
+但禁止：
+
+```text
+snapshot says free
+→ assume slot reserved
+```
+
+真正 admission authority 仍是 DeerFlow `capacity.slot()`。
+
+#### P1 Local Dispatch Budget
+
+A-SWE 自身再设置：
+
+```text
+max_inflight_node_executions
+<= pinned backend max_running
+```
+
+作为 control-plane budget，避免 A-SWE 自己制造超过 native capacity 的大量 queued executions。
+
+它不是 DeerFlow capacity 的复制品：
+
+- 不判断全进程真实 running count；
+- 不替代 queue/reject policy；
+- 不作为 execution admission evidence；
+- external DeerFlow traffic 仍可能让 native backend saturated。
+
+#### Metrics
+
+至少记录：
+
+```text
+workspace_lock_wait_duration
+workspace_lock_hold_duration
+backend_capacity_wait_after_workspace_lock
+backend_capacity_busy_before_lock
+```
+
+若：
+
+```text
+backend_capacity_wait_after_workspace_lock
+```
+
+长期占 Node duration 高比例，再在 P2 评估正式的 reservation / two-resource scheduler；P1 不提前引入。
+
+原则：
+
+> **Keep one resource order for correctness; measure lock hoarding before optimizing it.**
+
+---
+
 ### 9.16 一期 Runtime Budget
 
 所有预算必须属于 Runtime config，而不是 Prompt 建议。
@@ -9099,7 +9256,8 @@ P1 建议初始值：
 
 ```text
 max_work_items = 8
-max_parallel_read_nodes = min(3, backend_capacity)
+max_inflight_node_executions = backend_capacity
+max_parallel_read_nodes = min(3, max_inflight_node_executions)
 planning_attempts = 2
 execution_replans = 1        # pre-WRITE only
 max_repairs_per_write = 1
@@ -9959,6 +10117,10 @@ Tool Receipt Count
 Retry Count
 Node Failure Count
 Workspace Block Count
+Workspace Lock Wait Duration
+Workspace Lock Hold Duration
+Backend Capacity Wait After Workspace Lock
+Backend Capacity Busy Before Lock
 Selected Skills
 Selected Tools
 Final Status
@@ -11521,6 +11683,9 @@ Source Audit In Progress
 - `started_at is None` 是 pinned background path 的 PRE_START 强信号；
 - PRE_START timeout / admission failure 可证明 backend 未进入 model/tool/sandbox execution；
 - TIMED_OUT 必须结合 execution_phase 解释，不能统一视为 started execution timeout；
+- A-SWE P1 统一资源顺序为 Workspace → DeerFlow native capacity，避免内部 ABBA；
+- capacity snapshot 只能做 pre-lock backpressure hint，不能当 reservation；
+- P1 接受 backend saturation 时的 Workspace lock hoarding，并以 metrics 量化，不自建第二套 capacity controller。
 - NodeExecutionResult 使用 exhaustive typed status/stop-reason mapping，未知值视为 BACKEND_CONTRACT_MISMATCH。
 
 审计目标：
@@ -11630,6 +11795,10 @@ P0-7 新增 PoC：
 | POC-R51 | `nohup` / `setsid` / daemon / detached workflow | P1 contract reject / UNSUPPORTED_BACKGROUND_EXECUTION |
 | POC-R52 | implementation Node 无 Runtime-approved bash command | bash denied，即使 Provider generic config 原本暴露 bash |
 | POC-R53 | external MCP submitted async side effect | executor quiescence 不升级为 distributed side-effect quiescence；no auto retry |
+| POC-R54 | backend 已 saturated 时 WRITE ready | snapshot 只延迟/提示，不声明已 reservation |
+| POC-R55 | WRITE 已拿锁后等待 native capacity | 后续 Workspace Node 不越过锁；记录 backend_capacity_wait_after_workspace_lock |
+| POC-R56 | 多个 A-SWE ready Node | max_inflight_node_executions 不超过 configured backend capacity |
+| POC-R57 | external DeerFlow traffic 占满 capacity | A-SWE correctness 不变；可能 lock hoarding，但无 ABBA deadlock |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
@@ -11779,6 +11948,8 @@ Executable TaskDAG
 - Cancellation；
 - DeerFlow independent background-completion/quiescence compatibility seam；
 - WorkspaceSession QUARANTINED fail-safe；
+- fixed Workspace→Backend-capacity resource ordering；
+- capacity backpressure hint + lock-hoarding metrics；
 - BackendExecutionPhase / pre-start vs started failure semantics；
 - ExecutionCompleteness / capped-partial logical acceptance gate；
 - Failure Propagation；
