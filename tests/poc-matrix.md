@@ -322,4 +322,20 @@
 | POC-R106 | FROZEN finalizer 生成 final repository changeset | 使用 task-scoped TaskEvidenceRef；不伪造 synthetic Node attempt |
 | POC-R107 | TaskEvidenceRef 被尝试放入 NodeHandoff | schema/policy reject；task-finalization evidence 不进入 ordinary execution handoff |
 | POC-R108 | QUARANTINED task finalization | 不创建声称 current-final 的 TaskEvidenceRef；仅保留 last_trusted attempt EvidenceRef |
+| POC-R109 | Writer reopen 时 downstream READY 且尚无 dispatch ticket | accepted authority revoke 后 consumer → PENDING；无 attempt |
+| POC-R110 | downstream ticket=PREPARING 时 Writer reopen | ticket REVOKED；prepared result discard；不创建 NodeAttemptRecord |
+| POC-R111 | downstream ticket=WAITING_WORKSPACE 时 Writer reopen | lock wait 被取消/退出；ticket REVOKED；无 backend cancel |
+| POC-R112 | downstream 已拿 lock、ticket=LOCKED_PRECOMMIT，reopen 先取得 SchedulerStateMutex | ticket REVOKED；consumer commit gate 失败并释放 lock；无 attempt |
+| POC-R113 | downstream final dispatch commit 先取得 SchedulerStateMutex | consumer → RUNNING/COMMITTED；Writer reopen → REPAIR_SCOPE_INVALIDATED(ACTIVE_DOWNSTREAM_DISPATCH) |
+| POC-R114 | Writer reopen transaction 先于 consumer commit | acceptance_epoch/handoff authority 改变；consumer commit 看到 stamp mismatch，不进入 backend |
+| POC-R115 | consumer COMMITTED 但 DeerFlow 尚 PRE_START/排队 capacity | P1 仍视为跨越 dispatch boundary；不 retract attempt 后 repair |
+| POC-R116 | ACTIVE_DOWNSTREAM_DISPATCH 导致 task fail-close | 先 close dispatch gate，再 cancel/join committed consumer；全部 quiescent 后才 FROZEN |
+| POC-R117 | active consumer cancellation 无法证明 quiescence | Workspace→QUARANTINED；不得继续 repair/final workspace inspection |
+| POC-R118 | Writer H1 publish→reopen→H2 publish | acceptance_epoch 1→2→3；旧 epoch=1 ticket 永久失效 |
+| POC-R119 | task-wide fail-close 时已有 WAITING/LOCKED_PRECOMMIT tickets | TaskDispatchGate epoch 改变；所有旧 ticket commit fail |
+| POC-R120 | prepare_node 期间 ticket 被 revoke | prepare_node 不产生 model/tool/workspace side effect；结果可直接 discard |
+| POC-R121 | SchedulerStateMutex 持有期间 | 不等待 Workspace lock/backend capacity/I/O；避免 SchedulerMutex→Workspace 反向等待 |
+| POC-R122 | source Verification failure 触发合法 reopen | source Verification→REMEDIATION_PENDING；repair success 后同 Node 用 REVERIFY fresh attempt |
+| POC-R123 | running consumer 被 fail-close cancel 且留下 mutation | consumer 不是业务 root failure，但 mutation evidence 影响最终 Workspace/Repository disposition |
+| POC-R124 | same WorkspaceRevision R，Writer H1 已 revoke 但 repair 尚未修改 workspace | revision check alone would pass；acceptance_epoch/handoff stamp 必须阻止旧 consumer commit |
 
