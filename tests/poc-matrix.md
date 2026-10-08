@@ -371,3 +371,5 @@
 | POC-F08 | TaskResult root failure | 使用 RootFailureRecord + supporting EvidenceRefs，不把 failure 本身伪装成 EvidenceRef |
 | POC-F09 | Task success gate | final_contract_verdict 存在且 all_required_satisfied=true 才能 SUCCEEDED |
 | POC-F10 | documentation graph | README/master/spec/audit/test 的相对链接全部可解析，active docs 不引用 archived monolith 作为 authority |
+| POC-F11 | active Python schema annotation closure | 所有项目内 annotation type 都能解析到唯一 authoritative class；无 dangling type |
+| POC-F12 | shared-contract import graph | NodeHandoff 不反向 import runtime module；ExecutionCompleteness 由 shared contract 单一拥有 |
