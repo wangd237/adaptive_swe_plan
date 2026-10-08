@@ -675,10 +675,17 @@ P1 也不能判 `PROVEN_NONE`。
 
 #### PROVEN_NONE Frozen Predicate
 
-P1 的 `MutationEvidence.PROVEN_NONE` 必须同时满足：
+P1 的 `MutationEvidence.PROVEN_NONE` 有两条 mutually exclusive proof path：
 
 ```text
-before/after workspace snapshot available
+A. PRE_START proof
+   execution_phase == PRE_START
+   AND NodeExecutionBinding / audit integrity intact
+   AND no ToolCallAdmissionRecord
+   → PROVEN_NONE
+
+B. STARTED proof
+   before/after workspace snapshot available
 AND snapshot attribution not truncated
 AND no observed workspace change
 AND NodeExecutionBinding / RuntimeOutcome intact
@@ -688,6 +695,7 @@ AND no admitted tool call whose effect is:
     EXTERNAL_SIDE_EFFECT
     UNKNOWN
 AND no independent runtime evidence of mutation
+   → PROVEN_NONE
 ```
 
 否则：
@@ -1462,6 +1470,10 @@ class ExecutionCompleteness(str, Enum):
     # usable partial work may be COMPLETED; unusable/no partial may be FAILED.
     CAPPED = "capped"
 
+class BackendExecutionPhase(str, Enum):
+    PRE_START = "pre_start"
+    STARTED = "started"
+
 class BackendFailureClass(str, Enum):
     NONE = "none"
 
@@ -1492,6 +1504,8 @@ class NodeExecutionResult(BaseModel):
 
     failure_class: BackendFailureClass
     admission_failure: bool
+
+    execution_phase: BackendExecutionPhase
 
     started_at: datetime | None
     completed_at: datetime | None
@@ -1581,11 +1595,137 @@ CANCELLED
 → cancellation termination
 ```
 
+#### PRE_START vs STARTED
+
+Pinned DeerFlow background path 的顺序：
+
+```text
+execute_async()
+      ↓
+result = PENDING
+      ↓
+await capacity.slot()
+      ↓
+slot acquired
+      ↓
+result.status = RUNNING
+result.started_at = utcnow()
+      ↓
+_aexecute_admitted()
+      ↓
+agent / model / tool / sandbox execution
+```
+
+因此在 pinned commit 中：
+
+```text
+started_at is None
+→ native execution slot never acquired
+→ _aexecute_admitted() never entered
+→ no model/tool/sandbox business execution started
+```
+
+Adapter 映射：
+
+```text
+started_at is None
+→ execution_phase = PRE_START
+
+started_at is not None
+→ execution_phase = STARTED
+```
+
+这个字段不能由 status 文本推断，而直接来自 `SubagentResult.started_at`。
+
+特别重要的是 outer：
+
+```python
+asyncio.wait_for(
+    self._aexecute(...),
+    timeout=config.timeout_seconds,
+)
+```
+
+**包含 capacity queue wait。**
+
+所以可能出现：
+
+```text
+terminal_status = TIMED_OUT
+admission_failure = false
+started_at = None
+```
+
+这不是“Agent 已执行后超时”，而是：
+
+> **整体 execution deadline 在 capacity admission 前耗尽。**
+
+它与：
+
+```text
+TIMED_OUT
+started_at != None
+```
+
+必须分开。
+
+#### Mutation / Retry Consequence
+
+`PRE_START` 是强 mutation-safety signal：
+
+- no A-SWE admitted tool call should exist；
+- no DeerFlow agent/model/tool body entered；
+- no sandbox business action from this Node attempt occurred；
+- no Repository mutation can originate from this backend execution。
+
+因此：
+
+```text
+PRE_START
++ Binding/audit integrity intact
+→ backend mutation evidence = PROVEN_NONE
+```
+
+不需要因为 DeerFlow workspace scanner truncated 就把**这个 backend execution**降为 UNKNOWN；它根本没有开始。
+
+但：
+
+- task-wide/user cancellation 仍不自动 retry；
+- external out-of-band workspace mutation 不属于该 proof；
+- 如果 `started_at=None` 却存在 A-SWE `ToolCallAdmissionRecord`，则属于 `BACKEND_CONTRACT_MISMATCH`，fail closed。
+
+`STARTED` 后的 timeout/cancel/failure 才进入完整的：
+
+```text
+snapshot
++
+ToolCallAdmissionRecord
++
+receipt / workspace evidence
+```
+
+mutation classification。
+
+原则：
+
+> **No slot acquired is stronger than “no change observed”.**
+
+---
+
 #### Admission Failure 映射
 
 Pinned DeerFlow `SubagentResult.admission_failure=True` 的语义是：
 
 > capacity rejection / queue admission timeout occurred before the subagent execution acquired a running slot.
+
+因此所有正常 `admission_failure=True` 都应同时满足：
+
+```text
+execution_phase == PRE_START
+started_at is None
+```
+
+若不满足，Adapter 视为 `BACKEND_CONTRACT_MISMATCH`。
 
 因此：
 
@@ -1638,6 +1778,7 @@ FAILED
 
 TIMED_OUT
 → failure_class = TIMEOUT
+→ execution_phase 决定它是 pre-start deadline exhaustion 还是 started execution timeout
 
 CANCELLED
 → failure_class = CANCELLED
@@ -7201,6 +7342,7 @@ Cancelled
 | Failure | 行为 |
 |---|---|
 | admission failure before execution | wait / bounded retry |
+| overall timeout before capacity slot (`PRE_START`) | bounded retry candidate；无需按 started WRITE 处理 mutation |
 | backend preflight stale | fail before execution；pre-WRITE 时可 bounded replan |
 | provider assembly mismatch | fail closed；P1 不自动换 Provider |
 | READ transient failure | RetryPolicy |
@@ -11156,6 +11298,10 @@ Source Audit In Progress
 - direct SubagentExecutor terminal vocabulary 固定为 completed/failed/cancelled/timed_out；polling_timed_out 不进入 Adapter backend status；
 - `stop_reason` 与 terminal status 正交；FAILED 也可能是 capped execution；
 - capacity `admission_failure` 只映射 backend admission，不与 policy/preflight/model auth failure 混用；
+- DeerFlow overall timeout 包含 capacity queue wait；
+- `started_at is None` 是 pinned background path 的 PRE_START 强信号；
+- PRE_START timeout / admission failure 可证明 backend 未进入 model/tool/sandbox execution；
+- TIMED_OUT 必须结合 execution_phase 解释，不能统一视为 started execution timeout；
 - NodeExecutionResult 使用 exhaustive typed status/stop-reason mapping，未知值视为 BACKEND_CONTRACT_MISMATCH。
 
 审计目标：
@@ -11252,6 +11398,12 @@ P0-7 新增 PoC：
 | POC-R38 | completion signal missing/corrupt | WorkspaceSession=QUARANTINED；后续 Node 零 dispatch |
 | POC-R39 | cleanup_background_task | 只在 completion consumed 后移除 result/completion record |
 | POC-R40 | ordinary DeerFlow task_tool | compatibility patch 不改变现有 polling/cancellation semantics |
+| POC-R41 | capacity queue 中 overall timeout | TIMED_OUT + started_at=None → PRE_START |
+| POC-R42 | capacity SubagentCapacityTimeout | FAILED + admission_failure=true + PRE_START |
+| POC-R43 | slot acquired 后 execution timeout | TIMED_OUT + started_at!=None → STARTED，进入 mutation classification |
+| POC-R44 | PRE_START timeout + snapshot truncated | 仍可由 execution-phase proof判 backend PROVEN_NONE |
+| POC-R45 | started_at=None 但出现 admitted tool record | BACKEND_CONTRACT_MISMATCH，fail closed |
+| POC-R46 | user cancel while queued | CANCELLED + PRE_START；workspace safe，但不自动 retry user cancellation |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
@@ -11399,6 +11551,7 @@ Executable TaskDAG
 - Cancellation；
 - DeerFlow independent background-completion/quiescence compatibility seam；
 - WorkspaceSession QUARANTINED fail-safe；
+- BackendExecutionPhase / pre-start vs started failure semantics；
 - ExecutionCompleteness / capped-partial logical acceptance gate；
 - Failure Propagation；
 - Result Aggregation；
