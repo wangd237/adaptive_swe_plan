@@ -93,27 +93,7 @@ NodeHandoff 本身不是 EvidenceRef。P1 将 bounded NodeHandoff 保存在 Node
 
 现有 `EvidenceRef` 保持严格的 **Node-attempt-scoped provenance**。Terminal Task finalization 不允许伪造 synthetic Node / execution id 来复用它。
 
-P1 增加单独的 task-scoped reference：
-
-```python
-class TaskEvidenceRef(BaseModel):
-    evidence_id: str
-
-    kind: Literal[
-        "final_repository_state",
-        "final_repository_changeset",
-        "final_contract_verdict",
-    ]
-
-    task_id: str
-    finalization_id: str
-
-    # Present only when the finalizer observed a stable FROZEN workspace.
-    workspace_revision_generation: int | None
-    workspace_state_fingerprint: str | None
-
-    content_sha256: str
-```
+P1 的 task-scoped `TaskEvidenceRef` 与 attempt-scoped `EvidenceRef` 的**唯一 authoritative schema** 均定义在 `specs/01-task-planning.md §4.17.1`；本节只定义其 storage/evaluation 使用语义。
 
 规则：
 
@@ -128,7 +108,7 @@ TaskEvidenceRef
 → 不得伪装成某次 Agent execution evidence
 ```
 
-两者可以由同一个 immutable `ExecutionEvidenceStore` 持久化，但使用不同 provenance schema / namespace。
+两者由同一个 immutable `ExecutionEvidenceStore` 持久化：attempt artifact 使用 `put_attempt()`，terminal task artifact 使用 `put_task()`，并使用不同 provenance schema / namespace。
 
 当 Workspace 已 `QUARANTINED`：
 
