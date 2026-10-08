@@ -18,6 +18,35 @@ Real DeerFlow Shared-Workspace Integration: GO/NO-GO GATED
 
 它**不表示** DeerFlow integration PoC 已通过。
 
+### P0 Consistency Sweep Result
+
+本次 Design Freeze 对 active docs（不含 `archive/`）执行了静态一致性检查：
+
+```text
+duplicate authoritative class definitions     0
+dangling project-internal annotation types   0
+unbalanced fenced code blocks                0
+broken relative document links               0
+duplicate PoC ids                            0
+malformed PoC table rows                     0
+active pre-freeze status markers             0
+PoC rows currently indexed                   332
+```
+
+同时已完成：
+
+- README Schema Ownership Map；
+- P0-1 ～ P0-7 状态统一为 `Design Frozen / PoC Execution Pending`；
+- P0-4 contract/constraint PoC 分组补齐；
+- P0-7 retry/repair/failure PoC 分组恢复；
+- P0-Final static conformance checks；
+- Master Plan Authoritative Coding Order；
+- archive 明确降级为 historical reference only。
+
+这些 manual/static checks 后续应转成 `POC-F*` 对应 CI/static tests，防止实现阶段重新引入 schema drift。
+
+它**不表示** DeerFlow integration PoC 已通过。
+
 在允许真实 DeerFlow backend 承担 P1 shared mutable Workspace 主链路前，至少必须通过既有关键 integration gates：
 
 ```text
