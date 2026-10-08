@@ -4611,6 +4611,7 @@ class EvidenceRef(BaseModel):
         "report_receipt_verdict",
         "acceptance_verdict",
         "verification_result",
+        "repair_attribution",
         "review_verdict",
         "repository_invariant",
     ]
@@ -7583,6 +7584,7 @@ LLM 不直接生成最终 TaskNode。
 class TaskNode(BaseModel):
     id: str
     objective: str
+    work_kind: WorkKind
 
     required_capabilities: list[str]
     provider_id: str
@@ -7602,6 +7604,106 @@ class TaskNode(BaseModel):
 ```
 
 实现时建议进一步将 mutable `status` 从 immutable TaskNode schema 移入 `NodeRuntimeState`；TaskNode 本体作为 plan artifact 不承担 attempt lifecycle。
+
+#### Verification Repair Ownership Binding
+
+P1 不允许在测试失败以后根据：
+
+- “最后一个 Coder”；
+- Tester / Coder 自由文本；
+- failed test path 与 changed path 的表面重合；
+- Provider identity；
+- 执行时间上最近的 WRITE；
+
+来猜测 Repair target。
+
+原因是：
+
+> **Verification failure does not prove causal blame.**
+
+P1 只解决一个更窄、可确定性实现的问题：
+
+> **当前 deterministic verification obligation 是否存在唯一的 logical repair owner。**
+
+这里的 attribution 是 **repair ownership attribution**，不是 root-cause causality proof。
+
+DAG Materializer / ExecutionPlanCompiler 为每个 downstream deterministic verification check 编译 immutable binding：
+
+```python
+class VerificationRepairBinding(BaseModel):
+    verification_node_id: str
+    verification_check_id: str
+
+    # Logical IMPLEMENTATION nodes that may own remediation for this check.
+    candidate_write_node_ids: tuple[str, ...]
+
+    derivation: Literal[
+        "dag_business_writer_ancestors",
+        "runtime_owned_gate",
+    ]
+
+    dag_fingerprint: str
+    fingerprint: str
+```
+
+其中 `verification_check_id` 必须引用 Runtime 编译后的 deterministic check identity；shell-based check 通常直接引用 `VerificationCommand.id`。
+
+P1 candidate 集合只从 immutable DAG / semantic authority 推导：
+
+```text
+transitive ancestors of Verification Node
+        ∩
+WorkKind == IMPLEMENTATION
+        ∩
+semantic authority includes REPOSITORY_MUTATION
+```
+
+注意：
+
+```text
+WorkspaceAccess.WRITE
+!=
+business writer
+```
+
+所以：
+
+- Tester 因 bash 获得 WRITE lock，不进入 candidate writers；
+- Reviewer / Discovery 即使物理 ToolEffect 导致 WRITE scheduling，也不进入 candidate writers；
+- same Provider 执行两个 IMPLEMENTATION Node，仍然是两个 logical writer candidates；
+- 同一个 logical Writer 的多次 attempt 不扩大 candidate node 集合，attempt 在 runtime attribution 时再解析。
+
+对于 Runtime 注入的：
+
+```text
+__aswe_verify
+```
+
+其 mandatory edges 已经是：
+
+```text
+all relevant IMPLEMENTATION nodes
+        ↓
+__aswe_verify
+```
+
+因此 global gate 的 candidate set 会自然覆盖所有业务 mutation owners。
+
+P1 **不允许**用以下信息缩小 candidate set：
+
+```text
+failed test filename
+stack trace path
+repository_changed_paths overlap
+affected_paths hint
+verifier_report
+Agent self-report
+"last writer"
+```
+
+这些信息可以进入 diagnostics / Trace，但不是 attribution authority。
+
+如果需要更精确的 multi-writer repair ownership，必须未来引入更强的 compiler-owned obligation-to-writer mapping，而不是在运行时做启发式 root-cause guessing。
 
 ### 9.3 Side-Effect Compilation
 
@@ -8462,6 +8564,378 @@ PLAN_INVALIDATED / requires explicit replan
 
 而 WRITE 之后 arbitrary replan 已关闭，因此默认 fail / restart-from-baseline。
 
+#### Downstream Verification → Repair Attribution
+
+P1 对 downstream verification failure 使用独立的：
+
+```text
+RepairAttributionResolver
+```
+
+而不是让 Scheduler 根据 Tester prose 直接生成 `RepairFeedback`。
+
+先定义结构化 verification evidence：
+
+```python
+class VerificationCheckStatus(str, Enum):
+    HOLDS = "holds"
+    FAILED = "failed"
+    UNVERIFIED = "unverified"
+
+class VerificationCheckResult(BaseModel):
+    check_id: str
+    status: VerificationCheckStatus
+
+    deterministic: bool
+
+    # Runtime-owned evidence only.
+    evidence_refs: tuple[EvidenceRef, ...] = ()
+
+class VerificationResult(BaseModel):
+    verification_node_id: str
+    verification_execution_id: str
+    verification_attempt: int
+
+    observed_workspace_revision: WorkspaceRevision
+    observed_repository_state_fingerprint: str
+
+    checks: tuple[VerificationCheckResult, ...]
+
+    # Must remain true for independent verifier semantics.
+    repository_state_unchanged: bool
+
+    fingerprint: str
+```
+
+`FAILED` 必须来自 Runtime 的 canonical deterministic checker；自由文本：
+
+```text
+"tests seem broken"
+"probably caused by auth.py"
+```
+
+不能生成 authoritative failed check。
+
+Repair attribution 的输出同样持久化：
+
+```python
+class RepairAttributionKind(str, Enum):
+    UNIQUE_WRITER = "unique_writer"
+    NO_OWNER = "no_owner"
+    MULTI_WRITER = "multi_writer"
+    SOURCE_INELIGIBLE = "source_ineligible"
+    SCOPE_INVALIDATED = "scope_invalidated"
+
+class RepairAttributionEvidence(BaseModel):
+    source_verification_node_id: str
+    source_verification_execution_id: str
+    source_verification_attempt: int
+
+    failed_check_ids: tuple[str, ...]
+    candidate_write_node_ids: tuple[str, ...]
+
+    target_write_node_id: str | None = None
+    target_write_attempt: int | None = None
+
+    observed_workspace_revision: WorkspaceRevision
+
+    kind: RepairAttributionKind
+    reason_codes: tuple[str, ...]
+
+    dag_fingerprint: str
+    fingerprint: str
+```
+
+该对象写入 `ExecutionEvidenceStore`，EvidenceRef.kind = `repair_attribution`。
+
+##### Deterministic Resolver
+
+P1 直接按下面顺序实现：
+
+```python
+def resolve_verification_repair_attribution(
+    verification_node: TaskNode,
+    source_attempt: NodeAttemptRecord,
+    verification_result: VerificationResult,
+    bindings: tuple[VerificationRepairBinding, ...],
+    dag: TaskDAG,
+    node_states: Mapping[str, NodeRuntimeState],
+    repository_write_ledger: RepositoryWriteLedger,
+) -> RepairAttributionEvidence:
+    ...
+```
+
+###### Gate 1：source 必须是真正的 deterministic Verification failure
+
+全部满足：
+
+```text
+verification_node.work_kind == VERIFICATION
+verification_result belongs to source execution/attempt
+verification_result evidence integrity valid
+verification_result.repository_state_unchanged == true
+at least one check.status == FAILED
+every failed check is deterministic
+no UNVERIFIED check is promoted to FAILED
+source failure is verification failure, not backend/tool/policy execution failure
+```
+
+否则：
+
+```text
+SOURCE_INELIGIBLE
+→ no automatic RepairFeedback
+```
+
+特别地：
+
+- verifier backend crash；
+- test command 根本没运行；
+- acceptance evidence 缺失；
+- verifier 修改 Git-visible Repository；
+- 只有 Tester prose 声称失败；
+
+都不能进入 writer attribution。
+
+###### Gate 2：每个 failed check 必须解析 compiler-owned binding
+
+对每个 `failed_check_id`：
+
+```text
+lookup VerificationRepairBinding
+verify dag_fingerprint
+verify verification_node_id
+```
+
+任一 binding 缺失 / fingerprint 不一致：
+
+```text
+SOURCE_INELIGIBLE
+```
+
+禁止 fallback 到：
+
+```text
+nearest writer
+last writer
+path overlap
+model guess
+```
+
+###### Gate 3：按 logical Node 求 candidate union
+
+```python
+candidate_sets = [
+    set(binding.candidate_write_node_ids)
+    for binding in failed_bindings
+]
+all_candidates = union(candidate_sets)
+```
+
+但“union 恰好一个”还不够。
+
+P1 要求：
+
+```text
+EVERY failed check candidate set == {same single writer W}
+```
+
+也就是：
+
+```python
+if any(len(s) == 0 for s in candidate_sets):
+    return NO_OWNER
+
+if any(len(s) != 1 for s in candidate_sets):
+    return MULTI_WRITER
+
+owners = {only(s) for s in candidate_sets}
+
+if len(owners) != 1:
+    return MULTI_WRITER
+```
+
+这样可以阻止：
+
+```text
+check A → Writer 1
+check B → Writer 2
+```
+
+被错误压成“挑一个最可能的 Writer”。
+
+###### Gate 4：target 必须仍是当前 accepted logical Writer
+
+设唯一 logical owner 为 `W`。
+
+必须满足：
+
+```text
+TaskNode(W).work_kind == IMPLEMENTATION
+W semantic authority includes REPOSITORY_MUTATION
+
+NodeRuntimeState(W).logical_status == SUCCEEDED
+accepted_attempt is not None
+accepted_handoff is not None
+accepted_handoff belongs to accepted_attempt
+accepted attempt temporally precedes source verification attempt
+```
+
+注意：
+
+> downstream verification repair target 是 logical Writer 的 **current accepted_attempt**，不是“最近执行过的 attempt”。
+
+因此：
+
+```text
+attempt 1 transient clean fail
+attempt 2 success
+verification fail
+→ target = attempt 2
+```
+
+旧 attempt 只留 Trace。
+
+如果 writer 已经：
+
+```text
+REMEDIATION_PENDING
+FAILED
+BLOCKED
+CANCELLED
+```
+
+则当前 attribution 不能再次创建新的 repair ownership。
+
+###### Gate 5：排除 intervening distinct business Writer
+
+即使 compiler binding 是 singleton，Runtime 仍做 defense-in-depth：
+
+在 target accepted attempt 完成之后，到 verification 所观察 revision 之间，若存在**另一个 logical Node**：
+
+```text
+semantic authority = REPOSITORY_MUTATION
+AND Git-visible RepositoryStateDigest actually changed
+```
+
+则：
+
+```text
+SCOPE_INVALIDATED
+→ no automatic repair
+```
+
+这防止 DAG / phase normalization bug、异常 dispatch 或未来 topology 扩展后出现：
+
+```text
+Writer A accepted
+Writer B later mutates repo
+Verifier fails
+→ still blame A
+```
+
+同一 logical Writer 的 REPAIR attempt 不按“distinct writer”计算；它由 `accepted_attempt` ownership 管理。
+
+###### Gate 6：成功 attribution 只代表 repair ownership
+
+全部通过：
+
+```text
+kind = UNIQUE_WRITER
+target_write_node_id = W
+target_write_attempt = W.accepted_attempt
+```
+
+它只证明：
+
+> 在 P1 当前 DAG / authority / accepted-attempt model 下，这组失败 verification obligations 只有一个合法 remediation owner。
+
+它**不证明**：
+
+> Writer W 在因果意义上制造了这个失败。
+
+例如 baseline 本来就存在 bug 时：
+
+```text
+test failed before patch
+```
+
+不自动否定 Writer 的 repair ownership；如果任务 contract 要求该 Writer 修复它，那么 failure 仍表示该 obligation 尚未满足。
+
+因此 P1 不把 baseline pass/fail comparison 用作 writer blame classifier。
+
+##### Atomic Reopen Boundary
+
+`UNIQUE_WRITER` 产生后：
+
+```text
+persist RepairAttributionEvidence
+        ↓
+build RepairFeedback
+        ↓
+Scheduler state transaction
+    W: SUCCEEDED → REMEDIATION_PENDING
+    revoke ordinary dependency authority of old accepted_handoff
+    attach pending repair attribution
+        ↓
+only then recompute READY set
+```
+
+这三件事必须属于一个 Scheduler logical state transition。
+
+禁止：
+
+```text
+create RepairFeedback
+→ recompute downstream READY
+→ later reopen Writer
+```
+
+否则旧 `accepted_handoff` 可能在窗口期继续解锁 consumer。
+
+真正 REPAIR dispatch 时，仍然执行已经冻结的：
+
+```text
+RepairFeedback.observed_workspace_revision
+vs
+current revision under WRITE lock
+```
+
+freshness gate。
+
+所以职责分离为：
+
+```text
+VerificationRepairBinding
+→ compile-time ownership scope
+
+RepairAttributionResolver
+→ post-verification unique-owner decision
+
+RepairFeedback freshness check
+→ pre-repair current-state validity
+```
+
+##### Explicit Non-Attribution Rules
+
+P1 明确禁止：
+
+```text
+"Tester failed after Coder"
+→ therefore Coder is at fault
+
+"stack trace points to file changed by Writer A"
+→ therefore Writer A is unique owner
+
+"Writer B ran last"
+→ therefore repair Writer B
+
+"Tester says Writer A caused it"
+→ therefore repair Writer A
+```
+
+这些最多是 diagnostic hints。
+
 #### Repair Trigger
 
 P1 只允许：
@@ -8500,10 +8974,19 @@ class RepairFeedback(BaseModel):
     # Revision whose state the deterministic failure evidence actually observed.
     observed_workspace_revision: WorkspaceRevision
 
-    deterministic_failures: tuple[str, ...]
+    # Authoritative check identities, not free-text blame statements.
+    failed_check_ids: tuple[str, ...]
+
     verification_result: EvidenceRef | None
     acceptance_verdict: EvidenceRef | None
+
+    # Required for DOWNSTREAM_VERIFICATION trigger.
+    repair_attribution: EvidenceRef | None
+
     receipt_refs: tuple[ReceiptRef, ...]
+
+    # Runtime-rendered bounded summaries only; not attribution authority.
+    deterministic_failure_summaries: tuple[str, ...] = ()
 
     # Untrusted explanatory prose only.
     verifier_report: str | None
@@ -12105,6 +12588,12 @@ Source Audit In Progress
 - P1 不支持已提交普通 downstream success 后的隐式 descendant rollback；此时 Repair scope invalidated。
 - RepairFeedback 是 revision-scoped deterministic evidence；真正 REPAIR dispatch 前必须在 WRITE lock 内做 freshness check；
 - stale verification/acceptance feedback 不能直接变成 current repair instruction；必须 refresh/reverify 或 fail closed。
+- downstream verification attribution 定义为 repair ownership，不宣称 causal blame；
+- attribution candidate 只来自 immutable DAG 中的 semantic REPOSITORY_MUTATION IMPLEMENTATION ancestors，不按 last-writer / path overlap / model prose 猜测；
+- 每个 failed deterministic check 都必须有 compiler-owned VerificationRepairBinding；所有 failed check 必须解析到同一个 singleton logical Writer 才允许 automatic repair；
+- downstream repair target 使用该 Writer 当前 accepted_attempt；旧 retry/repair attempt 不作为 current owner；
+- distinct intervening business Writer 若在 target acceptance 后改变 Git-visible Repository state，则 attribution scope invalidated；
+- RepairAttributionEvidence 持久化并进入 RepairFeedback；Writer reopen + old accepted_handoff revocation + READY recomputation 必须是一个 Scheduler logical state transition。
 - direct SubagentExecutor terminal vocabulary 固定为 completed/failed/cancelled/timed_out；polling_timed_out 不进入 Adapter backend status；
 - `stop_reason` 与 terminal status 正交；FAILED 也可能是 capped execution；
 - capacity `admission_failure` 只映射 backend admission，不与 policy/preflight/model auth failure 混用；
@@ -12293,6 +12782,22 @@ P0-7 新增 PoC：
 | POC-R72 | VerificationCommand 与 BashCommandPolicy command 不一致 | ACCEPTANCE_COMMAND_POLICY_MISMATCH，compile-time fail |
 | POC-R73 | verification Node required deerflow_tests_passed_evidence，但 backend 缺失 | Provider preflight fail before Workspace lock / execution |
 | POC-R74 | cancel 发生在已 yielded passing pytest ToolMessage 之后 | 已发布 bash evidence 保留；是否接受仍由 terminal/completeness policy决定 |
+| POC-R75 | single business Writer + one deterministic failed check | binding singleton → UNIQUE_WRITER，target=current accepted_attempt |
+| POC-R76 | single Writer + multiple deterministic failed checks | 每个 check 都绑定同一 singleton Writer → UNIQUE_WRITER |
+| POC-R77 | two business Writers → global verification fail | candidate set >1 → MULTI_WRITER；不生成 automatic RepairFeedback |
+| POC-R78 | Writer B 是最后执行者但 A/B 都是 candidates | 禁止 last-writer heuristic；仍 MULTI_WRITER |
+| POC-R79 | failed stack trace/path 只与 Writer A changed_paths 重合 | path overlap 不缩小 authority candidate set |
+| POC-R80 | Tester prose 声称“Writer A caused failure” | self-report 不影响 attribution |
+| POC-R81 | 一个 failed check 无 owner，另一个属于 Writer A | NO_OWNER / no automatic repair；不能只修可归因子集 |
+| POC-R82 | failed checks 分别绑定 Writer A / Writer B | MULTI_WRITER；不任选其一 |
+| POC-R83 | Writer attempt1 clean retry fail、attempt2 accepted，随后 verify fail | target_write_attempt=attempt2 |
+| POC-R84 | Tester 修改 tracked repo 后测试失败 | repository_state_unchanged=false → SOURCE_INELIGIBLE；不归因 Writer |
+| POC-R85 | verifier backend crash / test command 未形成 deterministic result | SOURCE_INELIGIBLE；不把 execution failure 当 verification failure |
+| POC-R86 | verification only UNVERIFIED | 不触发 repair attribution |
+| POC-R87 | semantic READ_ONLY Tester 有 physical WRITE lock | 不进入 business writer candidate set |
+| POC-R88 | same Provider 执行两个 IMPLEMENTATION logical nodes | 仍是两个 candidates；Provider identity 不合并 ownership |
+| POC-R89 | singleton Writer accepted 后，另一个 business Writer 改 Git-visible state，再运行 verifier | SCOPE_INVALIDATED；不沿用旧 singleton attribution |
+| POC-R90 | UNIQUE_WRITER attribution 后 Scheduler reopen | Writer reopen + old handoff revoke 先于 READY recomputation，无旧 handoff 解锁窗口 |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
@@ -12394,7 +12899,8 @@ ValidatedWorkPlan
 - deterministic multi-parent handoff merge；
 - revision-aware HandoffEvidenceProjection / renderer；
 - DAG Materializer；
-- TaskNode；
+- TaskNode / WorkKind；
+- VerificationRepairBinding compilation；
 - ToolEffect Registry；
 - Capability + Tool Effect workspace access compiler；
 - deterministic workspace-conflict serialization。
@@ -12421,6 +12927,8 @@ Executable TaskDAG
 - ASWEHandoffContextMiddleware；
 - request-scoped dependency context projection；
 - Handoff staleness / revision check；
+- RepairAttributionResolver / RepairAttributionEvidence；
+- atomic Writer reopen + accepted_handoff revocation；
 - RepairFeedback routing；
 - READ / WRITE Workspace Access；
 - provably READ-only Basic Parallel Execution；
