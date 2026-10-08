@@ -3054,7 +3054,7 @@ A-SWE RuntimeEvent / DeerFlow RunEventStore
 → timeline / correlation / observability
 ```
 
-允许在 EvidenceStore `put()` 成功后发布小型事件：
+允许在 EvidenceStore `put_attempt() / put_task()` 成功后发布小型事件：
 
 ```text
 EvidenceCreated
