@@ -1026,7 +1026,9 @@ DeerFlow Adapter 在这一阶段重新解析当前 deployment，并形成：
 
 ```python
 class NodeExecutionPreparation(BaseModel):
-    execution_id: str
+    # Pre-commit preparation identity; NOT a Node attempt/execution id.
+    preparation_id: str
+
     node_id: str
     provider_id: str
 
@@ -1044,6 +1046,22 @@ class NodeExecutionPreparation(BaseModel):
 
     status: Literal["prepared"]
 ```
+
+P1 identity boundary：
+
+```text
+prepare_node()
+→ preparation_id only
+→ no attempt / execution_id / run_id yet
+
+final Scheduler dispatch commit
+→ allocate attempt
+→ allocate execution_id
+→ allocate run_id
+→ freeze NodeExecutionInvocation
+```
+
+因此 `NodeExecutionPreparation` 被 pre-commit ticket revoke 时可以安全 discard，不会留下一个“已经存在但从未运行”的 execution identity。
 
 `backend_snapshot_id` 是 provider-neutral opaque id。Core 不通过它读取 DeerFlow object；它只让 Adapter 在 `execute_prepared()` 时取回本次准备阶段冻结的 concrete resources。
 
