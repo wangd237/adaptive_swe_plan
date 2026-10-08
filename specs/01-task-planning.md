@@ -427,9 +427,20 @@ class ReconReport(BaseModel):
     findings: list[ReconFinding]
     likely_areas: list[str]
     unresolved_questions: list[str]
+
+class PlanningContext(BaseModel):
+    repository_profile: RepositoryProfile
+    recon_report: ReconReport | None = None
+
+    context_complete: bool
+    unresolved_questions: tuple[str, ...] = ()
+
+    fingerprint: str
 ```
 
 其中 path / line range 由 Runtime 做基础可验证性检查。
+
+`PlanningContext` 只表示 Planner 可消费的 repository/context snapshot；authoritative obligations 仍来自后续 `CompiledTaskContract`，不能因为 Recon finding 出现在 PlanningContext 中就自动升级为约束。
 
 ### 4.8 TaskContract / Constraint Compiler
 
@@ -1378,9 +1389,8 @@ SemanticPlanner 输入：
 
 ```text
 TaskSpec
-Compiled TaskContract
-RepositoryProfile
-ReconReport（如果存在）
+CompiledTaskContract
+PlanningContext
 Capability Catalog（只提供语义能力，不提供 Agent roster）
 ```
 
@@ -1388,7 +1398,7 @@ Capability Catalog（只提供语义能力，不提供 Agent roster）
 
 - `TaskSpec` 提供 task classification / risk / scope inference；
 - `TaskContract` 提供 authoritative deliverables / constraints / forbidden actions / verification obligations；
-- Repository / Recon 信息属于 untrusted evidence，不可提升为 Runtime Policy。
+- PlanningContext 中的 Repository / Recon 信息属于 untrusted evidence，不可提升为 Runtime Policy。
 
 Planner 不应该看到：
 
