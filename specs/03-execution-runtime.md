@@ -3098,7 +3098,7 @@ AcceptanceFailure + mutation
 
 只有 remediation 不成立 / 已耗尽 / scope invalidated 后，才进入 terminal fail-closed。
 
-##### Task / Workspace / Patch 三轴状态
+##### Task / Workspace / Repository / Patch 四轴状态
 
 P1 禁止用单个枚举同时表达业务结果与 workspace condition。
 
@@ -3241,7 +3241,7 @@ final_repository_state / final_repository_changeset = None
 ordinary dispatch = closed
 ```
 
-这里仍保持三轴正交：若进入 QUARANTINED 的根因是 task-wide user cancellation，而不是 dirty business failure，则 TaskLogicalStatus 可以是 `CANCELLED`；WorkspaceDisposition 仍为 `QUARANTINED`。
+这里仍保持四轴正交：若进入 QUARANTINED 的根因是 task-wide user cancellation，而不是 dirty business failure，则 TaskLogicalStatus 可以是 `CANCELLED`；WorkspaceDisposition 仍为 `QUARANTINED`。
 
 并禁止 workspace-touching finalization。
 
