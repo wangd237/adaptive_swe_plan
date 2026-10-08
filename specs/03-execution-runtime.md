@@ -74,8 +74,13 @@ class WorkspaceSessionStatus(str, Enum):
     READY = "ready"
     ACTIVE = "active"
 
+    # The workspace is stable/quiescent, but ordinary DAG dispatch has been
+    # permanently closed for this task. Runtime-owned finalization only.
+    FROZEN = "frozen"
+
     # Backend execution may still be live / late-mutating and quiescence
-    # cannot be proven. No further DAG node may enter this workspace.
+    # cannot be proven. No further DAG node or workspace-touching finalizer
+    # may enter this workspace.
     QUARANTINED = "quarantined"
 
     CLOSED = "closed"
@@ -95,6 +100,39 @@ class WorkspaceSession(BaseModel):
 
     status: WorkspaceSessionStatus
 ```
+
+关键约束：
+
+`FROZEN` 与 `QUARANTINED` 必须严格区分：
+
+```text
+FROZEN
+→ backend quiescence 已证明
+→ Workspace state 可视为稳定 terminal snapshot
+→ ordinary Agent / DAG dispatch 永久关闭
+→ 只允许 Runtime-owned deterministic finalization
+
+QUARANTINED
+→ backend quiescence 无法证明
+→ Workspace 可能仍被 late mutation
+→ 禁止任何新的 Agent dispatch
+→ 禁止依赖“当前 workspace 稳定”的 finalization probe
+→ 只能使用 quarantine 前已持久化的 trusted evidence
+```
+
+因此：
+
+> **dirty task failure does not automatically mean QUARANTINED.**
+
+典型 dirty WRITE failure 若 `execute_prepared()/cancel_node()` 已证明 executor-owned quiescence，应进入 terminal `FROZEN`；只有 completion/quiescence proof 丢失时才进入 `QUARANTINED`。
+
+正常成功、失败或取消在形成 terminal task state 后，也可以短暂：
+
+```text
+ACTIVE → FROZEN → CLOSED
+```
+
+以完成 final result materialization。这里的 `FROZEN` 是 dispatch/lifecycle state，不是业务 success/failure verdict。
 
 关键约束：
 
@@ -2652,6 +2690,8 @@ BackendPreflightStale
 ProviderAssemblyMismatch
 ExecutionTransientFailure
 ExecutionCappedPartial
+DirtyWriteFailure
+WorkspaceQuarantined
 AcceptanceFailure
 AcceptanceCommandPolicyMismatch
 VerificationFailure
@@ -3021,6 +3061,321 @@ root_failure_refs = upstream failure evidence refs
 
 > **A failed attempt may be remediable; a failed logical node blocks the DAG.**
 
+#### Task-Level Fail-Closed Semantics
+
+Node failure propagation 只能回答“哪些 DAG descendants 不能继续”，还不足以回答：
+
+> **共享 Workspace 已被失败 attempt 修改后，整个 Task 是否还能继续调度其他 branch？**
+
+P1 冻结为两种不同 scope：
+
+```text
+ordinary clean terminal node failure
+→ block ordinary descendants
+→ unrelated branch 可按 DAG 继续
+
+workspace-compromising terminal failure
+→ task-wide fail closed
+→ no further ordinary DAG dispatch anywhere in this WorkspaceSession
+```
+
+其中 workspace-compromising terminal failure 至少包括：
+
+- WRITE / UNKNOWN-mutating attempt terminal failure，且 `mutation_evidence == OBSERVED | UNKNOWN`，同时不存在合法 Retry / Repair transition；
+- `REPOSITORY_MUTATION_AUTHORITY_VIOLATION`；
+- Repository invariant broken，且 P1 不提供 deterministic rollback；
+- dirty-state 下 `REPAIR_SCOPE_INVALIDATED` / post-WRITE `PLAN_INVALIDATED`；
+- 任何要求 fail closed 且无法证明当前 shared Workspace 仍可作为后续 business execution 基线的状态。
+
+注意：
+
+```text
+AcceptanceFailure + mutation
++ legal deterministic Repair
+→ REMEDIATION_PENDING
+→ 不是 task-wide terminal dirty failure
+```
+
+只有 remediation 不成立 / 已耗尽 / scope invalidated 后，才进入 terminal fail-closed。
+
+##### Task / Workspace / Patch 三轴状态
+
+P1 禁止用单个枚举同时表达业务结果与 workspace condition。
+
+定义：
+
+```python
+class TaskLogicalStatus(str, Enum):
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+class WorkspaceDisposition(str, Enum):
+    CLEAN = "clean"
+
+    # Observed mutation exists, or mutation cannot be ruled out.
+    # Backend quiescence is nevertheless proven.
+    MUTATED_OR_UNKNOWN = "mutated_or_unknown"
+
+    # Backend may still be live / late-mutating.
+    QUARANTINED = "quarantined"
+
+class RepositoryDisposition(str, Enum):
+    BASELINE_CLEAN = "baseline_clean"
+    PATCH_PRESENT = "patch_present"
+    INVARIANT_BROKEN = "invariant_broken"
+    UNKNOWN = "unknown"
+
+class PatchDisposition(str, Enum):
+    NONE = "none"
+    ACCEPTED = "accepted"
+    RESIDUAL_UNACCEPTED = "residual_unaccepted"
+    UNAVAILABLE = "unavailable"
+```
+
+这允许明确表示：
+
+```text
+FAILED
++ WorkspaceDisposition.MUTATED_OR_UNKNOWN
++ RepositoryDisposition.PATCH_PRESENT
++ PatchDisposition.RESIDUAL_UNACCEPTED
+```
+
+即：
+
+> **任务失败，但 Workspace 中仍保留一份未被接受的 residual patch。**
+
+也允许：
+
+```text
+FAILED
++ WorkspaceDisposition.MUTATED_OR_UNKNOWN
++ RepositoryDisposition.BASELINE_CLEAN
++ PatchDisposition.NONE
+```
+
+例如 bash 改了 scanner-excluded cache/environment，但 Git-visible business patch 没有变化。
+
+以及：
+
+```text
+FAILED
++ WorkspaceDisposition.QUARANTINED
++ RepositoryDisposition.UNKNOWN
++ PatchDisposition.UNAVAILABLE
+```
+
+因此“dirty”不能被偷换成“Git patch 一定存在”。
+
+##### Atomic Task Fail-Closed Transition
+
+当 workspace-compromising terminal failure 成立，且当前 execution quiescence 已证明：
+
+```text
+1. publish post-attempt WorkspaceRevision / NodeWorkspaceDelta / failure evidence
+2. failing Node → FAILED
+3. TaskLogicalStatus → FAILED
+4. WorkspaceSessionStatus → FROZEN
+5. close ordinary dispatch gate
+6. every remaining PENDING / READY / REMEDIATION_PENDING ordinary Node
+      → BLOCKED
+      → block_reason = TASK_FAIL_CLOSED
+      → blocked_by includes root terminal failure node
+7. only then run Runtime-owned finalization
+```
+
+步骤 2–6 必须是一个 Scheduler logical state transaction。
+
+不能：
+
+```text
+Writer dirty-fails
+→ release lock
+→ another unrelated READY Node dispatches
+→ later Task marked FAILED
+```
+
+因为 shared Workspace 已不再是 validated execution baseline。
+
+已 `SUCCEEDED` 的 Node 保留其历史 logical success / evidence；Task failure 不重写历史 attempt。它们的 accepted Handoff 也不得再用于新的 ordinary dispatch，因为 Task dispatch gate 已关闭。
+
+如果 quiescence **无法证明**：
+
+```text
+TaskLogicalStatus → FAILED
+WorkspaceSessionStatus → QUARANTINED
+WorkspaceDisposition → QUARANTINED
+ordinary dispatch = closed
+```
+
+并禁止 workspace-touching finalization。
+
+##### Dirty Failure 后允许什么
+
+P1 明确禁止在 task-wide fail closed 后继续执行：
+
+- Reviewer Agent；
+- Explorer / diagnostic Agent；
+- Tester；
+- 任意 Provider-backed Node；
+- MCP / plugin / external tool；
+- “只读 prompt 诊断”形式的新 LLM run。
+
+即使某个 Agent 的业务 capability 是 READ_ONLY，也不重新打开 Agent execution surface。
+
+允许的只有 **Runtime-owned deterministic finalization**，且仅当 Workspace 已 `FROZEN` 而非 `QUARANTINED`：
+
+```text
+final RepositoryStateDigest resolve/materialization
+final RepositoryChangeSet / residual patch materialization
+final WorkspaceRevision reference
+root failure aggregation
+blocked-node aggregation
+already-persisted evidence integrity resolution
+TaskResult construction
+```
+
+这些 finalizer：
+
+- 不经过 AgentProvider；
+- 不调用 LLM；
+- 不调用 MCP/plugin；
+- 不扩大 business mutation authority；
+- 不产生新的普通 NodeHandoff；
+- 产物只进入 final TaskResult / EvidenceStore。
+
+对 Git finalization，优先复用已经持久化的 canonical `working_tree_oid` / RepositoryStateDigest；不要为了“诊断”重新让 Agent 扫 Repository。
+
+如果 finalizer 无法确定性 materialize residual patch：
+
+```text
+PatchDisposition.UNAVAILABLE
+```
+
+不能因为“看起来有改动”伪造 Patch。
+
+##### Residual Patch 不是 Accepted Patch
+
+Task 失败时，即使 final Git ChangeSet 可完整 materialize：
+
+```text
+PatchDisposition = RESIDUAL_UNACCEPTED
+```
+
+它只能用于：
+
+- 用户检查；
+- Debug / Trace；
+- 后续显式 restart-from-baseline / manual recovery 的参考。
+
+它不能：
+
+- satisfy TaskContract；
+- 作为 normal success artifact；
+- 解锁 downstream；
+- 被标记为 Reviewer approved；
+- 被描述成“任务已完成”。
+
+同样，Review `REQUEST_CHANGES`、post-WRITE plan invalidation 等可能产生：
+
+```text
+Task FAILED
++ residual patch present
+```
+
+即使失败根因不是 `DIRTY_WRITE_FAILURE`。Final result 必须忠实表达当前 Repository 状态，而不是只看最后一个 failure class。
+
+##### TaskResult
+
+P1 增加 Runtime-owned terminal schema：
+
+```python
+class TaskResult(BaseModel):
+    task_id: str
+
+    status: TaskLogicalStatus
+
+    workspace_disposition: WorkspaceDisposition
+    repository_disposition: RepositoryDisposition
+    patch_disposition: PatchDisposition
+
+    final_workspace_revision: WorkspaceRevision | None
+
+    # Canonical final repository-state / patch evidence where available.
+    repository_state: EvidenceRef | None
+    repository_changeset: EvidenceRef | None
+
+    # Root business/runtime failures only; BLOCKED consequences are separate.
+    root_failure_refs: tuple[EvidenceRef, ...] = ()
+
+    blocked_node_ids: tuple[str, ...] = ()
+    cancelled_node_ids: tuple[str, ...] = ()
+
+    warnings: tuple[str, ...] = ()
+
+    fingerprint: str
+```
+
+约束：
+
+```text
+status == SUCCEEDED
+→ root_failure_refs empty
+→ patch_disposition in {NONE, ACCEPTED}
+→ workspace_disposition != QUARANTINED
+
+status == FAILED
+AND repository_disposition == PATCH_PRESENT
+→ patch_disposition == RESIDUAL_UNACCEPTED
+
+workspace_disposition == QUARANTINED
+AND no previously persisted trustworthy final repository artifact
+→ repository_disposition == UNKNOWN
+→ patch_disposition == UNAVAILABLE
+```
+
+`TaskResult` 不复制完整 patch bytes；`repository_changeset` 指向 EvidenceStore artifact。
+
+##### Terminal Finalization
+
+稳定 terminal path：
+
+```text
+Task terminal decision
+        ↓
+close ordinary dispatch
+        ↓
+Workspace ACTIVE → FROZEN
+        ↓
+Runtime deterministic finalization
+        ↓
+TaskResult persisted
+        ↓
+Workspace CLOSED
+```
+
+quarantine path：
+
+```text
+quiescence proof lost
+        ↓
+Workspace QUARANTINED
+        ↓
+no workspace inspection
+        ↓
+aggregate only already-persisted trusted evidence
+        ↓
+TaskResult persisted
+        ↓
+backend-specific teardown / CLOSED when possible
+```
+
+核心原则：
+
+> **Fail closed stops execution; it does not erase evidence. Residual state must be reported, not promoted to success.**
+
 #### Immutable TaskNode + Mutable NodeRuntimeState
 
 P1 冻结：
@@ -3051,6 +3406,10 @@ class NodeAttemptRecord(BaseModel):
 
     evidence_refs: tuple[EvidenceRef, ...] = ()
 
+class NodeBlockReason(str, Enum):
+    UPSTREAM_FAILURE = "upstream_failure"
+    TASK_FAIL_CLOSED = "task_fail_closed"
+
 class NodeLogicalStatus(str, Enum):
     PENDING = "pending"
     READY = "ready"
@@ -3078,6 +3437,8 @@ class NodeRuntimeState(BaseModel):
     accepted_handoff: EvidenceRef | None = None
 
     terminal_failure_kind: str | None = None
+
+    block_reason: NodeBlockReason | None = None
     blocked_by: tuple[str, ...] = ()
 
     attempts: tuple[NodeAttemptRecord, ...]
