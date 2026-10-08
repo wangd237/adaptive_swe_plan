@@ -18,9 +18,10 @@ Execution Trace 是一期核心模块，但 A-SWE 不重复实现 DeerFlow 已�
 │ CapabilityResolved                        │
 │ TeamSelected                              │
 │ DAGCreated                                 │
-│ NodeScheduled                             │
+│ NodeDispatchTicketIssued / Revoked         │
+│ NodeDispatchCommitted                      │
 │ WorkspaceAccessGranted / Blocked           │
-│ NodeRetried                               │
+│ NodeRetried / RemediationPending           │
 │ EvaluationCompleted                       │
 └────────────────────────────────────────────┘
                       │
