@@ -1299,6 +1299,30 @@ async def await_background_task_quiescence(
     """
 ```
 
+为了处理 first-terminal-wins 与 outer timeout race，实际 public seam 不应只返回裸 `SubagentResult`。建议 compatibility layer 返回：
+
+```python
+class BackgroundQuiescenceOutcome(BaseModel):
+    execution_id: str
+
+    result: SubagentResult
+
+    quiescent: bool
+    quiescent_at: datetime
+
+    outer_timeout_fired: bool
+    cancellation_requested: bool
+
+    lifecycle_warnings: tuple[str, ...] = ()
+```
+
+其中：
+
+- `result` 仍保持 DeerFlow first-terminal-wins contract；
+- `outer_timeout_fired` 由 `run_with_timeout` wrapper 记录，而不是从 result.status 倒推；
+- completion signal 与 lifecycle outcome 同时在 wrapper `finally` 完成；
+- A-SWE Core 不直接依赖该 DeerFlow-specific schema，Adapter 映射为 provider-neutral lifecycle metadata。
+
 内部可以基于 thread-safe completion event / equivalent primitive；实现细节由 DeerFlow fork 持有，A-SWE Adapter 只依赖 public seam。
 
 ##### 为什么 signal 要在 run_with_timeout finally 才 set
@@ -1346,6 +1370,76 @@ capacity slot exited
 的 fence。
 
 Extension task-stop notification 是 bounded/fail-open；若其失败，只记录 warning，不重新打开 execution。
+
+##### First-Terminal-Wins vs Lifecycle Deadline
+
+Pinned `SubagentResult.try_set_terminal()` 是严格 first-terminal-wins：
+
+```text
+if result.status.is_terminal:
+    late terminal write is ignored
+```
+
+因此存在合法竞态：
+
+```text
+Agent produced final result
+      ↓
+result → COMPLETED
+      ↓
+executor enters sandbox / stream cleanup tail
+      ↓
+outer wait_for deadline expires
+      ↓
+run_with_timeout tries TIMED_OUT
+      ↓
+try_set_terminal(TIMED_OUT) returns false
+      ↓
+final result remains COMPLETED
+```
+
+如果 Adapter 只看：
+
+```text
+result.status
+```
+
+就会完全看不见 deadline 已经触发。
+
+P1 语义冻结：
+
+```text
+COMPLETED
++ outer_timeout_fired == false
+→ ordinary completed candidate
+
+COMPLETED
++ outer_timeout_fired == true
++ quiescence eventually proven
+→ completed work may still be evaluated
+→ add lifecycle warning BACKEND_LIFECYCLE_DEADLINE_OVERRUN
+→ never report as clean within-budget completion
+
+TIMED_OUT
+→ timeout won the first-terminal race
+→ normal timeout failure semantics
+```
+
+是否接受 `COMPLETED + DEADLINE_OVERRUN` 仍取决于：
+
+- deterministic acceptance；
+- repository invariants；
+- execution completeness；
+- no policy violation；
+- quiescence proof。
+
+P1 不因为 cleanup-tail budget overrun 自动丢弃已经确定产生的有效 Patch；但 metrics / Trace 必须真实反映 budget overrun。
+
+原则：
+
+> **Terminal outcome and lifecycle deadline outcome are related but not identical facts.**
+
+---
 
 ##### Adapter Execution Flow
 
@@ -1862,6 +1956,10 @@ class NodeExecutionResult(BaseModel):
     report_receipt_verdict: ReportReceiptVerdict | None
 
     backend_trace_id: str | None
+
+    # Adapter-mapped execution lifecycle metadata.
+    outer_timeout_fired: bool
+    lifecycle_warnings: tuple[str, ...]
 ```
 
 #### Terminal Status 与 Cap 必须正交
@@ -2125,6 +2223,7 @@ CANCELLED
 
 COMPLETED
 → failure_class = NONE
+→ outer_timeout_fired may still be true; preserve lifecycle warning separately
 ```
 
 #### Adapter Mapping 必须穷举
@@ -10255,6 +10354,7 @@ Workspace Lock Wait Duration
 Workspace Lock Hold Duration
 Backend Capacity Wait After Workspace Lock
 Backend Capacity Busy Before Lock
+Backend Lifecycle Deadline Overrun Count
 Selected Skills
 Selected Tools
 Final Status
@@ -11820,6 +11920,9 @@ Source Audit In Progress
 - `started_at is None` 是 pinned background path 的 PRE_START 强信号；
 - PRE_START timeout / admission failure 可证明 backend 未进入 model/tool/sandbox execution；
 - TIMED_OUT 必须结合 execution_phase 解释，不能统一视为 started execution timeout；
+- SubagentResult first-terminal-wins 会隐藏“COMPLETED 后 cleanup tail 触发 outer timeout”的竞态；
+- completion compatibility outcome 必须独立记录 outer_timeout_fired；
+- COMPLETED + lifecycle deadline overrun 可继续 deterministic evaluation，但不得记为 clean within-budget completion。
 - A-SWE P1 统一资源顺序为 Workspace → DeerFlow native capacity，避免内部 ABBA；
 - capacity snapshot 只能做 pre-lock backpressure hint，不能当 reservation；
 - P1 接受 backend saturation 时的 Workspace lock hoarding，并以 metrics 量化，不自建第二套 capacity controller。
@@ -11942,6 +12045,10 @@ P0-7 新增 PoC：
 | POC-R61 | dirty submodule、gitlink SHA 不变 | bootstrap/feature gate 拒绝，不误判 clean |
 | POC-R62 | sparse checkout active | P1 bootstrap fail with explicit unsupported feature |
 | POC-R63 | semantic READ_ONLY Tester 改 tracked source | pre/post working_tree_oid 不同 → mutation authority violation |
+| POC-R64 | result 先 COMPLETED、cleanup 尾部跨过 timeout | result 保持 COMPLETED，同时 outer_timeout_fired=true |
+| POC-R65 | timeout 在 terminal result 前发生 | TIMED_OUT；outer_timeout_fired=true |
+| POC-R66 | COMPLETED + deadline overrun + acceptance holds | 可 logical accept，但 Trace 标 BACKEND_LIFECYCLE_DEADLINE_OVERRUN |
+| POC-R67 | completion outcome 丢失 timeout marker | compatibility test fail，不允许仅从 result.status 猜 |
 
 
 ### Phase 1：Adaptive SWE Runtime MVP
