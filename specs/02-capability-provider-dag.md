@@ -1,6 +1,6 @@
 # Capability / Provider / Team Specification
 
-> Authoritative implementation specification. 内容由原实施方案第 5–8、10–12 章零语义迁移。
+> Authoritative implementation specification. 已经 P0 consistency sweep / Design Freeze 收口；Capability/Provider/WorkspaceAccess contracts 以本文为准。
 
 ## 5. Capability Registry：能力注册中心
 
