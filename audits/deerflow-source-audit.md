@@ -451,7 +451,7 @@ PoC Execution Pending
 - Task FAILED 且 Git-visible patch 存在时必须标记 RESIDUAL_UNACCEPTED；残留 patch 不满足 TaskContract、不解锁 downstream、不伪装成功。
 - QUARANTINED workspace 禁止新的 workspace-touching finalizer；TaskResult 只能聚合 quarantine 前已经持久化的 trusted evidence。
 - remaining PENDING/READY/REMEDIATION_PENDING nodes 在 task-wide dirty fail-close 时统一 BLOCKED，block_reason=TASK_FAIL_CLOSED，root failure ownership 保持唯一。
-- terminal TaskResult 持有 root_failure_refs、blocked/cancelled node ids 和 final repository evidence refs，不复制 patch bytes。
+- terminal TaskResult 持有 structured root_failures、blocked/cancelled node ids 和 final repository evidence refs，不复制 patch bytes。
 - attempt-scoped EvidenceRef 不扩权为 task finalizer provenance；terminal repository artifacts 使用独立 TaskEvidenceRef。
 - QUARANTINED 不创建伪 final TaskEvidenceRef；只能保留 quarantine 前 last_trusted EvidenceRef，并标为历史观察。
 - post-lock Handoff revalidation 不能单独关闭 reopen race；consumer dispatch commit 与 Writer reopen 必须共享 SchedulerStateMutex 作为 linearization point。
