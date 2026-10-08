@@ -2404,6 +2404,10 @@ class WorkspaceRevision(BaseModel):
     repository_state_fingerprint: str
     dirty: bool
 
+class ExecutionCompleteness(str, Enum):
+    UNCAPPED = "uncapped"
+    CAPPED = "capped"
+
 class AttemptEvidenceKind(str, Enum):
     TOOL_RECEIPT_LEDGER = "tool_receipt_ledger"
     REPOSITORY_CHANGESET = "repository_changeset"
