@@ -103,6 +103,12 @@
 | POC-64 | Evidence 文件被篡改/损坏 | get() full SHA-256 mismatch → typed integrity failure |
 | POC-65 | EvidenceCreated trace event | event 只携带 EvidenceRef metadata，不复制大 payload |
 | POC-66 | A-SWE execution run_id | 符合 DeerFlow JsonlRunEventStore safe-id regex；无冒号/路径字符 |
+ 并可创建 thread workspace |
+| POC-70 | raw external user id 含 unsafe chars | 不直接作为 DeerFlow filesystem user_id |
+| POC-71 | receipt tool_call_id 为空 | ReceiptRef 仍通过 ledger EvidenceRef + ledger_index 稳定解析 |
+| POC-72 | 两个 execution 复用同一 tool_call_id | execution-owned ledger artifact 隔离，无跨 execution 歧义 |
+| POC-73 | receipt short hash 字段相同 | 不作为 durable identity；EvidenceStore full SHA-256 保护 ledger integrity |
+| POC-74 | receipt compaction 后 rN 变化 | 已持久化 citing-turn/terminal ledger index 不重新解释 |
 
 ## P0-6：NodeHandoff / Cross-Node Context Audit
 
