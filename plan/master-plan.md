@@ -1079,6 +1079,9 @@ Executable TaskDAG
 - BackendExecutionPhase / pre-start vs started failure semantics；
 - ExecutionCompleteness / capped-partial logical acceptance gate；
 - Failure Propagation；
+- task-wide dirty fail-closed / Workspace FROZEN semantics；
+- TaskResult + Workspace/Repository/Patch disposition；
+- residual unaccepted patch finalization；
 - Result Aggregation；
 - Node Acceptance Gate；
 - WRITE Node 后 Repository Invariant Check；
