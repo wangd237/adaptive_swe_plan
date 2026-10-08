@@ -57,6 +57,15 @@ Repository Bootstrap 完成后，Runtime 先产生廉价、确定性的 `Reposit
 建议：
 
 ```python
+class AnchorMatch(BaseModel):
+    anchor: str
+    match_kind: Literal["path", "symbol", "string", "config", "test"]
+    path: str
+    line: int | None = None
+
+    # Bounded deterministic snippet / metadata; never instruction authority.
+    context: str | None = None
+
 class RepositoryProfile(BaseModel):
     base_sha: str
 
@@ -153,6 +162,25 @@ TaskContractDraft
 示例：
 
 ```python
+class TaskType(str, Enum):
+    BUG_FIX = "bug_fix"
+    FEATURE = "feature"
+    REFACTOR = "refactor"
+    TEST = "test"
+    DOCUMENTATION = "documentation"
+    ANALYSIS = "analysis"
+    OTHER = "other"
+
+class Complexity(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+class RiskLevel(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
 class TaskSpec(BaseModel):
     task_type: TaskType
     description: str
@@ -192,6 +220,15 @@ deerflow.models.create_chat_model
 建议定义：
 
 ```python
+class StructuredReasoningResult(BaseModel):
+    data: dict[str, object]
+
+    model_role: str | None = None
+    provider_model: str | None = None
+
+    usage: dict[str, int | float] = {}
+    warnings: tuple[str, ...] = ()
+
 class ReasoningBackend(Protocol):
     async def generate_structured(
         self,
@@ -228,6 +265,8 @@ semantic_planner → planner
 ```
 
 A-SWE Core 只认识 logical role，不绑定具体模型厂商。
+
+`StructuredReasoningResult.data` 必须已经通过 `response_schema` validation；Core 不接收 provider-native response object。
 
 ### 4.4.2 TaskContract Draft
 
