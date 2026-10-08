@@ -3848,14 +3848,14 @@ PatchDisposition = RESIDUAL_UNACCEPTED
 - 被标记为 Reviewer approved；
 - 被描述成“任务已完成”。
 
-同样，Review `REQUEST_CHANGES`、post-WRITE plan invalidation 等可能产生：
+同样，Review `REQUEST_CHANGES`、post-WRITE plan invalidation、task-wide cancellation 等都可能产生：
 
 ```text
-Task FAILED
+Task FAILED or CANCELLED
 + residual patch present
 ```
 
-即使失败根因不是 `DIRTY_WRITE_FAILURE`。Final result 必须忠实表达当前 Repository 状态，而不是只看最后一个 failure class。
+即使终态根因不是 `DIRTY_WRITE_FAILURE`。Final result 必须忠实表达当前 Repository 状态，而不是只看最后一个 failure class。
 
 ##### TaskResult
 
@@ -3916,9 +3916,12 @@ status == SUCCEEDED
 → patch_disposition in {NONE, ACCEPTED}
 → workspace_disposition in {STABLE, STABLE_WITH_UNCERTAINTY}
 
-status == FAILED
+status in {FAILED, CANCELLED}
 AND repository_disposition == PATCH_PRESENT
 → patch_disposition == RESIDUAL_UNACCEPTED
+
+patch_disposition == ACCEPTED
+→ status == SUCCEEDED
 
 workspace_disposition == QUARANTINED
 AND no previously persisted trustworthy final repository artifact
