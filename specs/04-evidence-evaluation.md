@@ -190,7 +190,7 @@ WorkspaceClosed
 - `WorkspaceQuarantined` 表示 quiescence 无法证明，不能与 Frozen 同义；
 - `EvidenceCreated` payload 使用 attempt/task scope-aware provenance。
 
-旧的模糊 `NodeScheduled` 不再作为 P1 minimum event；claim 与 commit 必须分别记录。
+旧的单一“scheduled”模糊事件不再作为 P1 minimum event；claim 与 commit 必须分别记录。
 
 低层 `ToolCalled / ToolReturned / LLMStarted` 不强制重新转写成 A-SWE Event；需要时通过 `backend_trace_id` 下钻到底层 Trace。
 
