@@ -2702,7 +2702,9 @@ Scheduler 不负责 Task decomposition。
 - acceptance gate；
 - Repository invariant gate；
 - handoff routing；
-- post-lock handoff revision revalidation；
+- post-lock handoff / dependency-authority revalidation；
+- revocable dispatch ticket / final dispatch commit；
+- Writer reopen vs consumer commit linearization；
 - result aggregation。
 
 ### 9.8 Failure Taxonomy
@@ -3042,6 +3044,32 @@ Ticket 不是 EvidenceRef，也不是 NodeAttemptRecord。它只是 Scheduler co
 
 规则：
 
+READY predicate 计算与 ticket claim 必须在 `SchedulerStateMutex` 下完成，形成一个短事务：
+
+```text
+lock SchedulerStateMutex
+→ verify Node still READY
+→ verify task dispatch gate OPEN
+→ capture each direct dependency:
+     acceptance_epoch
+     accepted_attempt
+     handoff fingerprint
+→ create exactly one active ticket
+→ release SchedulerStateMutex
+```
+
+禁止：
+
+```text
+compute READY
+→ release scheduler state authority
+→ later capture dependency stamps
+```
+
+否则 ticket 可能从两代 dependency authority 拼出一个不存在的 snapshot。
+
+随后：
+
 ```text
 READY Node claimed
 → create one active ticket
@@ -3102,6 +3130,23 @@ Writer success H1      epoch = 1
 Writer reopen          epoch = 2, accepted authority = none
 Writer repair success  epoch = 3, H2
 ```
+
+accepted authority publication 也必须在 `SchedulerStateMutex` 下原子完成：
+
+```text
+logical success confirmed
+        ↓
+lock SchedulerStateMutex
+        ↓
+publish accepted_attempt
+publish accepted_handoff
+acceptance_epoch += 1
+recompute dependent READY predicates
+        ↓
+unlock
+```
+
+不能先让 downstream 看见新 Handoff，再晚一步更新 epoch。
 
 consumer 的 `DependencyAcceptanceStamp` 同时记录：
 
