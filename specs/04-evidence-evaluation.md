@@ -162,6 +162,9 @@ TeamCreated
 
 DAGCreated
 NodeReady
+NodeDispatchTicketIssued
+NodeDispatchTicketRevoked
+NodeDispatchCommitted
 NodeScheduled
 
 WorkspaceAccessGranted
