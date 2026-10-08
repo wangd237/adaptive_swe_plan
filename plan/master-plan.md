@@ -912,14 +912,330 @@ Performance-driven Runtime
 
 ### Phase 0：Integration Validation / Architecture Freeze
 
-Phase 0 的详细源码审计、冻结结论、Go/No-Go 与 PoC 已迁移至：
+状态：
+
+```text
+Design Frozen
+PoC Execution Pending
+```
+
+Phase 0 的详细源码审计、冻结结论、Go/No-Go 与 PoC 位于：
 
 - [audits/deerflow-source-audit.md](../audits/deerflow-source-audit.md)
 - [tests/poc-matrix.md](../tests/poc-matrix.md)
 
+`Design Frozen` 表示 schema ownership 与 P1 execution semantics 已收口，可以开始 Core/FakeBackend 实现；它不表示真实 DeerFlow integration PoC 已通过。
+
+冻结后若要修改下列核心 contract：
+
+```text
+TaskContract / ValidatedWorkPlan
+TaskNode / TaskDAG
+WorkspaceAccess / WorkspaceRevision
+EvidenceRef / TaskEvidenceRef / NodeHandoff
+NodeRuntimeState / dispatch commit
+Retry / Repair / Reverify
+TaskResult / ContractVerdict
+Backend quiescence contract
+```
+
+必须显式 reopen Design Freeze，并同步：
+
+1. authoritative Spec；
+2. audit conclusion；
+3. PoC matrix；
+4. affected implementation tests。
+
 ### Phase 1：Adaptive SWE Runtime MVP
 
 这是当前唯一必须完成的产品阶段。
+
+#### Phase 1 Authoritative Coding Order
+
+下面的 **P1-1～P1-7 是功能 workstream，不是 Git commit / 编码先后顺序**。
+
+实际实现必须按以下顺序推进：
+
+##### Coding Step 0：Core Contracts + Deterministic Test Harness
+
+先实现纯 Python、无 DeerFlow execution、无 LLM 的 contracts：
+
+```text
+core/contracts/
+core/config/
+core/ids/
+tests/fakes/
+```
+
+至少落地：
+
+- Task / Planning contracts 的基础 shared types；
+- `WorkspaceAccess`；
+- `EvidenceRef / TaskEvidenceRef / ReceiptRef / NodeHandoff`；
+- `TaskNode / TaskDAG`；
+- Runtime failure/status enums；
+- Runtime budget config；
+- canonical serialization / fingerprint helpers；
+- `FakeExecutionBackend`；
+- deterministic Workspace/Fake execution fixtures。
+
+Exit Criteria：
+
+- active schema 可直接 import；
+- fingerprint deterministic；
+- `POC-F01 ~ F06` 对应 static/unit checks 通过；
+- **不调用 LLM，不依赖 DeerFlow SubagentExecutor。**
+
+##### Coding Step 1：Evidence + Workspace / Git Substrate
+
+实现：
+
+```text
+evidence/
+workspace/
+repository/
+trace/minimal_events.py
+```
+
+顺序：
+
+1. `LocalEvidenceStore.put_attempt / put_task / get`；
+2. 最小 RuntimeEvent sink（先服务调试，不做 UI）；
+3. `WorkspaceSession / RepositoryBinding`；
+4. Repository bootstrap / exact base SHA；
+5. `RepositoryStateDigest` temporary-index implementation；
+6. `WorkspaceRevision`；
+7. `NodeWorkspaceDelta`；
+8. READ/WRITE workspace lock manager；
+9. FROZEN / QUARANTINED lifecycle substrate。
+
+Exit Criteria：
+
+- Git state/delta 可确定性测试；
+- attempt/task evidence provenance 不混用；
+- workspace lock/revision tests 在无 Agent 环境通过。
+
+##### Coding Step 2：Scheduler State Machine on FakeBackend
+
+这是 **第一阶段真正的项目核心**。
+
+实现：
+
+```text
+runtime/state.py
+runtime/scheduler.py
+runtime/dispatch.py
+runtime/remediation.py
+runtime/finalization.py
+```
+
+先只接 `FakeExecutionBackend`，完成：
+
+- `NodeRuntimeState / NodeAttemptRecord`；
+- Ready predicate；
+- `SchedulerStateMutex`；
+- `NodeDispatchTicket`；
+- `DependencyAcceptanceStamp / acceptance_epoch`；
+- `TaskDispatchGate`；
+- Workspace arbitration；
+- dispatch commit；
+- cancellation；
+- Retry / Repair / Reverify transitions；
+- task-wide dirty fail-close；
+- FROZEN / QUARANTINED drain；
+- `RootFailureRecord / TaskResult` state assembly。
+
+Exit Criteria：
+
+- `POC-R16 ~ R26`；
+- `POC-R75 ~ R108`；
+- **尤其 `POC-R109 ~ R126`**；
+- 全部先在 deterministic FakeBackend 下通过。
+
+原则：
+
+> **如果 FakeBackend 状态机都不能证明正确，不允许用 DeerFlow/LLM 的复杂行为掩盖问题。**
+
+##### Coding Step 3：Task / Contract / Planning Compiler
+
+实现：
+
+```text
+planning/profile.py
+planning/analyzer.py
+planning/contracts.py
+planning/constraints.py
+planning/planner.py
+planning/validator.py
+planning/acceptance.py
+```
+
+完成：
+
+- RepositoryProfile / AnchorMatch；
+- TaskSpec；
+- ReasoningBackend interface + fake reasoning backend；
+- TaskContractDraft；
+- provenance validation；
+- ConstraintCompiler / merge algebra；
+- CompiledTaskContract；
+- TaskExecutionAuthority；
+- WorkPlanProposal；
+- PlanValidator / Normalizer；
+- `ValidatedWorkPlan`；
+- VerificationCommand / Acceptance Compiler。
+
+Exit Criteria：
+
+- P0-3 semantic-plan tests；
+- `POC-C01 ~ C10`；
+- planner 输出永远不能直接进入 Scheduler。
+
+##### Coding Step 4：Capability / Provider / DAG Compiler
+
+实现：
+
+```text
+capabilities/
+providers/
+planning/dag.py
+```
+
+完成：
+
+- Capability Registry；
+- CapabilityBinding；
+- AgentProvider Registry；
+- provider-neutral BackendInventory interface；
+- ProviderAssignment；
+- TeamSpec；
+- ToolEffect / WorkspaceAccess compiler；
+- TaskDAG Materializer；
+- phase/workspace conflict normalization；
+- VerificationRepairBinding；
+- CompiledPlanDescriptor。
+
+Exit Criteria：
+
+- P0-3 DAG tests；
+- P0-5 中不依赖真实 DeerFlow 的 contract/preflight tests；
+- 同一个 ValidatedWorkPlan deterministically 生成相同 TaskDAG fingerprint。
+
+##### Coding Step 5：DeerFlow Integration Adapter
+
+只有 Core/Scheduler/compiler 已可独立测试后，才接真实 DeerFlow：
+
+```text
+integrations/deerflow/
+```
+
+实现顺序：
+
+1. inventory adapter；
+2. `DeerFlowReasoningBackend / ModelInvoker`；
+3. `NodeExecutionPreparation(preparation_id)`；
+4. AppConfig/tool/model snapshot pinning；
+5. `NodeExecutionInvocation` mapping；
+6. `NodeExecutionBindingStore`；
+7. trusted ToolPolicy / Handoff middleware；
+8. SubagentExecutor result mapper；
+9. independent completion/quiescence compatibility seam；
+10. cancellation join；
+11. Acceptance / receipt-citation adapters；
+12. AssemblyAttestation；
+13. fresh-shell deterministic verification profile。
+
+Go / No-Go：
+
+真实 shared mutable Workspace execution 在关键 DeerFlow integration PoC 通过前仍关闭。至少覆盖：
+
+```text
+POC-02 / 03 / 05 / 09
+POC-R34 / 35 / 36 / 38
+POC-R50 / 51
+POC-R69 / 70 / 73
+```
+
+##### Coding Step 6：Cross-Node SWE Semantics
+
+在真实 Adapter 合同成立后接完整 Node 语义：
+
+- Repo Explorer / Coder / Tester / Reviewer Provider definitions；
+- bounded prompts；
+- Skills 作为 optional enhancement；
+- Handoff renderer / projector；
+- evidence finalization；
+- NodeAcceptanceResult；
+- RepairAttributionResolver；
+- RepairFeedback；
+- REVERIFY；
+- structured Review direct-return tool；
+- ReviewEvidenceResolver。
+
+这里才开始认真调 Agent prompt / Skill；**不要把 prompt engineering 放在 Runtime state machine 之前。**
+
+Exit Criteria：
+
+- H-series PoC；
+- unique-writer / repair loop；
+- structured review gate；
+- one complete single-writer repair scenario。
+
+##### Coding Step 7：Task Finalization + Evaluation
+
+实现：
+
+```text
+evaluation/
+runtime/finalization.py
+```
+
+完成：
+
+- TaskContractEvaluator；
+- ContractVerdict；
+- final RepositoryState / RepositoryChangeSet TaskEvidence；
+- residual unaccepted patch；
+- TaskResult；
+- root failure aggregation；
+- stable / quarantine terminal paths。
+
+Exit Criteria：
+
+- Task SUCCEEDED 必须有 final ContractVerdict；
+- dirty failure / residual patch / quarantine cases deterministic；
+- no “LLM says done → task success” shortcut。
+
+##### Coding Step 8：Observability + Demo Packaging
+
+最后补齐：
+
+- full RuntimeEvent vocabulary；
+- Trace Store；
+- Decision Timeline；
+- metrics；
+- simple Trace Viewer；
+- README architecture/demo；
+- 3～5 个 stable scenarios。
+
+一期 benchmark 仍不作为主线 blocker。
+
+#### Coding Order Rule
+
+```text
+Contracts
+→ Evidence/Workspace
+→ Scheduler(FakeBackend)
+→ Planning Compiler
+→ Capability/DAG Compiler
+→ DeerFlow Adapter
+→ SWE Agent Semantics
+→ Evaluation/Finalization
+→ Trace UI/Demos
+```
+
+任何后续实现 PR 若跨越该依赖顺序，必须说明为什么不会让未冻结/未测试的下层 contract 被上层代码反向定义。
+
 
 #### P1-1：Runtime Skeleton + Workspace Runtime
 
@@ -982,6 +1298,8 @@ DeerFlow Subagent Execution
 - NodeBoundaryPolicy；
 - PlanValidator；
 - PlanNormalizer；
+- ValidatedWorkItem / ValidatedWorkPlan；
+- PlanRepair / PlanWarning；
 - Acceptance Compiler；
 - VerificationCommand / command identity；
 - acceptance-derived sandbox evidence requirements。
@@ -1015,8 +1333,9 @@ ValidatedWorkPlan
 - Handoff evidence authority；
 - deterministic multi-parent handoff merge；
 - revision-aware HandoffEvidenceProjection / renderer；
+- WorkspaceAccess；
 - DAG Materializer；
-- TaskNode / WorkKind；
+- TaskNode / TaskDAG / WorkKind；
 - VerificationRepairBinding compilation；
 - ToolEffect Registry；
 - Capability + Tool Effect workspace access compiler；
@@ -1039,7 +1358,8 @@ Executable TaskDAG
 - revocable NodeDispatchTicket / dispatch commit；
 - dependency acceptance_epoch / DependencyAcceptanceStamp；
 - TaskDispatchGate epoch；
-- NodeExecutionPreparation；
+- NodeExecutionPreparation / preparation_id；
+- NodeExecutionInvocation / post-commit execution identity；
 - live Backend revalidation；
 - Backend snapshot pinning；
 - `BACKEND_PREFLIGHT_STALE` classification；
@@ -1081,6 +1401,7 @@ Executable TaskDAG
 - capacity backpressure hint + lock-hoarding metrics；
 - BackendExecutionPhase / pre-start vs started failure semantics；
 - ExecutionCompleteness / capped-partial logical acceptance gate；
+- NodeAcceptanceResult / acceptance EvidenceRef；
 - Failure Propagation；
 - task-wide dirty fail-closed / Workspace FROZEN semantics；
 - TaskResult + Workspace/Repository/Patch disposition；
@@ -1123,7 +1444,7 @@ Executable TaskDAG
 - Git-aware task-level Repository ChangeSet；
 - per-attempt NodeWorkspaceDelta；
 - DeerFlow Workspace ChangeSet；
-- TaskContractEvaluator / ContractVerdict；
+- TaskContractEvaluator / ContractVerdict / final_contract_verdict TaskEvidenceRef；
 - Evaluation Report。
 
 #### P1-7：Demo Packaging
