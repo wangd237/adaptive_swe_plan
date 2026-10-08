@@ -91,6 +91,51 @@ typed evidence payload
 
 NodeHandoff 使用同一 EvidenceRef，不建设第二套 handoff-only storage。
 
+现有 `EvidenceRef` 保持严格的 **Node-attempt-scoped provenance**。Terminal Task finalization 不允许伪造 synthetic Node / execution id 来复用它。
+
+P1 增加单独的 task-scoped reference：
+
+```python
+class TaskEvidenceRef(BaseModel):
+    evidence_id: str
+
+    kind: Literal[
+        "final_repository_state",
+        "final_repository_changeset",
+        "final_contract_verdict",
+    ]
+
+    task_id: str
+    finalization_id: str
+
+    # Present only when the finalizer observed a stable FROZEN workspace.
+    workspace_revision_generation: int | None
+    workspace_state_fingerprint: str | None
+
+    content_sha256: str
+```
+
+规则：
+
+```text
+EvidenceRef
+→ Node / execution / attempt provenance
+→ 可进入 NodeHandoff / ReceiptRef 等 execution chain
+
+TaskEvidenceRef
+→ Runtime terminal-finalization provenance
+→ 不得进入 NodeHandoff
+→ 不得伪装成某次 Agent execution evidence
+```
+
+两者可以由同一个 immutable `ExecutionEvidenceStore` 持久化，但使用不同 provenance schema / namespace。
+
+当 Workspace 已 `QUARANTINED`：
+
+- 不创建声称“观察了 final workspace”的 `TaskEvidenceRef`；
+- 只能在 `TaskResult.last_trusted_evidence_refs` 中引用 quarantine 前已经存在的 attempt-scoped `EvidenceRef`；
+- 这些旧 evidence 必须明确理解为 last trusted observation，不是 current final-state proof。
+
 Model-facing Handoff 不直接 dump EvidenceStore payload，而由 deterministic HandoffRenderer 生成 bounded `HandoffEvidenceProjection`。
 
 ---
