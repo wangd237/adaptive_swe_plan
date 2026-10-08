@@ -2942,7 +2942,7 @@ ExecutionCappedPartial
 处理：
 
 - READ / semantic READ_ONLY 且 Workspace proven unchanged：
-  - 可按 bounded RetryPolicy 重试；
+  - 可按 bounded Scheduler retry rules 重试；
   - Runtime 可以缩小 attempt context / objective projection；
   - P1 不自动提高 DeerFlow operator `max_turns` / token budget。
 - WRITE / UNKNOWN-mutating 且 Workspace proven unchanged：
@@ -4111,7 +4111,7 @@ implement_repair_2
 
 #### Retry Semantics
 
-P1 不定义 per-node `RetryPolicy` schema。Retry eligibility 与 budget 属于 Scheduler-owned Runtime config，TaskNode 不携带可由 Planner 改写的 retry authority。
+P1 不定义 per-node retry-policy schema。Retry eligibility 与 budget 属于 Scheduler-owned Runtime config，TaskNode 不携带可由 Planner 改写的 retry authority。
 
 Retry：
 
@@ -4246,7 +4246,7 @@ class RepairAttributionEvidence(BaseModel):
     kind: RepairAttributionKind
     reason_codes: tuple[str, ...]
 
-    dag_fingerprint: str
+    task_dag_fingerprint: str
     fingerprint: str
 ```
 
@@ -4440,7 +4440,7 @@ Verifier fails
 
 同一 logical Writer 的 REPAIR attempt 不按“distinct writer”计算；它由 `accepted_attempt` ownership 管理。
 
-实现不维护第二套 `RepositoryWriteLedger`。Resolver 通过 `node_states[*].attempts` 的 pre/post WorkspaceRevision，并用 `evidence_store` resolve per-attempt RepositoryStateDigest / repository delta，查询 target accepted attempt 之后、verification observed revision 之前是否存在 distinct business Writer 的 Git-visible mutation。
+实现不维护第二套 repository-write ledger。Resolver 通过 `node_states[*].attempts` 的 pre/post WorkspaceRevision，并用 `evidence_store` resolve per-attempt RepositoryStateDigest / repository delta，查询 target accepted attempt 之后、verification observed revision 之前是否存在 distinct business Writer 的 Git-visible mutation。
 
 ###### Gate 6：成功 attribution 只代表 repair ownership
 
