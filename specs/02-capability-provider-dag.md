@@ -88,6 +88,10 @@ DirectToolProvider
 Capability Registry 只保存 provider-neutral semantic metadata：
 
 ```python
+class WorkspaceAccess(str, Enum):
+    READ = "read"
+    WRITE = "write"
+
 class CapabilityAuthorityClass(str, Enum):
     READ_ONLY = "read_only"
     REPOSITORY_MUTATION = "repository_mutation"
@@ -98,7 +102,7 @@ class CapabilitySpec(BaseModel):
     description: str
 
     # physical shared-workspace lower bound
-    workspace_effect_floor: Literal["read", "write"]
+    workspace_effect_floor: WorkspaceAccess
 
     # semantic/business authority required to select this capability
     authority_class: CapabilityAuthorityClass
@@ -647,6 +651,8 @@ otherwise
 即：
 
 > **MVP 只有“可证明只读”的 Node 才能并发读取 Workspace。**
+
+`WorkspaceAccess` 的唯一 authoritative enum 就是 §5.3 的 `READ | WRITE`。未知/外部副作用不增加第三个 lock class；它们一律保守编译为 `WRITE`，副作用不确定性由 `ToolEffect.UNKNOWN / EXTERNAL_SIDE_EFFECT` 与 MutationEvidence 单独表达。
 
 这里必须使用最终：
 
