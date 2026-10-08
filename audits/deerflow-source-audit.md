@@ -422,6 +422,8 @@ Source Audit In Progress
 - active downstream 导致 repair scope invalidated 时，先 close task dispatch gate，再 cancel/join committed runs；全部 quiescent 后才可 Workspace→FROZEN，否则 QUARANTINED。
 - Writer reopen 成功 transaction 内同时 revoke affected pre-commit tickets、清除 current accepted_attempt/handoff、acceptance_epoch+1、Writer→REMEDIATION_PENDING、source verifier→REMEDIATION_PENDING，并 recompute affected READY。
 - WorkspaceRevision 与 DependencyAcceptanceStamp 是两个独立 fence：前者保护 physical workspace state，后者保护 accepted dependency authority。
+- accepted_attempt/handoff publication + acceptance_epoch increment + dependent READY recomputation 必须在 SchedulerStateMutex 下原子完成。
+- READY predicate check + DependencyAcceptanceStamp capture + single active dispatch-ticket claim 也必须在同一 SchedulerStateMutex transaction 内完成，禁止先算 READY 后晚取 stamps。
 
 审计目标：
 
