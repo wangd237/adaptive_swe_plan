@@ -56,6 +56,21 @@
 | POC-P3-11 | Tester bash modifies source | 虽有 WRITE lock但 post-node business-mutation invariant fail |
 | POC-P3-12 | mutation WorkItem 无 mutation deliverable coverage | PLAN_INVALID |
 
+## P0-4：TaskContract / Constraint Compiler Audit
+
+| PoC | 测试内容 | 必须验证 |
+|---|---|---|
+| POC-C01 | Repository guidance 自称 mandatory / system authority | provenance 可验证但仍保持 REPOSITORY_GUIDANCE + SOFT，不允许 self-promotion |
+| POC-C02 | user HARD 请求与 Runtime LOCKED policy 冲突 | CONTRACT_POLICY_CONFLICT；不静默降级执行 |
+| POC-C03 | 两个 user-explicit HARD exact constraints 互斥 | CONTRACT_UNSATISFIABLE |
+| POC-C04 | 未识别但明确的 user requirement | canonicalize 为 semantic.requirement + HARD，不静默丢弃 |
+| POC-C05 | Runtime/User allowed-path scopes 同时存在 | effective allow scope 使用 intersection，不扩大权限 |
+| POC-C06 | 多来源 forbidden path/action | effective deny 使用 union |
+| POC-C07 | report-only TaskExecutionAuthority + code_modification work item | CAPABILITY_AUTHORITY_VIOLATION / PLAN_INVALID |
+| POC-C08 | Contract 要求 verification/review，Planner 漏 gate | validator 单调注入 reserved runtime-owned gate，并记录 PlanRepair |
+| POC-C09 | HARD/LOCKED final leaf = UNVERIFIED | ContractVerdict blocking；Task 不得 SUCCEEDED |
+| POC-C10 | final ContractVerdict | task_contract_fingerprint 必须与执行所用 CompiledTaskContract 精确一致 |
+
 ## P0-5：Capability / Provider Contract Audit
 
 | PoC | 测试内容 | 必须验证 |
@@ -91,7 +106,7 @@
 | POC-52 | Node B 依赖 Node A | 只有显式 NodeHandoff / Workspace evidence 进入 B |
 | POC-53 | 单 Provider 覆盖全部 WorkItem | TeamSpec 单成员，但 DAG Node 数与语义边界保持不变 |
 | POC-54 | bash 执行但只改变 .venv / cache | scanner 可无 observed paths，但 mutation_evidence=UNKNOWN，revision 推进 |
-| POC-55 | WRITE Node 在任何 mutating tool 前失败 | mutation_evidence=PROVEN_NONE，可按 RetryPolicy 重试 |
+| POC-55 | WRITE Node 在任何 mutating tool 前失败 | mutation_evidence=PROVEN_NONE，可按 Scheduler-owned retry rules 重试 |
 | POC-56 | failed bash Node 且 scanner 显示 no changes | 不自动 retry；按 DIRTY_WRITE_FAILURE / UNKNOWN mutation fail closed |
 | POC-57 | snapshot truncated 且无 observed changed path | changed_paths_complete=false；mutation_evidence=UNKNOWN；revision 推进 |
 | POC-58 | Handoff via ParentContextSnapshot | 禁止作为 A-SWE 实现路径；compat test 确认正式路径不依赖该 carrier |
@@ -102,8 +117,7 @@
 | POC-63 | Evidence 写入在 rename 前 crash | final path 不出现半写 JSON；orphan temp 可清理 |
 | POC-64 | Evidence 文件被篡改/损坏 | get() full SHA-256 mismatch → typed integrity failure |
 | POC-65 | EvidenceCreated trace event | event 只携带 EvidenceRef metadata，不复制大 payload |
-| POC-66 | A-SWE execution run_id | 符合 DeerFlow JsonlRunEventStore safe-id regex；无冒号/路径字符 |
- 并可创建 thread workspace |
+| POC-66 | A-SWE execution run_id | 符合 DeerFlow JsonlRunEventStore safe-id regex；无冒号/路径字符；并可创建 thread workspace |
 | POC-70 | raw external user id 含 unsafe chars | 不直接作为 DeerFlow filesystem user_id |
 | POC-71 | receipt tool_call_id 为空 | ReceiptRef 仍通过 ledger EvidenceRef + ledger_index 稳定解析 |
 | POC-72 | 两个 execution 复用同一 tool_call_id | execution-owned ledger artifact 隔离，无跨 execution 歧义 |
@@ -210,7 +224,9 @@
 | POC-H88 | Review basis 只引用 submit_review_verdict 自身 | 不算 inspection evidence |
 | POC-H89 | valid basis receipt | display rN 转 durable ReceiptRef 后入 ReviewVerdict |
 
-## P0-7.1 Deterministic Verification Sandbox Profile
+## P0-7：Retry / Repair / Failure Propagation Audit
+
+> R69–R73 specifically cover the P0-7.1 deterministic-verification sandbox profile；其余 R-series 覆盖 execution lifecycle、retry/repair、dirty failure 与 dispatch-race semantics。
 
 | PoC | 测试内容 | 必须验证 |
 |---|---|---|
@@ -317,7 +333,7 @@
 | POC-R101 | AcceptanceFailure + mutation + legal deterministic Repair | Node=REMEDIATION_PENDING；不提前 task-wide fail closed |
 | POC-R102 | Repair budget exhausted while repository patch remains | Task=FAILED；Workspace→FROZEN；residual patch reported |
 | POC-R103 | terminal dirty fail-close state transaction | failing node FAILED + task FAILED + dispatch closed + remaining nodes BLOCKED 原子化 |
-| POC-R104 | Task FAILED + 10 blocked descendants | root_failure_refs 只报告真实 root；blocked nodes 作为 propagation consequences |
+| POC-R104 | Task FAILED + 10 blocked descendants | TaskResult.root_failures 只记录真实 root；blocked nodes 作为 propagation consequences |
 | POC-R105 | terminal TaskResult final_repository_changeset | 使用 TaskEvidenceRef 指向 immutable artifact，不复制完整 patch bytes |
 | POC-R106 | FROZEN finalizer 生成 final repository changeset | 使用 task-scoped TaskEvidenceRef；不伪造 synthetic Node attempt |
 | POC-R107 | TaskEvidenceRef 被尝试放入 NodeHandoff | schema/policy reject；task-finalization evidence 不进入 ordinary execution handoff |
@@ -341,3 +357,17 @@
 | POC-R125 | Writer logical success publication 与 downstream READY recompute 并发 | accepted_attempt/handoff + acceptance_epoch increment + READY recompute 在同一 SchedulerStateMutex transaction |
 | POC-R126 | READY Node claim 与 Writer reopen 并发 | READY check + dependency stamps capture + single ticket claim 原子化；ticket 不混合两代 authority |
 
+## P0-Final：Design Freeze Static Conformance
+
+| PoC | 测试内容 | 必须验证 |
+|---|---|---|
+| POC-F01 | active specs schema scan | 每个 authoritative class name 只定义一次；archive 不参与 source-of-truth scan |
+| POC-F02 | TaskNode schema | immutable；无 status / RetryPolicy / RepairPolicy mutable fields |
+| POC-F03 | Planning output boundary | Capability Resolver / DAG Materializer 只消费 ValidatedWorkPlan，不回读 unvalidated WorkPlanProposal |
+| POC-F04 | Handoff ownership | accepted_handoff 类型为 NodeHandoff；EvidenceRef 只引用其内部 authority artifacts |
+| POC-F05 | TaskDAG fingerprint | VerificationRepairBinding 绑定 structure_fingerprint；final DAG fingerprint 不形成自引用 hash cycle |
+| POC-F06 | preparation vs execution identity | prepare_node 只产生 preparation_id；attempt/execution_id/run_id 只在 dispatch commit 分配 |
+| POC-F07 | EvidenceStore provenance | put_attempt→EvidenceRef；put_task→TaskEvidenceRef；terminal finalizer 不伪造 Node attempt |
+| POC-F08 | TaskResult root failure | 使用 RootFailureRecord + supporting EvidenceRefs，不把 failure 本身伪装成 EvidenceRef |
+| POC-F09 | Task success gate | final_contract_verdict 存在且 all_required_satisfied=true 才能 SUCCEEDED |
+| POC-F10 | documentation graph | README/master/spec/audit/test 的相对链接全部可解析，active docs 不引用 archived monolith 作为 authority |
