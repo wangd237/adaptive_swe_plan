@@ -1605,14 +1605,13 @@ class BashCommandPolicy(BaseModel):
     fingerprint: str
 ```
 
-并进入：
+并进入 §9.13 唯一 authoritative `NodeExecutionPolicy` schema 的：
 
-```python
-class NodeExecutionPolicy(BaseModel):
-    ...
-    bash_policy: BashCommandPolicy
-    ...
+```text
+bash_policy: BashCommandPolicy
 ```
+
+本节不再重复声明 `NodeExecutionPolicy`。
 
 P1 规则：
 
@@ -2245,24 +2244,32 @@ class TaskNode(BaseModel):
     objective: str
     work_kind: WorkKind
 
-    required_capabilities: list[str]
+    required_capabilities: tuple[str, ...]
     provider_id: str
 
-    dependencies: list[str]
+    dependencies: tuple[str, ...]
 
     workspace_access: WorkspaceAccess
 
-    affected_paths: list[str] | None = None
+    planner_ordinal: int
+    runtime_owned: bool = False
 
-    acceptance_criteria: list[str] = []
+    affected_paths: tuple[str, ...] | None = None
 
-    retry_policy: RetryPolicy
-    repair_policy: RepairPolicy | None = None
+    # Canonical compiled acceptance criteria only.
+    acceptance_criteria: tuple[str, ...] = ()
 
-    status: NodeStatus
+    fingerprint: str
 ```
 
-实现时建议进一步将 mutable `status` 从 immutable TaskNode schema 移入 `NodeRuntimeState`；TaskNode 本体作为 plan artifact 不承担 attempt lifecycle。
+冻结规则：
+
+- `TaskNode` / `TaskDAG` 是 immutable compile artifacts；
+- mutable lifecycle 只存在于 `NodeRuntimeState / NodeAttemptRecord`；
+- Retry / Repair eligibility 与预算属于 Scheduler-owned Runtime config，不写进 Planner/TaskNode；
+- `provider_id` 来自 validated ProviderAssignment，不允许 execution-time 私下 rebinding；
+- `planner_ordinal` 延续 `ValidatedWorkItem.planner_ordinal`，用于 deterministic same-phase serialization；
+- `runtime_owned` 标识 compiler 注入的 `__aswe_*` gate。
 
 #### Verification Repair Ownership Binding
 
@@ -2301,11 +2308,26 @@ class VerificationRepairBinding(BaseModel):
         "runtime_owned_gate",
     ]
 
-    dag_fingerprint: str
+    # Canonical nodes + dependency structure only; avoids a hash cycle.
+    dag_structure_fingerprint: str
+    fingerprint: str
+
+class TaskDAG(BaseModel):
+    nodes: tuple[TaskNode, ...]
+    topological_order: tuple[str, ...]
+
+    # Canonical nodes + dependencies only.
+    structure_fingerprint: str
+
+    verification_repair_bindings: tuple[VerificationRepairBinding, ...] = ()
+
+    # Final identity covers structure + compiled bindings.
     fingerprint: str
 ```
 
 其中 `verification_check_id` 必须引用 Runtime 编译后的 deterministic check identity；shell-based check 通常直接引用 `VerificationCommand.id`。
+
+`VerificationRepairBinding.dag_structure_fingerprint` 必须等于所属 `TaskDAG.structure_fingerprint`。最终 `TaskDAG.fingerprint` 再覆盖 structure + bindings，避免 binding 与最终 DAG hash 相互递归。
 
 P1 candidate 集合只从 immutable DAG / semantic authority 推导：
 
@@ -2744,7 +2766,7 @@ Cancelled
 | overall timeout before capacity slot (`PRE_START`) | bounded retry candidate；无需按 started WRITE 处理 mutation |
 | backend preflight stale | fail before execution；pre-WRITE 时可 bounded replan |
 | provider assembly mismatch | fail closed；P1 不自动换 Provider |
-| READ transient failure | RetryPolicy |
+| READ transient failure | Scheduler-owned retry rules |
 | capped partial + complete deterministic proof | accept with `EXECUTION_CAPPED_BUT_ACCEPTED` warning |
 | capped partial + no complete proof + proven-clean READ | bounded retry / fail |
 | capped partial + dirty/unknown WRITE | no blind retry；deterministic repair evidence exists 才 repair，否则 fail closed |
@@ -2988,8 +3010,9 @@ for every upstream dependency U:
 
 U.logical_status == SUCCEEDED
 AND U.accepted_attempt is not None
-AND U.accepted_handoff resolves successfully
-AND accepted_handoff belongs to U.accepted_attempt
+AND U.accepted_handoff is not None
+AND accepted_handoff.source_attempt == U.accepted_attempt
+AND Handoff EvidenceRefs resolve successfully
 AND Handoff / evidence satisfies current revision-staleness rules
 ```
 
@@ -3495,7 +3518,7 @@ BLOCKED Node 自身不是新的业务失败根因。
 
 ```text
 blocked_by = terminal upstream node ids
-root_failure_refs = upstream failure evidence refs
+root_failures = structured root records with supporting evidence refs
 ```
 
 最终 Task Result 聚合时：
@@ -3780,9 +3803,21 @@ Task FAILED
 
 ##### TaskResult
 
-P1 增加 Runtime-owned terminal schema：
+P1 增加 Runtime-owned terminal schema。Root failure 本身不是 `EvidenceRef`；它是 TaskResult 内的结构化归因记录，并可引用 supporting attempt evidence：
 
 ```python
+class RootFailureRecord(BaseModel):
+    failure_kind: str
+
+    node_id: str | None = None
+    execution_id: str | None = None
+    attempt: int | None = None
+
+    supporting_evidence_refs: tuple[EvidenceRef, ...] = ()
+    diagnostics: tuple[str, ...] = ()
+
+    fingerprint: str
+
 class TaskResult(BaseModel):
     task_id: str
 
@@ -3798,13 +3833,14 @@ class TaskResult(BaseModel):
     # by specs/04-evidence-evaluation.md and never impersonates a Node attempt.
     final_repository_state: TaskEvidenceRef | None
     final_repository_changeset: TaskEvidenceRef | None
+    final_contract_verdict: TaskEvidenceRef | None
 
     # When QUARANTINED prevents a final observation, retain only the last
     # already-persisted trusted attempt evidence, explicitly as historical.
     last_trusted_evidence_refs: tuple[EvidenceRef, ...] = ()
 
     # Root business/runtime failures only; BLOCKED consequences are separate.
-    root_failure_refs: tuple[EvidenceRef, ...] = ()
+    root_failures: tuple[RootFailureRecord, ...] = ()
 
     blocked_node_ids: tuple[str, ...] = ()
     cancelled_node_ids: tuple[str, ...] = ()
@@ -3818,7 +3854,7 @@ class TaskResult(BaseModel):
 
 ```text
 status == SUCCEEDED
-→ root_failure_refs empty
+→ root_failures empty
 → patch_disposition in {NONE, ACCEPTED}
 → workspace_disposition in {STABLE, STABLE_WITH_UNCERTAINTY}
 
@@ -3902,6 +3938,9 @@ class NodeAttemptRecord(BaseModel):
 
     evidence_refs: tuple[EvidenceRef, ...] = ()
 
+    # Bounded terminal handoff for a logically accepted attempt.
+    handoff: NodeHandoff | None = None
+
 class NodeBlockReason(str, Enum):
     UPSTREAM_FAILURE = "upstream_failure"
     TASK_FAIL_CLOSED = "task_fail_closed"
@@ -3934,7 +3973,7 @@ class NodeRuntimeState(BaseModel):
     # Only the currently accepted logical-success attempt may own a normal
     # downstream handoff.
     accepted_attempt: int | None = None
-    accepted_handoff: EvidenceRef | None = None
+    accepted_handoff: NodeHandoff | None = None
 
     # At most one pre-commit dispatch ticket may claim this Node.
     active_dispatch_ticket_id: str | None = None
@@ -3946,6 +3985,21 @@ class NodeRuntimeState(BaseModel):
 
     attempts: tuple[NodeAttemptRecord, ...]
 ```
+
+Current-authority invariant：
+
+```text
+accepted_attempt is None
+↔ accepted_handoff is None
+
+accepted_attempt == N
+→ attempts contains attempt N
+→ attempt N.handoff exists
+→ accepted_handoff.fingerprint == attempt N.handoff.fingerprint
+→ accepted_handoff.source_attempt == N
+```
+
+历史 Handoff 保留在对应 `NodeAttemptRecord.handoff`；Writer reopen 只清除 current `accepted_*` authority，不删除历史 attempt artifact。
 
 因此：
 
@@ -3967,13 +4021,15 @@ implement_repair_2
 
 #### Retry Semantics
 
+P1 不定义 per-node `RetryPolicy` schema。Retry eligibility 与 budget 属于 Scheduler-owned Runtime config，TaskNode 不携带可由 Planner 改写的 retry authority。
+
 Retry：
 
 - objective 不变；
 - ProviderAssignment 不变；
 - compiled NodeExecutionPolicy 不变；
 - live `prepare_node()` 仍重新做 backend revalidation；
-- 只允许上一 attempt 属于 RetryPolicy 允许的 transient/capped-clean class，且 `mutation_evidence == PROVEN_NONE`；
+- 只允许上一 attempt 属于 Scheduler-owned retry rules 允许的 transient/capped-clean class，且 `mutation_evidence == PROVEN_NONE`；
 - 新 execution_id；
 - 新 attempt number；
 - 所有 evidence 重新生成，绝不沿用前一 attempt acceptance / receipt verdict。
@@ -4118,7 +4174,7 @@ def resolve_verification_repair_attribution(
     bindings: tuple[VerificationRepairBinding, ...],
     dag: TaskDAG,
     node_states: Mapping[str, NodeRuntimeState],
-    repository_write_ledger: RepositoryWriteLedger,
+    evidence_store: ExecutionEvidenceStore,
 ) -> RepairAttributionEvidence:
     ...
 ```
@@ -4161,7 +4217,7 @@ SOURCE_INELIGIBLE
 
 ```text
 lookup VerificationRepairBinding
-verify dag_fingerprint
+verify dag_structure_fingerprint
 verify verification_node_id
 ```
 
@@ -4293,6 +4349,8 @@ Verifier fails
 ```
 
 同一 logical Writer 的 REPAIR attempt 不按“distinct writer”计算；它由 `accepted_attempt` ownership 管理。
+
+实现不维护第二套 `RepositoryWriteLedger`。Resolver 通过 `node_states[*].attempts` 的 pre/post WorkspaceRevision，并用 `evidence_store` resolve per-attempt RepositoryStateDigest / repository delta，查询 target accepted attempt 之后、verification observed revision 之前是否存在 distinct business Writer 的 Git-visible mutation。
 
 ###### Gate 6：成功 attribution 只代表 repair ownership
 
@@ -5347,8 +5405,9 @@ class CompiledPlanDescriptor(BaseModel):
 
     dag_hash: str
 
-    repairs: list[PlanRepair]
-    warnings: list[PlanWarning]
+    # PlanRepair / PlanWarning are authoritative in specs/01-task-planning.md.
+    repairs: tuple[PlanRepair, ...]
+    warnings: tuple[PlanWarning, ...]
 
     fingerprint: str
 ```
@@ -5658,6 +5717,7 @@ max_inflight_node_executions = backend_capacity
 max_parallel_read_nodes = min(3, max_inflight_node_executions)
 planning_attempts = 2
 execution_replans = 1        # pre-WRITE only
+max_retries_per_node = 1
 max_repairs_per_write = 1
 ```
 
