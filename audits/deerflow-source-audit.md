@@ -412,6 +412,16 @@ Source Audit In Progress
 - terminal TaskResult 持有 root_failure_refs、blocked/cancelled node ids 和 final repository evidence refs，不复制 patch bytes。
 - attempt-scoped EvidenceRef 不扩权为 task finalizer provenance；terminal repository artifacts 使用独立 TaskEvidenceRef。
 - QUARANTINED 不创建伪 final TaskEvidenceRef；只能保留 quarantine 前 last_trusted EvidenceRef，并标为历史观察。
+- post-lock Handoff revalidation 不能单独关闭 reopen race；consumer dispatch commit 与 Writer reopen 必须共享 SchedulerStateMutex 作为 linearization point。
+- READY Node 在真正 dispatch commit 前保持 logical READY；prepare / wait-lock / locked-precommit 使用独立 revocable NodeDispatchTicket，不提前创建 NodeAttemptRecord。
+- NodeRuntimeState 增加 acceptance_epoch；accepted authority publish/revoke/new publish 都递增，consumer 通过 DependencyAcceptanceStamp 冻结 upstream authority generation。
+- TaskDispatchGate 使用 epoch 防止 task fail-close 后旧 READY/waiting ticket 越过 commit boundary。
+- pre-commit ticket 可 revoke：不消耗 attempt/retry/repair budget，不调用 backend cancel；prepared object 必须可安全 discard。
+- affected consumer 一旦 COMMITTED/RUNNING，P1 不实现 cancel-clean-and-repair；Writer reopen 判 REPAIR_SCOPE_INVALIDATED(reason=ACTIVE_DOWNSTREAM_DISPATCH)。
+- COMMITTED 即使 DeerFlow execution_phase=PRE_START，也视为越过 P1 rollback-free dispatch boundary。
+- active downstream 导致 repair scope invalidated 时，先 close task dispatch gate，再 cancel/join committed runs；全部 quiescent 后才可 Workspace→FROZEN，否则 QUARANTINED。
+- Writer reopen 成功 transaction 内同时 revoke affected pre-commit tickets、清除 current accepted_attempt/handoff、acceptance_epoch+1、Writer→REMEDIATION_PENDING、source verifier→REMEDIATION_PENDING，并 recompute affected READY。
+- WorkspaceRevision 与 DependencyAcceptanceStamp 是两个独立 fence：前者保护 physical workspace state，后者保护 accepted dependency authority。
 
 审计目标：
 
