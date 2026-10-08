@@ -1809,13 +1809,8 @@ class BackendStopReason(str, Enum):
     TURN_CAPPED = "turn_capped"
     LOOP_CAPPED = "loop_capped"
 
-class ExecutionCompleteness(str, Enum):
-    # Backend ended without a guard-cap signal.
-    UNCAPPED = "uncapped"
-
-    # Backend ended because a guard cap fired. This is orthogonal to terminal status:
-    # usable partial work may be COMPLETED; unusable/no partial may be FAILED.
-    CAPPED = "capped"
+# ExecutionCompleteness is authoritative in specs/01-task-planning.md
+# because NodeHandoff and NodeExecutionResult both depend on it.
 
 class BackendExecutionPhase(str, Enum):
     PRE_START = "pre_start"
