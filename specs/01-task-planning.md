@@ -1276,7 +1276,7 @@ Compiler version / rule-set version
 最终 Plan fingerprint 再包含：
 
 ```text
-task_contract_hash
+task_contract_fingerprint
 ```
 
 从而回答：
