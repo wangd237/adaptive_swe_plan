@@ -3237,6 +3237,7 @@ Writer dirty-fails
 TaskLogicalStatus → FAILED
 WorkspaceSessionStatus → QUARANTINED
 WorkspaceDisposition → QUARANTINED
+final_repository_state / final_repository_changeset = None
 ordinary dispatch = closed
 ```
 
@@ -3335,9 +3336,14 @@ class TaskResult(BaseModel):
 
     final_workspace_revision: WorkspaceRevision | None
 
-    # Canonical final repository-state / patch evidence where available.
-    repository_state: EvidenceRef | None
-    repository_changeset: EvidenceRef | None
+    # Canonical terminal-finalization artifacts. TaskEvidenceRef is defined
+    # by specs/04-evidence-evaluation.md and never impersonates a Node attempt.
+    final_repository_state: TaskEvidenceRef | None
+    final_repository_changeset: TaskEvidenceRef | None
+
+    # When QUARANTINED prevents a final observation, retain only the last
+    # already-persisted trusted attempt evidence, explicitly as historical.
+    last_trusted_evidence_refs: tuple[EvidenceRef, ...] = ()
 
     # Root business/runtime failures only; BLOCKED consequences are separate.
     root_failure_refs: tuple[EvidenceRef, ...] = ()
@@ -3368,7 +3374,7 @@ AND no previously persisted trustworthy final repository artifact
 → patch_disposition == UNAVAILABLE
 ```
 
-`TaskResult` 不复制完整 patch bytes；`repository_changeset` 指向 EvidenceStore artifact。
+`TaskResult` 不复制完整 patch bytes；`final_repository_changeset` 通过 task-scoped `TaskEvidenceRef` 指向 EvidenceStore artifact。
 
 ##### Terminal Finalization
 
