@@ -1034,8 +1034,11 @@ Executable TaskDAG
 
 完成：
 
-- Scheduler；
+- Scheduler / SchedulerStateMutex linearization；
 - Ready Node calculation；
+- revocable NodeDispatchTicket / dispatch commit；
+- dependency acceptance_epoch / DependencyAcceptanceStamp；
+- TaskDispatchGate epoch；
 - NodeExecutionPreparation；
 - live Backend revalidation；
 - Backend snapshot pinning；
