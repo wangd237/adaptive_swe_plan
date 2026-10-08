@@ -401,6 +401,15 @@ Source Audit In Progress
 - capacity snapshot 只能做 pre-lock backpressure hint，不能当 reservation；
 - P1 接受 backend saturation 时的 Workspace lock hoarding，并以 metrics 量化，不自建第二套 capacity controller。
 - NodeExecutionResult 使用 exhaustive typed status/stop-reason mapping，未知值视为 BACKEND_CONTRACT_MISMATCH。
+- DIRTY_WRITE_FAILURE 与 Workspace QUARANTINED 分离：前者可在 quiescence 已证明时冻结稳定 residual state，后者表示 late mutation 仍不可排除。
+- WorkspaceSession 增加 FROZEN：terminal dispatch closed、backend quiescent，只允许 Runtime-owned deterministic finalization。
+- workspace-compromising terminal failure 触发 task-wide fail closed；不只阻塞 DAG descendants，也阻塞同 WorkspaceSession 中尚未执行的独立 branch。
+- task-wide fail closed 后禁止 Reviewer / Explorer / Tester / 任意 Agent diagnostic run；只允许不经 AgentProvider/LLM/MCP 的 deterministic finalization。
+- Task outcome、Workspace disposition、Repository disposition、Patch disposition 正交建模。
+- Task FAILED 且 Git-visible patch 存在时必须标记 RESIDUAL_UNACCEPTED；残留 patch 不满足 TaskContract、不解锁 downstream、不伪装成功。
+- QUARANTINED workspace 禁止新的 workspace-touching finalizer；TaskResult 只能聚合 quarantine 前已经持久化的 trusted evidence。
+- remaining PENDING/READY/REMEDIATION_PENDING nodes 在 task-wide dirty fail-close 时统一 BLOCKED，block_reason=TASK_FAIL_CLOSED，root failure ownership 保持唯一。
+- terminal TaskResult 持有 root_failure_refs、blocked/cancelled node ids 和 final repository evidence refs，不复制 patch bytes。
 
 审计目标：
 
