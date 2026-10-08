@@ -89,7 +89,7 @@ ExecutionEvidenceStore
 typed evidence payload
 ```
 
-NodeHandoff 使用同一 EvidenceRef，不建设第二套 handoff-only storage。
+NodeHandoff 本身不是 EvidenceRef。P1 将 bounded NodeHandoff 保存在 NodeAttemptRecord / current NodeRuntimeState；其中的大型、权威 execution payload 统一通过 EvidenceRef 指向 ExecutionEvidenceStore，因此不建设第二套 handoff-only artifact store。
 
 现有 `EvidenceRef` 保持严格的 **Node-attempt-scoped provenance**。Terminal Task finalization 不允许伪造 synthetic Node / execution id 来复用它。
 
@@ -445,8 +445,55 @@ Evaluator
     └── Reviewer
     │
     ▼
-Evaluation Report
+TaskContractEvaluator
+    │
+    ▼
+ContractVerdict
+    │
+    ▼
+Evaluation Report / TaskResult
 ```
+
+#### ContractVerdict
+
+`CompiledTaskContract` 在 Planning 阶段定义 obligation；terminal evaluator 必须把最终 deterministic / semantic evidence 映射回同一 constraint identity。
+
+```python
+class ContractLeafStatus(str, Enum):
+    SATISFIED = "satisfied"
+    VIOLATED = "violated"
+    UNVERIFIED = "unverified"
+    NOT_APPLICABLE = "not_applicable"
+
+class ContractLeafVerdict(BaseModel):
+    constraint_id: str
+    enforcement: ConstraintEnforcement
+    status: ContractLeafStatus
+
+    supporting_refs: tuple[EvidenceRef | TaskEvidenceRef, ...] = ()
+    diagnostics: tuple[str, ...] = ()
+
+class ContractVerdict(BaseModel):
+    task_contract_fingerprint: str
+
+    leaves: tuple[ContractLeafVerdict, ...]
+
+    blocking_constraint_ids: tuple[str, ...]
+    all_required_satisfied: bool
+
+    fingerprint: str
+```
+
+冻结规则：
+
+- `LOCKED / HARD` leaf 的 `VIOLATED` 或 `UNVERIFIED` 都是 blocking；
+- `NOT_APPLICABLE` 只有 evaluator 能确定该 constraint 对当前 task state 不适用时才允许；
+- SOFT leaf 不直接阻止成功，但进入 diagnostics / warnings；
+- deterministic constraint 优先消费 final RepositoryChangeSet、VerificationResult、Acceptance evidence；
+- semantic constraint 可以消费 structured ReviewVerdict；无法确认仍为 `UNVERIFIED`；
+- `undecidable != passed`；
+- stable terminal finalization 将 `ContractVerdict` 写入 ExecutionEvidenceStore，并返回 `TaskEvidenceRef(kind="final_contract_verdict")`；
+- `TaskLogicalStatus.SUCCEEDED` 要求 `ContractVerdict.all_required_satisfied == true`。
 
 ### 14.5 EvaluationResult
 
@@ -473,6 +520,10 @@ evaluation:
   reviewer:
     status: pass
     concerns: []
+
+  contract:
+    all_required_satisfied: true
+    blocking_constraint_ids: []
 
   final_status: accepted
 ```
