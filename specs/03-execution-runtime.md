@@ -975,9 +975,20 @@ NodeExecutionResult
 NodeAcceptanceResult
 ```
 
-其中 `NodeExecutionPreparation` 冻结 backend resources；`NodeExecutionInvocation` 冻结**拿到 Workspace lock 以后才能确定的本 attempt execution context**：
+其中 `NodeExecutionPreparation` 冻结 backend resources；`NodeExecutionInvocation` 冻结**拿到 Workspace lock 以后才能确定的本 attempt execution context**。
+
+为关闭 Writer reopen 与 downstream dispatch 的 TOCTOU，Invocation 还必须携带 Runtime-owned dependency authority snapshot：
 
 ```python
+class DependencyAcceptanceStamp(BaseModel):
+    upstream_node_id: str
+
+    # Monotonic authority generation owned by Scheduler state.
+    acceptance_epoch: int
+
+    accepted_attempt: int
+    handoff_fingerprint: str
+
 class NodeExecutionInvocation(BaseModel):
     task_id: str
     node_id: str
@@ -989,6 +1000,11 @@ class NodeExecutionInvocation(BaseModel):
 
     execution_workspace_revision: WorkspaceRevision
 
+    # Scheduler-linearized dispatch authority.
+    dispatch_ticket_id: str
+    task_dispatch_epoch: int
+    dependency_acceptance_stamps: tuple[DependencyAcceptanceStamp, ...]
+
     # Already deterministically rendered, bounded and neutralized.
     dependency_context_text: str
     dependency_handoff_fingerprints: tuple[str, ...]
@@ -999,6 +1015,17 @@ class NodeExecutionInvocation(BaseModel):
 ```
 
 Core 不知道 DeerFlow middleware store；Adapter 再将 Invocation 投影到 DeerFlow-specific execution binding。
+
+`prepare_node()` 在 P1 必须满足：
+
+```text
+no model/tool execution
+no Workspace mutation
+no backend execution registration that requires task-level cancellation
+discardable when a dispatch ticket is revoked
+```
+
+因此 Writer reopen 发生在 preparation / Workspace wait 阶段时，Scheduler 可以直接丢弃 `NodeExecutionPreparation`；若 Backend future 版本需要 preparation resource cleanup，必须新增显式 `release_preparation()` seam，不能让“prepared object 丢弃”留下隐藏执行副作用。
 
 而不知道 DeerFlow 内部如何加载 Skill、Tool、MCP、Middleware 或 Sandbox。
 
@@ -2983,6 +3010,194 @@ Writer FAILED → Repair Node
 
 Repair / Retry / Reverify 是 Scheduler 对**原 immutable TaskNode**的 attempt transition，不创建新语义节点。
 
+#### Revocable Dispatch Ticket 与 Dispatch Commit
+
+`NodeLogicalStatus` 不应该承担“正在 prepare / 等 Workspace lock / 已拿锁但尚未真正开始 attempt”这些瞬时调度状态。
+
+P1 增加 Scheduler-only、可撤销的 dispatch ticket：
+
+```python
+class NodeDispatchTicketState(str, Enum):
+    PREPARING = "preparing"
+    WAITING_WORKSPACE = "waiting_workspace"
+    LOCKED_PRECOMMIT = "locked_precommit"
+
+    # Linearization point crossed; an actual Node attempt now exists.
+    COMMITTED = "committed"
+
+    REVOKED = "revoked"
+    FINISHED = "finished"
+
+class NodeDispatchTicket(BaseModel):
+    ticket_id: str
+    node_id: str
+
+    task_dispatch_epoch: int
+    dependency_acceptance_stamps: tuple[DependencyAcceptanceStamp, ...]
+
+    state: NodeDispatchTicketState
+```
+
+Ticket 不是 EvidenceRef，也不是 NodeAttemptRecord。它只是 Scheduler concurrency-control artifact。
+
+规则：
+
+```text
+READY Node claimed
+→ create one active ticket
+→ Node logical_status remains READY
+
+prepare_node()
+→ PREPARING
+
+wait WorkspaceAccess
+→ WAITING_WORKSPACE
+
+Workspace lock granted
+→ LOCKED_PRECOMMIT
+
+final dependency / dispatch validation succeeds
+→ atomic DISPATCH COMMIT
+→ allocate attempt/execution/run ids
+→ Node READY → RUNNING
+→ ticket COMMITTED
+→ NodeAttemptRecord begins
+```
+
+因此：
+
+> **RUNNING means dispatch committed, not merely selected by Scheduler.**
+
+pre-commit ticket 被 revoke：
+
+- 不创建 NodeAttemptRecord；
+- 不消耗 retry / repair budget；
+- 不生成 execution evidence；
+- prepared backend object 丢弃；
+- Workspace wait 可取消；
+- 若 lock 已拿到，则在 pre-commit gate 失败后释放；
+- Node 回到 / 保持 `PENDING`，等待依赖重新满足后再次 READY。
+
+##### acceptance_epoch
+
+每个 Node 的 `acceptance_epoch` 是 dependency authority generation。
+
+以下 transition 必须递增：
+
+```text
+no accepted authority
+→ publish accepted attempt/handoff
+
+accepted H1
+→ revoke H1 because Writer reopens
+
+no current authority after repair
+→ publish accepted H2
+```
+
+例如：
+
+```text
+Writer success H1      epoch = 1
+Writer reopen          epoch = 2, accepted authority = none
+Writer repair success  epoch = 3, H2
+```
+
+consumer 的 `DependencyAcceptanceStamp` 同时记录：
+
+- upstream node id；
+- epoch；
+- accepted attempt；
+- handoff fingerprint。
+
+这样即使旧 Handoff object 仍留在 Trace，旧 ticket 也不会重新获得 authority。
+
+##### Task Dispatch Gate
+
+Task Runtime 维护：
+
+```python
+class TaskDispatchGateState(str, Enum):
+    OPEN = "open"
+    CLOSED = "closed"
+
+class TaskDispatchGate(BaseModel):
+    state: TaskDispatchGateState
+    epoch: int
+```
+
+task-wide fail-close / cancellation 关闭 gate 时递增 epoch。
+
+任何 ticket 的最终 dispatch commit 都必须验证：
+
+```text
+gate.state == OPEN
+AND ticket.task_dispatch_epoch == gate.epoch
+```
+
+这使已经 READY / waiting 的旧 ticket 在 Task fail-close 后无法越过 commit boundary。
+
+##### Dispatch Commit Linearization Point
+
+仅有“post-lock handoff revalidation”仍存在 TOCTOU：
+
+```text
+consumer validates H1
+        ↓
+Writer reopens / revokes H1
+        ↓
+consumer enters backend
+```
+
+所以 P1 要求 **dispatch commit 与 Writer reopen 使用同一个 SchedulerStateMutex**。
+
+consumer 在持有 WorkspaceAccess 后：
+
+```text
+freeze WorkspaceRevision
+resolve/render handoffs
+        ↓
+acquire SchedulerStateMutex
+        ↓
+validate:
+  ticket still active / not REVOKED
+  task dispatch gate still OPEN + same epoch
+  Node still READY and owns this ticket
+  every direct dependency still:
+      SUCCEEDED
+      same acceptance_epoch
+      same accepted_attempt
+      same handoff fingerprint
+        ↓
+if valid:
+  allocate attempt/execution ids
+  freeze NodeExecutionInvocation
+  READY → RUNNING
+  ticket → COMMITTED
+        ↓
+release SchedulerStateMutex
+        ↓
+pre-attempt snapshot / execute_prepared()
+```
+
+禁止在持有 SchedulerStateMutex 时等待 Workspace lock、backend capacity 或执行 I/O。
+
+资源关系保持：
+
+```text
+Workspace lock
+→ short SchedulerStateMutex commit section
+→ backend capacity
+```
+
+而 Writer reopen 只短暂持有 SchedulerStateMutex，不在其中等待 Workspace lock，因此不会引入反向：
+
+```text
+SchedulerStateMutex → wait Workspace
+```
+
+的 ABBA。
+
 #### Accepted Handoff Single-Owner Rule
 
 同一 Node 任意时刻最多只有一个：
@@ -2997,11 +3212,12 @@ accepted_handoff
 当已 SUCCEEDED 的 Writer 因 downstream deterministic verification failure 被重新打开进入 REPAIR：
 
 1. Writer 从 `SUCCEEDED` → `REMEDIATION_PENDING`；
-2. 原 `accepted_handoff` 立即标记 HISTORICAL / 不再满足 ordinary dependency；
-3. 新 Repair attempt 基于 current WorkspaceRevision 执行；
-4. Repair 成功后产生新的 accepted attempt/handoff；
-5. Verification 使用 REVERIFY attempt 重新验证；
-6. 只有最新 verification accepted attempt 才能继续解锁 Review / final downstream。
+2. 保存旧 accepted attempt/handoff identity 到 RepairFeedback / Trace 后，撤销 current dependency authority；
+3. `accepted_attempt = None`、`accepted_handoff = None`，并递增 `acceptance_epoch`；
+4. 新 Repair attempt 基于 current WorkspaceRevision 执行；
+5. Repair 成功后产生新的 accepted attempt/handoff，并再次递增 acceptance_epoch；
+6. Verification 使用 REVERIFY attempt 重新验证；
+7. 只有最新 verification accepted attempt 才能继续解锁 Review / final downstream。
 
 这防止：
 
@@ -3039,6 +3255,191 @@ IMPLEMENTATION → VERIFICATION → REVIEW
 ```
 
 天然满足这个条件；但 Runtime 仍必须检查，不能仅靠 prompt/plan 假设。
+
+##### Writer Reopen vs Downstream Dispatch Race
+
+Repair reopen 与 downstream dispatch 必须在 SchedulerStateMutex 上线性化。
+
+Writer W 准备 reopen 时，Runtime 先计算：
+
+```text
+affected descendants of W
+```
+
+并检查这些 Node 的 logical / dispatch state。
+
+###### A. READY，尚无 ticket
+
+```text
+Writer reopen wins
+→ revoke accepted authority
+→ READY predicate no longer holds
+→ consumer READY → PENDING
+```
+
+不产生 attempt。
+
+###### B. PREPARING / WAITING_WORKSPACE
+
+ticket 可撤销：
+
+```text
+ticket → REVOKED
+Node remains / returns PENDING
+```
+
+- preparation result 丢弃；
+- Workspace lock wait 被取消或唤醒后自行退出；
+- 不调用 Backend cancel，因为 backend execution 尚未 commit；
+- 不产生 NodeAttemptRecord。
+
+###### C. LOCKED_PRECOMMIT
+
+consumer 已拿 Workspace lock、完成或正在完成 context resolution，但还没有 dispatch commit。
+
+Writer reopen 在 SchedulerStateMutex 中：
+
+```text
+ticket → REVOKED
+Writer authority revoked
+```
+
+consumer 随后的 commit gate 必须看到：
+
+```text
+ticket REVOKED
+OR acceptance_epoch mismatch
+OR accepted handoff mismatch
+```
+
+因此：
+
+```text
+no commit
+→ no attempt
+→ discard Invocation candidate
+→ release Workspace lock
+→ PENDING
+```
+
+这正是 post-lock revalidation 之后仍需要 commit mutex 的原因。
+
+###### D. COMMITTED / RUNNING
+
+一旦 affected ordinary downstream ticket 已 `COMMITTED`：
+
+> **P1 不再撤销该 execution 后继续 Writer Repair。**
+
+即使 DeerFlow 还处于：
+
+```text
+execution_phase = PRE_START
+```
+
+只要 A-SWE dispatch commit 已经发生，Repair reopen gate 就视为 active consumer 已跨越 rollback-free boundary。
+
+原因：
+
+- NodeAttemptRecord 已存在；
+- immutable Invocation / dependency authority 已冻结；
+- binding/backend execution lifecycle 可能已建立；
+- 再引入“cancel clean → pretend attempt never happened → reopen writer”需要新的 transaction semantics。
+
+P1 返回：
+
+```text
+REPAIR_SCOPE_INVALIDATED
+reason = ACTIVE_DOWNSTREAM_DISPATCH
+```
+
+然后：
+
+```text
+close Task dispatch gate
+do NOT reopen Writer
+request cancellation of affected committed/running consumers
+await quiescence
+classify their actual mutation/evidence normally
+Task → FAILED
+Workspace → FROZEN if all quiescent
+          or QUARANTINED if quiescence cannot be proven
+```
+
+被 fail-close 取消的 consumer 不成为新的业务 root failure；root 仍是：
+
+```text
+verification failure
++
+repair scope invalidation evidence
+```
+
+如果 consumer cancellation 自身造成 repository authority violation / dirty mutation，则该证据进入 secondary runtime failure diagnostics，并影响 Workspace/Repository disposition。
+
+未来可以优化：
+
+```text
+COMMITTED + backend PRE_START + proven clean cancellation
+→ retract attempt and permit repair
+```
+
+但 P1 明确不实现，以免把 backend execution phase 与 Scheduler transaction rollback 混为一谈。
+
+###### E. 已 SUCCEEDED ordinary non-verification descendant
+
+沿用现有规则：
+
+```text
+REPAIR_SCOPE_INVALIDATED
+reason = COMMITTED_DOWNSTREAM_SUCCESS
+```
+
+P1 不做 descendant rollback / accepted-handoff cascade invalidation。
+
+##### Reopen Transaction
+
+若不存在 COMMITTED/RUNNING 或已成功的 unsafe consumer，则 reopen 在一次 SchedulerStateMutex transaction 内完成：
+
+```text
+1. persist/attach RepairAttribution reference
+2. revoke all affected pre-commit tickets
+3. Writer SUCCEEDED → REMEDIATION_PENDING
+4. capture old target accepted attempt for RepairFeedback
+5. clear Writer accepted_attempt / accepted_handoff
+6. Writer acceptance_epoch += 1
+7. source Verification → REMEDIATION_PENDING for future REVERIFY
+8. recompute affected READY nodes → PENDING
+9. release SchedulerStateMutex
+```
+
+注意：
+
+- transaction 内不等待被 revoke ticket 释放 Workspace lock；
+- Repair attempt 后续正常请求 WRITE lock；
+- 已拿 READ lock 的 `LOCKED_PRECOMMIT` consumer 会在 commit gate 看到 revoked，释放后 Repair 才能获得 WRITE；
+- 这避免 SchedulerStateMutex 与 Workspace lock 反向等待。
+
+##### Dispatch Ticket 与 WorkspaceRevision 是两个不同 Fence
+
+```text
+WorkspaceRevision
+→ 保护“context 对应哪一个物理 workspace state”
+
+DependencyAcceptanceStamp / dispatch commit
+→ 保护“上游 accepted authority 是否仍然有效”
+```
+
+只检查 revision 不够，因为 Writer 可以：
+
+```text
+accepted H1 @ revision R
+→ reopen / revoke H1
+```
+
+而在真正 Repair mutation 发生前 WorkspaceRevision 仍然可能还是 R。
+
+所以：
+
+> **staleness is not only a workspace-version problem; it is also an accepted-authority problem.**
 
 #### Failure Propagation Root Cause
 
@@ -3469,10 +3870,17 @@ class NodeRuntimeState(BaseModel):
     next_attempt: int
     repair_count: int
 
+    # Monotonic dependency-authority generation.
+    # Increment whenever accepted downstream authority is published or revoked.
+    acceptance_epoch: int = 0
+
     # Only the currently accepted logical-success attempt may own a normal
     # downstream handoff.
     accepted_attempt: int | None = None
     accepted_handoff: EvidenceRef | None = None
+
+    # At most one pre-commit dispatch ticket may claim this Node.
+    active_dispatch_ticket_id: str | None = None
 
     terminal_failure_kind: str | None = None
 
@@ -4897,6 +5305,10 @@ A-SWE Plan Fingerprint
 NodeReady
    │
    ▼
+Create revocable NodeDispatchTicket
+(capture task dispatch epoch + dependency acceptance stamps)
+   │
+   ▼
 Resolve Dependency Handoff Refs
    │
    ▼
@@ -4905,7 +5317,7 @@ ExecutionBackend.prepare_node()
    ├── live backend revalidation
    ├── monotonic runtime narrowing
    ├── backend snapshot pinning
-   └── stale preflight → fail before workspace lock
+   └── stale preflight → revoke ticket / fail before workspace lock
    │
    ▼
 Acquire WorkspaceAccess
@@ -4918,7 +5330,18 @@ Resolve / Render Dependency Handoffs
 against frozen revision
    │
    ├── mark historical/stale handoffs
-   └── bind immutable handoff projection
+   └── build candidate immutable context
+   │
+   ▼
+SchedulerStateMutex: FINAL DISPATCH COMMIT
+   │
+   ├── ticket active?
+   ├── task dispatch epoch still current?
+   ├── dependency acceptance stamps still exact?
+   ├── if stale/revoked → no attempt, release lock, return PENDING
+   └── if valid → allocate attempt/execution ids
+                  READY → RUNNING
+                  freeze NodeExecutionInvocation
    │
    ▼
 WRITE / UNKNOWN-MUTATING → mandatory pre-attempt snapshot
