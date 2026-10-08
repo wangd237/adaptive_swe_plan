@@ -5486,14 +5486,14 @@ Tester 因此默认不会和普通 READ Explorer 并行共享可变 Workspace。
 class CompiledPlanDescriptor(BaseModel):
     repository_base_sha: str
 
-    task_contract_hash: str
-    validated_plan_hash: str
+    task_contract_fingerprint: str
+    validated_plan_fingerprint: str
 
-    capability_registry_hash: str
-    provider_registry_hash: str
-    policy_hash: str
+    capability_registry_fingerprint: str
+    provider_registry_fingerprint: str
+    node_policy_set_fingerprint: str
 
-    dag_hash: str
+    task_dag_fingerprint: str
 
     # PlanRepair / PlanWarning are authoritative in specs/01-task-planning.md.
     repairs: tuple[PlanRepair, ...]
